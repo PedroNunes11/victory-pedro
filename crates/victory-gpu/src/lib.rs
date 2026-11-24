@@ -53,6 +53,8 @@ mod overlay;
 mod pixels;
 mod screenshot;
 #[cfg(windows)]
+mod over;
+#[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
