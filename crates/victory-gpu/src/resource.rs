@@ -3382,6 +3382,12 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     Table(f)
 };
 
+/// An id a resource answers to, for other modules' tests.
+#[cfg(test)]
+pub(crate) fn test_iid() -> &'static Iid {
+    &RESOURCE_IIDS[0]
+}
+
 #[cfg(test)]
 pub(crate) fn test_buffer(width: u64) -> This {
     let heap = HeapProperties {

@@ -868,6 +868,71 @@ pub fn upscale_stretch(
     done
 }
 
+/// Upscales by DLSS on title list `this`, if a plugin was asked for
+/// ([`crate::dlss`]): `d` and `t` are the title's dispatch. False if it was
+/// not recorded, for [`upscale_stretch`] to do instead.
+///
+/// DLSS leaves its own heaps, root signature and pipeline on the list: the
+/// title's are replayed, whether it worked or not.
+#[cfg(windows)]
+pub fn upscale_dlss(
+    this: *const std::ffi::c_void,
+    d: &crate::dlss::Dispatch,
+    t: &crate::dlss::Textures,
+) -> bool {
+    const SHADER_READ: u32 = 0x40;
+    const UNORDERED: u32 = 0x8;
+    if !crate::dlss::loaded() || this.is_null() {
+        return false;
+    }
+    let of = |p: *const std::ffi::c_void| p as This;
+    let mut done = false;
+    with_state(this.cast(), |list, state| {
+        let [colour, depth, motion, exposure, output] =
+            [t.colour, t.depth, t.motion, t.exposure, t.output].map(of);
+        let host = |r: This| {
+            let texture = crate::resource::host_resource(r)?;
+            // Host copies without their largest levels have other sizes.
+            (crate::resource::dropped(r) == 0).then_some(texture)
+        };
+        let (Some(colour_host), Some(depth_host), Some(motion_host), Some(output_host)) =
+            (host(colour), host(depth), host(motion), host(output))
+        else {
+            crate::dlss::skipped("one of its textures has no host copy");
+            return;
+        };
+        let exposure_host = host(exposure);
+        let mut read = vec![(colour, colour_host), (depth, depth_host), (motion, motion_host)];
+        read.extend(exposure_host.map(|host| (exposure, host)));
+        if read.iter().any(|&(r, t)| r == output || crate::host::legal_state(t, SHADER_READ) != SHADER_READ) {
+            crate::dlss::skipped("one of its inputs cannot be read by shaders");
+            return;
+        }
+        // What shaders wrote into the depth texture's twin, first.
+        list.twin_use(depth, false, false);
+        for (r, _) in read {
+            ensure_state(list, r, SHADER_READ);
+        }
+        ensure_state(list, output, UNORDERED);
+        done = crate::dlss::record(
+            &list.list,
+            d,
+            &crate::dlss::Inputs {
+                colour: colour_host,
+                depth: depth_host,
+                motion: motion_host,
+                exposure: exposure_host,
+                output: output_host,
+            },
+        );
+        if done {
+            crate::texture::host_written(output);
+        }
+        state.replay(list);
+    });
+    done
+}
+
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
@@ -2443,6 +2508,23 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 static THIN_FUNCTIONS: Table<160> = Table(thin::table(false));
 #[cfg(windows)]
 static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
+
+/// An allocator and an open list as a title has them, for other modules'
+/// tests.
+#[cfg(all(test, windows))]
+pub(crate) fn test_list() -> (This, This) {
+    let null = std::ptr::null();
+    let (mut allocator, mut list) = (null, null);
+    assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+    assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+    (allocator, list)
+}
+
+/// Opens it again.
+#[cfg(all(test, windows))]
+pub(crate) fn test_reset(list: This, allocator: This) {
+    assert_eq!(reset(list, allocator, std::ptr::null()), S_OK);
+}
 
 #[cfg(test)]
 mod tests {

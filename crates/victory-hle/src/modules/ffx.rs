@@ -7,7 +7,10 @@
 //! translate: its output stayed black. `ffxDispatch` alone is taken here:
 //! an upscale dispatch becomes a plain stretch of the colour input
 //! (`victory_gpu::list::upscale_stretch`); anything else, and an upscale we
-//! could not stretch, goes to the title's DLL.
+//! could not stretch, goes to the title's DLL. With a DLSS plugin
+//! (`victory_gpu::dlss`) DLSS is tried before the stretch, and
+//! `ffxCreateContext` is taken too, only to see what the title makes its
+//! context with: the call goes on to the title's DLL.
 //!
 //! The structures are the public FidelityFX API's (`ffx_api.h`,
 //! `ffx_upscale.h`): a header of a type and a next pointer, and resources of
@@ -21,10 +24,16 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 pub const LOADER: &str = "amd_fidelityfx_loader_xbox.dll";
 
 static REAL: AtomicUsize = AtomicUsize::new(0);
+static REAL_CREATE: AtomicUsize = AtomicUsize::new(0);
 
 /// The title's own `ffxDispatch`, for what is not stretched here.
 pub fn set_real_dispatch(address: usize) {
     REAL.store(address, Ordering::Relaxed);
+}
+
+/// The title's own `ffxCreateContext`.
+pub fn set_real_create(address: usize) {
+    REAL_CREATE.store(address, Ordering::Relaxed);
 }
 
 #[repr(C)]
@@ -55,8 +64,27 @@ struct Upscale {
     motion_scale: [f32; 2],
     render: [u32; 2],
     upscale: [u32; 2],
+    // (The public API's `bool`s are bytes here: the title's, not checked.)
+    sharpening: u8,
+    sharpness: f32,
+    frame_time: f32,
+    pre_exposure: f32,
+    reset: u8,
+    /// Near, far, vertical angle, metres to a unit.
+    camera: [f32; 4],
+    flags: u32,
 }
 
+/// `ffxCreateContextDescUpscale`, as far as it is read.
+#[repr(C)]
+struct CreateUpscale {
+    header: Header,
+    flags: u32,
+    max_render: [u32; 2],
+    max_upscale: [u32; 2],
+}
+
+const _: () = assert!(size_of::<Upscale>() == 432);
 const _: () = assert!(size_of::<Resource>() == 48);
 const _: () = assert!(std::mem::offset_of!(Upscale, output) == 0x138);
 
@@ -66,7 +94,82 @@ const ERROR: u32 = 1;
 /// `FFX_API_DISPATCH_DESC_TYPE_UPSCALE`.
 const UPSCALE: u64 = 0x0001_0001;
 
+/// `FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE`.
+const CREATE_UPSCALE: u64 = 0x0001_0000;
+
 type Dispatch = extern "system" fn(*mut *mut c_void, *const Header) -> u32;
+type Create = extern "system" fn(*mut *mut c_void, *const Header, *const c_void) -> u32;
+
+/// The upscale description in the chain of descriptions `at` starts.
+///
+/// # Safety
+/// Null, or a chain of the title's.
+unsafe fn upscale_in<'a>(mut at: *const Header) -> Option<&'a CreateUpscale> {
+    // A chain is a few long: a longer one is not one.
+    for _ in 0..16 {
+        // SAFETY: the caller's chain.
+        let header = unsafe { at.as_ref() }?;
+        if header.kind == CREATE_UPSCALE {
+            // SAFETY: a description of this type.
+            return Some(unsafe { &*at.cast::<CreateUpscale>() });
+        }
+        at = header.next;
+    }
+    None
+}
+
+extern "system" fn create(
+    context: *mut *mut c_void,
+    desc: *const Header,
+    memory: *const c_void,
+) -> u32 {
+    let real = REAL_CREATE.load(Ordering::Relaxed);
+    if real == 0 {
+        return ERROR;
+    }
+    // SAFETY: the title's own `ffxCreateContext`, with its own arguments.
+    let code = unsafe { std::mem::transmute::<usize, Create>(real)(context, desc, memory) };
+    // SAFETY: the title's descriptions, and the context it was given.
+    if code == 0
+        && let (Some(made), Some(&id)) = unsafe { (upscale_in(desc), context.as_ref()) }
+    {
+        #[cfg(windows)]
+        victory_gpu::dlss::context_made(
+            id as usize,
+            victory_gpu::dlss::Context {
+                flags: made.flags,
+                max_render: made.max_render,
+                max_upscale: made.max_upscale,
+            },
+        );
+        #[cfg(not(windows))]
+        let _ = (made, id);
+    }
+    code
+}
+
+/// One upscale dispatch as DLSS is asked for it.
+#[cfg(windows)]
+fn for_dlss(context: usize, d: &Upscale) -> (victory_gpu::dlss::Dispatch, victory_gpu::dlss::Textures) {
+    (
+        victory_gpu::dlss::Dispatch {
+            context,
+            jitter: d.jitter,
+            motion_scale: d.motion_scale,
+            render: d.render,
+            upscale: d.upscale,
+            pre_exposure: d.pre_exposure,
+            reset: d.reset != 0,
+        },
+        victory_gpu::dlss::Textures {
+            colour: d.colour.resource,
+            depth: d.depth.resource,
+            motion: d.motion.resource,
+            exposure: d.exposure.resource,
+            output: d.output.resource,
+        },
+    )
+}
 
 extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u32 {
     // SAFETY: the title passes a dispatch description, whose header says
@@ -86,8 +189,23 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                     output_size = ?(d.output.description[2], d.output.description[3]),
                     render = ?d.render,
                     upscale = ?d.upscale,
+                    jitter = ?d.jitter,
+                    motion_scale = ?d.motion_scale,
+                    motion_size = ?(d.motion.description[2], d.motion.description[3]),
+                    motion_format = d.motion.description[1],
+                    pre_exposure = d.pre_exposure,
+                    reset = d.reset,
                     "upscale dispatch"
                 );
+            }
+            #[cfg(windows)]
+            if victory_gpu::dlss::loaded() {
+                // SAFETY: the title's context, if it passes one.
+                let id = unsafe { context.as_ref() }.map_or(0, |&c| c as usize);
+                let (dispatch, textures) = for_dlss(id, d);
+                if victory_gpu::list::upscale_dlss(d.list, &dispatch, &textures) {
+                    return 0;
+                }
             }
             #[cfg(windows)]
             if victory_gpu::list::upscale_stretch(
@@ -144,8 +262,87 @@ mod tests {
         assert_eq!(offset_of!(Upscale, motion_scale), 0x170);
         assert_eq!(offset_of!(Upscale, render), 0x178);
         assert_eq!(offset_of!(Upscale, upscale), 0x180);
+        assert_eq!(offset_of!(Upscale, sharpening), 0x188);
+        assert_eq!(offset_of!(Upscale, pre_exposure), 0x194);
+        assert_eq!(offset_of!(Upscale, reset), 0x198);
+        assert_eq!(offset_of!(Upscale, camera), 0x19c);
+        assert_eq!(offset_of!(Upscale, flags), 0x1ac);
+        assert_eq!(offset_of!(CreateUpscale, flags), 0x10);
+        assert_eq!(offset_of!(CreateUpscale, max_render), 0x14);
+        assert_eq!(offset_of!(CreateUpscale, max_upscale), 0x1c);
         assert_eq!(offset_of!(Resource, description), 8);
         assert_eq!(offset_of!(Resource, state), 40);
+    }
+
+    /// The upscale description is found wherever it is in its chain, and
+    /// not in another's.
+    #[test]
+    fn the_context_description_is_found_in_its_chain() {
+        let upscale = CreateUpscale {
+            header: Header { kind: CREATE_UPSCALE, next: std::ptr::null() },
+            flags: 0x29,
+            max_render: [1280, 720],
+            max_upscale: [1920, 1080],
+        };
+        let backend = Header { kind: 0x0100_0002, next: (&raw const upscale).cast() };
+        let version = Header { kind: 0x1, next: &raw const backend };
+        // SAFETY: a chain of our own, alive for the calls.
+        let found = unsafe { upscale_in(&raw const version) }.expect("the description");
+        assert_eq!((found.flags, found.max_render, found.max_upscale), (0x29, [1280, 720], [1920, 1080]));
+        let alone = Header { kind: 0x1, next: std::ptr::null() };
+        // SAFETY: as above; null is an empty chain.
+        unsafe {
+            assert!(upscale_in(&raw const alone).is_none());
+            assert!(upscale_in(std::ptr::null()).is_none());
+        }
+    }
+
+    /// The title's `ffxCreateContext` is called with its own arguments and
+    /// its answer given back, a failure too.
+    #[test]
+    fn creation_goes_on_to_the_title() {
+        extern "system" fn made(context: *mut *mut c_void, _: *const Header, _: *const c_void) -> u32 {
+            // SAFETY: the test's pointer.
+            unsafe { context.write(0x40 as *mut c_void) };
+            0
+        }
+        extern "system" fn not(_: *mut *mut c_void, _: *const Header, _: *const c_void) -> u32 {
+            7
+        }
+        let upscale = CreateUpscale {
+            header: Header { kind: CREATE_UPSCALE, next: std::ptr::null() },
+            flags: 0,
+            max_render: [1280, 720],
+            max_upscale: [1920, 1080],
+        };
+        let before = REAL_CREATE.swap(0, Ordering::Relaxed);
+        let mut context = std::ptr::null_mut();
+        let mut call = || create(&mut context, (&raw const upscale).cast(), std::ptr::null());
+        assert_eq!(call(), ERROR);
+        set_real_create(not as *const () as usize);
+        assert_eq!(call(), 7);
+        set_real_create(made as *const () as usize);
+        assert_eq!(call(), 0);
+        assert_eq!(context as usize, 0x40);
+        REAL_CREATE.store(before, Ordering::Relaxed);
+    }
+
+    /// What DLSS is asked for is the title's dispatch, unchanged.
+    #[cfg(windows)]
+    #[test]
+    fn the_dispatch_is_passed_on_as_it_is() {
+        // SAFETY: numbers and pointers only: all zero is a value.
+        let mut d: Upscale = unsafe { std::mem::zeroed() };
+        d.jitter = [0.25, -0.375];
+        d.motion_scale = [1280.0, -720.0];
+        (d.render, d.upscale) = ([1280, 720], [1920, 1080]);
+        (d.pre_exposure, d.reset) = (2.0, 3);
+        d.motion.resource = 0x50 as *const c_void;
+        let (n, t) = for_dlss(9, &d);
+        assert_eq!((n.context, n.jitter, n.motion_scale), (9, d.jitter, d.motion_scale));
+        assert_eq!((n.render, n.upscale, n.pre_exposure, n.reset), (d.render, d.upscale, 2.0, true));
+        assert_eq!(t.motion as usize, 0x50);
+        assert!(t.exposure.is_null());
     }
 
     /// A dispatch that is not an upscale, with no DLL of the title's to
@@ -168,4 +365,17 @@ mod tests {
 /// for the dispatches passed on.
 pub fn dispatch_address() -> usize {
     dispatch as *const () as usize
+}
+
+/// Whether a DLSS plugin was asked for and loaded.
+pub fn dlss() -> bool {
+    #[cfg(windows)]
+    return victory_gpu::dlss::loaded();
+    #[cfg(not(windows))]
+    false
+}
+
+/// What the import of `ffxCreateContext` is bound to with a DLSS plugin.
+pub fn create_address() -> usize {
+    create as *const () as usize
 }
