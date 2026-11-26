@@ -634,6 +634,9 @@ pub(crate) fn skipped(why: &'static str) {
     told(why, 0);
 }
 
+mod check;
+pub(crate) use check::{copy as check_copy, due as check_due};
+
 #[cfg(test)]
 mod card;
 #[cfg(test)]

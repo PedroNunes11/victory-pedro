@@ -251,3 +251,55 @@ fn without_a_plugin_there_is_no_dlss() {
     let textures = Textures { colour: null, depth: null, motion: null, exposure: null, output: null };
     assert!(!crate::list::upscale_dlss(8 as *const c_void, &dispatch(), &textures));
 }
+
+#[test]
+fn halves_are_read_as_the_floats_they_are() {
+    use super::check::half;
+    assert_eq!(half(0x3c00), 1.0);
+    assert_eq!(half(0xc000), -2.0);
+    assert_eq!(half(0x0000), 0.0);
+    assert_eq!(half(0x0001), 2f32.powi(-24));
+    assert_eq!(half(0x0200), 2f32.powi(-15));
+    assert_eq!(half(0x3555), 0.333_251_95);
+    assert!(half(0x7c00).is_infinite() && half(0x7e00).is_nan());
+}
+
+#[test]
+fn the_check_reads_depth_and_motion_of_the_rendered_part_only() {
+    use super::check::{Plane, depth_stats, half, jitter_spread, motion_stats};
+    // Depth: 4 by 2 texels of floats in rows of 32 bytes, 3 by 2 rendered;
+    // the fourth column holds what must not be read.
+    let plane = Plane { offset: 16, pitch: 32, width: 4, height: 2, format: 40 };
+    let mut bytes = vec![0u8; 16 + 64];
+    for (row, values) in [[0.0f32, 0.25, 1.0, 9.0], [0.0, 0.5, f32::NAN, 9.0]].iter().enumerate() {
+        for (i, v) in values.iter().enumerate() {
+            let at = 16 + row * 32 + i * 4;
+            bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    let s = depth_stats(&bytes, &plane, [3, 2]).unwrap();
+    assert_eq!((s.looked, s.bad, s.zeros, s.ones), (6, 1, 2, 1));
+    assert_eq!((s.min, s.max), (0.0, 1.0));
+    assert!((s.mean - 0.35).abs() < 1e-6);
+    // A format it does not read, and a plane that does not fit its bytes.
+    assert!(depth_stats(&bytes, &Plane { format: 28, ..plane }, [3, 2]).is_none());
+    assert!(depth_stats(&bytes[..40], &plane, [3, 2]).is_none());
+
+    // Motion: 2 by 1 texels of two halves, scaled to pixels.
+    let plane = Plane { offset: 0, pitch: 256, width: 2, height: 1, format: 34 };
+    let mut bytes = vec![0u8; 256];
+    // (0.5, -0.25) and (0, 0).
+    bytes[0..2].copy_from_slice(&0x3800u16.to_le_bytes());
+    bytes[2..4].copy_from_slice(&0xb400u16.to_le_bytes());
+    assert_eq!((half(0x3800), half(0xb400)), (0.5, -0.25));
+    let s = motion_stats(&bytes, &plane, [2, 1], [1280.0, -720.0]).unwrap();
+    assert_eq!((s.looked, s.still, s.bad), (2, 1, 0));
+    assert_eq!((s.x, s.y), ([0.0, 640.0], [0.0, 180.0]));
+    // 640 pixels is longer than an image two texels wide.
+    assert_eq!(s.long, 1);
+    assert!(motion_stats(&bytes, &Plane { format: 2, ..plane }, [2, 1], [1.0, 1.0]).is_none());
+
+    // Jitters: three, two of them the same.
+    let jitters: std::collections::VecDeque<[f32; 2]> = [[0.25, -0.5], [0.25, -0.5], [-0.125, 0.375]].into();
+    assert_eq!(jitter_spread(&jitters), (2, [-0.125, 0.25], [-0.5, 0.375]));
+}

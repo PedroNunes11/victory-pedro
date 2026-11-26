@@ -1118,6 +1118,13 @@ pub fn upscale_dlss(
         }
         // What shaders wrote into the depth texture's twin, first.
         list.twin_use(depth, false, false);
+        // `VICTORY_DLSS_CHECK`: the depth and motion of this dispatch are
+        // copied out to be read back and said in the log.
+        if crate::dlss::check_due(d) {
+            ensure_state(list, depth, COPY_SOURCE);
+            ensure_state(list, motion, COPY_SOURCE);
+            crate::dlss::check_copy(&list.list, d, colour_host, depth_host, motion_host);
+        }
         for (r, _) in read {
             ensure_state(list, r, SHADER_READ);
         }
