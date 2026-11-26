@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod discord;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
@@ -180,6 +181,10 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // (AnyXboxX) Discord Rich Presence while a title runs (`discord.rs`, `VICTORY_DISCORD=1`).
+    if std::env::args().nth(1).as_deref() == Some("run") {
+        discord::start();
+    }
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]

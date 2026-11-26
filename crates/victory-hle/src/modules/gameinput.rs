@@ -385,6 +385,27 @@ unsafe impl Sync for Hub {}
 
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+/// (AnyXboxX) Whether the automatic A is down `run` after the start, with
+/// `VICTORY_AUTO_A=<limit_s>`: a quarter of a second in every four, for
+/// `limit_s` seconds (0: never).
+fn auto_a_now(limit_s: u64, run: std::time::Duration) -> bool {
+    run.as_secs() < limit_s && run.as_millis() % 4000 < 250
+}
+
+#[cfg(test)]
+mod auto_a_tests {
+    use std::time::Duration;
+
+    #[test]
+    fn auto_a_presses_a_quarter_second_in_four_until_the_limit() {
+        assert!(super::auto_a_now(10, Duration::from_millis(100)));
+        assert!(!super::auto_a_now(10, Duration::from_millis(300)));
+        assert!(super::auto_a_now(10, Duration::from_millis(8_200)));
+        assert!(!super::auto_a_now(10, Duration::from_millis(12_100)));
+        assert!(!super::auto_a_now(0, Duration::from_millis(100)));
+    }
+}
+
 /// Microseconds, the clock of every timestamp we hand out.
 fn now() -> u64 {
     START.elapsed().as_micros() as u64
@@ -1252,6 +1273,16 @@ mod host {
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
                 down.extend(held);
+            }
+            // (AnyXboxX) `VICTORY_AUTO_A=<seconds>`: for that long after the start, Enter
+            // (the stand-in pad's A) is down for a quarter of a second in every four,
+            // whether or not the window has focus: a launch gets through the title's
+            // "press A" screens without the focus being taken from what the user does.
+            static AUTO_A: LazyLock<u64> = LazyLock::new(|| {
+                std::env::var("VICTORY_AUTO_A").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+            });
+            if super::auto_a_now(*AUTO_A, super::START.elapsed()) && !down.contains(&0x0D) {
+                down.push(0x0D);
             }
             down.into_iter()
                 .map(|vk| KeyState {

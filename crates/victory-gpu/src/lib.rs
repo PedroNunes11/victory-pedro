@@ -45,6 +45,12 @@ pub mod frame;
 mod book;
 #[cfg(windows)]
 mod host;
+// (AnyXboxX) The Neptune overlay; its screenshot helpers wait for an F12 capture.
+#[allow(dead_code)]
+mod overlay;
+#[allow(dead_code)]
+mod pixels;
+mod screenshot;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]

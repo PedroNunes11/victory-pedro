@@ -42,4 +42,19 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-env=VICTORY_TRANSLATOR={}", hash.finalize().to_hex());
+    // (AnyXboxX) The build tag the overlay shows: the git short hash, moving with every commit
+    // through the log's file.
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let build = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=VICTORY_BUILD={build}");
+    if let Some(log) = git(&["rev-parse", "--git-path", "logs/HEAD"]) {
+        println!("cargo:rerun-if-changed={log}");
+    }
 }
