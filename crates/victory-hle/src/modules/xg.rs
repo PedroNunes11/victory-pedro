@@ -11,11 +11,13 @@
 // Title code passes pointers the real library would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use victory_formats::texture::{Dimension, Error, Layout, Swizzle, Texture, TextureDesc};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
+use super::xg_oracle;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
 
@@ -71,14 +73,23 @@ fn suggested(desc: &ResourceDesc) -> Swizzle {
 /// result in the description's layout field.
 pub extern "system" fn XGSuggestSwizzleMode(
     desc: *const ResourceDesc,
-    _flags: u32,
+    flags: u32,
     out: *mut u32,
 ) -> HRESULT {
+    let oracle = xg_oracle::get();
+    if let Some(o) = oracle
+        && o.real
+    {
+        return o.suggest(desc, flags, out);
+    }
     // SAFETY: the title passes a description and room for the layout
     // (either may be null).
     match unsafe { (desc.as_ref(), out.as_mut()) } {
         (Some(desc), Some(out)) => {
             *out = SWIZZLED | suggested(desc).0;
+            if let Some(o) = oracle {
+                o.compare_suggest(desc, *out);
+            }
             S_OK
         }
         _ => E_INVALIDARG,
@@ -92,6 +103,10 @@ pub struct Computer {
     desc: ResourceDesc,
     mips: u32,
     texture: Texture,
+    /// The real library's computer for the same description when
+    /// `VICTORY_XG_DLL` asks for a comparison (else null), and its size.
+    real: *mut c_void,
+    real_size: u64,
 }
 
 type This = *mut Computer;
@@ -105,12 +120,23 @@ pub extern "system" fn XGCreateTextureComputer(
     desc: *const ResourceDesc,
     out: *mut This,
 ) -> HRESULT {
+    let oracle = xg_oracle::get();
+    if let Some(o) = oracle
+        && o.real
+    {
+        return o.create(desc, out.cast());
+    }
     // SAFETY: the title passes a description and room for a pointer.
     let (Some(&desc), false) = (unsafe { desc.as_ref() }, out.is_null()) else {
         return E_INVALIDARG;
     };
+    let real = oracle.map_or(std::ptr::null_mut(), |o| o.computer(&desc));
     let Some(texture) = texture(&desc) else {
         tracing::warn!(?desc, "no texture layout");
+        if let Some(o) = oracle {
+            o.compare_layout(&desc, None, real);
+            o.release(real);
+        }
         return E_INVALIDARG;
     };
     tracing::debug!(
@@ -128,10 +154,43 @@ pub extern "system" fn XGCreateTextureComputer(
         desc,
         mips,
         texture,
+        real,
+        real_size: 0,
     });
+    let this = Box::into_raw(computer);
+    if let Some(o) = oracle {
+        compare_layouts(o, this, &desc);
+    }
     // SAFETY: checked non-null.
-    unsafe { out.write(Box::into_raw(computer)) };
+    unsafe { out.write(this) };
     S_OK
+}
+
+/// Our layout of a new computer against the real library's, which also
+/// gives the size of scratch memory the real copies need.
+fn compare_layouts(o: &xg_oracle::Oracle, this: This, desc: &ResourceDesc) {
+    // SAFETY: plain data, filled by the call.
+    let mut ours: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
+    layout(this, &mut *ours);
+    // SAFETY: `this` was just made and is not yet shared.
+    let real = unsafe { (*this).real };
+    o.compare_layout(desc, Some(&ours), real);
+    if real.is_null() {
+        return;
+    }
+    // SAFETY: plain data, filled by the call.
+    let mut theirs: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
+    // SAFETY: a live real computer and room for its layout.
+    let hr = unsafe {
+        xg_oracle::slot::<extern "system" fn(*mut c_void, *mut LayoutOut) -> HRESULT>(
+            real,
+            xg_oracle::SLOT_LAYOUT,
+        )(real, &mut *theirs)
+    };
+    if hr == S_OK {
+        // SAFETY: just made, not yet shared.
+        unsafe { (*this).real_size = theirs.size };
+    }
 }
 
 fn texture(desc: &ResourceDesc) -> Option<Texture> {
@@ -284,7 +343,10 @@ extern "system" fn release(this: This) -> u32 {
     if left == 0 {
         // SAFETY: made by `Box::into_raw` in `XGCreateTextureComputer`; the
         // last reference is gone.
-        drop(unsafe { Box::from_raw(this) });
+        let c = unsafe { Box::from_raw(this) };
+        if let Some(o) = xg_oracle::get() {
+            o.release(c.real);
+        }
     }
     left
 }
@@ -408,8 +470,57 @@ extern "system" fn copy_into(
         .tile(tiled, a.mip, a.slice, linear, row as usize, depth as usize);
     if r.is_err() {
         tracing::warn!(?r, desc = ?c.desc, subresource, "copy into a texture failed");
+    } else if !c.real.is_null()
+        && let Some(o) = xg_oracle::get()
+        && o.check_copy(&c.desc, subresource)
+    {
+        compare_copy(o, c, &a, plane, subresource, linear, row, depth);
     }
     result(r)
+}
+
+/// The same copy through our layout and the real library, into scratch
+/// memory, compared byte for byte.
+#[allow(clippy::too_many_arguments)]
+fn compare_copy(
+    o: &xg_oracle::Oracle,
+    c: &Computer,
+    a: &CopyArgs<'_>,
+    plane: u32,
+    subresource: u32,
+    linear: &[u8],
+    row: u32,
+    depth: u32,
+) {
+    let offset = c.texture.planes[plane as usize].offset as usize;
+    let mut ours = vec![0u8; a.tiled];
+    let mut theirs = vec![0u8; a.tiled.max(c.real_size as usize) + 4096];
+    let r = a.layout.tile(
+        &mut ours[offset..],
+        a.mip,
+        a.slice,
+        linear,
+        row as usize,
+        depth as usize,
+    );
+    // SAFETY: a live real computer; scratch memory holds the whole texture
+    // as the real library sizes it.
+    let hr = unsafe {
+        xg_oracle::slot::<xg_oracle::CopyInto>(c.real, xg_oracle::SLOT_COPY_INTO)(
+            c.real,
+            theirs.as_mut_ptr(),
+            plane,
+            subresource,
+            linear.as_ptr(),
+            row,
+            depth,
+        )
+    };
+    if r.is_ok() && hr == S_OK {
+        o.report_copy(&c.desc, subresource, &ours, &theirs[..a.tiled]);
+    } else {
+        tracing::warn!(?r, hr = format_args!("{:#x}", hr as u32), desc = ?c.desc, subresource, "xg oracle: copy refused");
+    }
 }
 
 /// `(linear, plane, subresource, sample, tiled base, row pitch, depth
@@ -450,6 +561,7 @@ extern "system" fn copy_from(
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackedMips {
     pub standard: u8,
     pub packed: u8,
@@ -458,6 +570,7 @@ pub struct PackedMips {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubresourceTiling {
     pub width: u32,
     pub height: u16,
@@ -474,7 +587,7 @@ const TILE: u64 = 64 << 10;
 /// every slice in turn. With a tail the console's library lists two slices
 /// at most and zeroes all but the first; so do we (the title reads slice 0
 /// only).
-extern "system" fn tiling(
+extern "system" fn tiling_ours(
     this: This,
     tiles: *mut u32,
     packed: *mut PackedMips,
@@ -543,6 +656,101 @@ extern "system" fn tiling(
         }
     }
     S_OK
+}
+
+/// Slot 0x50 as the title calls it: ours, then the real library's answer
+/// to the same question compared when a comparison is on.
+extern "system" fn tiling(
+    this: This,
+    tiles: *mut u32,
+    packed: *mut PackedMips,
+    shape: *mut [u32; 3],
+    count: *mut u32,
+    first: u32,
+    out: *mut SubresourceTiling,
+) -> HRESULT {
+    // SAFETY: null or room for the count.
+    let room = unsafe { count.as_ref().copied() }.unwrap_or(0);
+    let hr = tiling_ours(this, tiles, packed, shape, count, first, out);
+    let c = computer(this);
+    if let Some(o) = xg_oracle::get()
+        && !c.real.is_null()
+    {
+        compare_tiling(o, c, room, first);
+    }
+    hr
+}
+
+const NO_TILING: SubresourceTiling = SubresourceTiling {
+    width: 0,
+    height: 0,
+    depth: 0,
+    start: 0,
+};
+const NO_PACKED: PackedMips = PackedMips {
+    standard: 0,
+    packed: 0,
+    tiles: 0,
+    start: 0,
+};
+
+/// Everything slot 0x50 reports for one question.
+type TilingAnswer = (HRESULT, u32, PackedMips, [u32; 3], Vec<SubresourceTiling>);
+type TilingAsk<'a> = &'a dyn Fn(
+    *mut u32,
+    *mut PackedMips,
+    *mut [u32; 3],
+    *mut u32,
+    *mut SubresourceTiling,
+) -> HRESULT;
+
+fn tiling_answer(ask: TilingAsk<'_>, room: u32) -> TilingAnswer {
+    let (mut tiles, mut packed, mut shape, mut n) = (0u32, NO_PACKED, [0u32; 3], room);
+    let mut out = vec![NO_TILING; room as usize];
+    let hr = ask(
+        &mut tiles,
+        &mut packed,
+        &mut shape,
+        &mut n,
+        out.as_mut_ptr(),
+    );
+    out.truncate((n as usize).min(room as usize));
+    (hr, tiles, packed, shape, out)
+}
+
+/// Slot 0x50 of ours and of the real library for the same question,
+/// reported once per description when they differ.
+fn compare_tiling(o: &xg_oracle::Oracle, c: &Computer, room: u32, first: u32) {
+    let this = std::ptr::from_ref(c).cast_mut();
+    let ours = tiling_answer(
+        &|t, p, s, n, out| tiling_ours(this, t, p, s, n, first, out),
+        room,
+    );
+    let theirs = tiling_answer(
+        &|t, p, s, n, out| {
+            // SAFETY: a live real computer and room for every output.
+            unsafe {
+                xg_oracle::slot::<xg_oracle::Tiling>(c.real, xg_oracle::SLOT_TILING)(
+                    c.real,
+                    t,
+                    p.cast(),
+                    s,
+                    n,
+                    first,
+                    out.cast(),
+                )
+            }
+        },
+        room,
+    );
+    let what = if ours.0 != theirs.0 {
+        format!("hr ours {:#x} real {:#x}", ours.0 as u32, theirs.0 as u32)
+    } else if ours.0 != S_OK || ours == theirs {
+        return;
+    } else {
+        format!("ours {ours:?} real {theirs:?}")
+    };
+    o.report_tiling(&c.desc, &what);
 }
 
 /// Slot 0x30 `(plane, mip, x, y, z or slice, sample, bit position)`: an
