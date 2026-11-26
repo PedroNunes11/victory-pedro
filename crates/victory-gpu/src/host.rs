@@ -182,6 +182,17 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     }
 }
 
+/// The host device's adapter name and dedicated video memory, when DXGI
+/// named it (the frametime dump's hardware line).
+pub(crate) fn adapter_summary() -> Option<(String, u64)> {
+    let host = host()?;
+    let adapter = host.adapter.as_ref()?;
+    // SAFETY: a plain DXGI adapter query on an adapter the device named.
+    let desc = unsafe { adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()? };
+    let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+    Some((String::from_utf16_lossy(&desc.Description[..end]), desc.DedicatedVideoMemory as u64))
+}
+
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
@@ -9416,6 +9427,8 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        // `VICTORY_FRAMETIME_DUMP`: times every present, before the one-second gate below.
+        crate::frametime::tick();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -9476,7 +9489,7 @@ impl Meter {
             crate::shadow::back_line(frames);
             #[cfg(feature = "diagnostics")]
             split_line(frames);
-            {
+            let (card_passes, card_compares) = {
                 let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
                 if passes + compares > 0.0 {
                     tracing::info!(
@@ -9485,8 +9498,9 @@ impl Meter {
                         if rehash_runs() { "on" } else { "off" }
                     );
                 }
-            }
-            {
+                (passes, compares)
+            };
+            let texture_refresh_ms = {
                 let [own, asking, still, all] =
                     [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
                 if all >= 1.0 {
@@ -9496,6 +9510,7 @@ impl Meter {
                          hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                     );
                 }
+                let texture_refresh_ms = all;
                 let [through, left, filled, short] =
                     [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
                 if through + left + filled > 0.0 {
@@ -9506,7 +9521,8 @@ impl Meter {
                          with less than was mapped (looked at again)"
                     );
                 }
-            }
+                texture_refresh_ms
+            };
             {
                 let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
                 if copies > 0.0 {
@@ -9533,6 +9549,49 @@ impl Meter {
             // Over the same frames as the counts above.
             #[cfg(feature = "diagnostics")]
             let drops = crate::pipeline::take_drops();
+            // `VICTORY_FRAMETIME_DUMP`: one row a second, from the figures taken above, and the
+            // worst and mean frame timed at each present. Empty cell on this base: `cpu_pct`
+            // (the process's share of the machine is not measured here). `gpu_pct` is
+            // `gpu / ms` as on the Neptune base, `ram_mb` the working set (`ram_sample`).
+            let (frame_ms_max, frame_ms_avg, _timed) = crate::frametime::take_interval();
+            crate::frametime::record(&crate::frametime::Row {
+                frame: crate::frame::current(),
+                frames,
+                fps,
+                ms,
+                frame_ms_max,
+                frame_ms_avg,
+                cpu_prepare_ms: cpu,
+                gpu_ms: gpu,
+                gpu_pct: if ms > 0.0 { gpu / ms * 100.0 } else { 0.0 },
+                copies_ms: copy_ms,
+                copies_mb: copy_mb,
+                textures_ms: texture_ms,
+                textures_mb: texture_mb,
+                copyback_ms: back_ms,
+                copyback_mb: back_mb,
+                draws,
+                dropped,
+                making: crate::pipeline::making() as f64,
+                indirect,
+                heap_passes: picked,
+                heap_ms: picked_ms,
+                texture_refresh_ms,
+                card_passes,
+                card_compares,
+                card_sent_mb: card[0] as f64 / frames / 1e6,
+                card_ranges: card[1] as f64 / frames,
+                card_pieces: card[2] as f64 / frames,
+                card_fetched: card[3] as f64 / frames,
+                card_fetched_mb: card[4] as f64 / frames / 1e6,
+                card_waits: card[5] as f64 / frames,
+                card_wait_ms: card[6] as f64 / frames / 1e3,
+                twins_into_depth: twin_to_depth,
+                twins_into_colour: twin_to_colour,
+                depth_planes: planes,
+                ram_mb: ram_sample().map_or(0.0, |s| s.0 as f64 / (1024.0 * 1024.0)),
+                cpu_pct: None,
+            });
             if !five {
                 return;
             }
