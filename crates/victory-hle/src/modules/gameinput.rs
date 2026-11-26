@@ -121,7 +121,9 @@ trait Source: Send {
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
+    // The controls are written for QWERTY; `keymap` says which key each one is on this keyboard.
+    let on = |logical: u8| {
+        let vk = super::keymap::resolve(logical);
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
         } else {

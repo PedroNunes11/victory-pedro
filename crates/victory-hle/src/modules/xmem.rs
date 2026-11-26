@@ -258,9 +258,57 @@ const ALLOC_32BIT: u64 = 1 << 33;
 /// pointer handed out.
 const HEADER: usize = 2 * size_of::<usize>();
 
+/// ERA's smallest alignment, 16 bytes, as log2.
+pub const MIN_ALIGNMENT_LOG2: u32 = 4;
+
+/// `XMemAlloc` attributes (`XALLOC_ATTRIBUTES`) split with the public ERA
+/// layout of the Xbox One (SlimEra's `era.h`): object type:14, page size:2,
+/// allocator:8, alignment:5 (log2), memory type:4, reserved:31. The field
+/// split follows Xbox2Windows' `src/era_heap.cpp` (MIT, credited in
+/// AnyXboxX's THIRD_PARTY.md). That the Series X keeps this layout is an
+/// assumption. AnyXboxX's `xmem.dll` (`crates/anyxboxx-xmem`) hands this
+/// structure out as is, hence `repr(C)`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EraFields {
+    pub object_type: u32,
+    /// 0: 4 KiB, 1: 64 KiB, 2: 4 MiB, 3: undefined.
+    pub page_size: u32,
+    pub allocator_id: u32,
+    /// log2 of the requested alignment.
+    pub alignment: u32,
+    /// 0: heap, 1-6: graphics, 7-9: physical, 10-15: undefined.
+    pub memory_type: u32,
+    /// Bits 33 and up; we read bit 33 as a 32-bit address (`ALLOC_32BIT`).
+    pub reserved: u64,
+}
+
+impl EraFields {
+    pub const fn decode(attributes: u64) -> Self {
+        Self {
+            object_type: (attributes & 0x3fff) as u32,
+            page_size: (attributes >> 14 & 0x3) as u32,
+            allocator_id: (attributes >> 16 & 0xff) as u32,
+            alignment: (attributes >> ALIGNMENT_SHIFT & 0x1f) as u32,
+            memory_type: (attributes >> 29 & 0xf) as u32,
+            reserved: attributes >> 33,
+        }
+    }
+
+    /// The requested alignment in bytes, 16 at least.
+    pub const fn alignment_bytes(&self) -> usize {
+        let log2 = if self.alignment < MIN_ALIGNMENT_LOG2 {
+            MIN_ALIGNMENT_LOG2
+        } else {
+            self.alignment
+        };
+        1 << log2
+    }
+}
+
 fn layout(size: usize, attributes: u64) -> Option<Layout> {
     // An alignment of at least 16 leaves room for the header.
-    let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f).max(4);
+    let align = EraFields::decode(attributes).alignment_bytes();
     Layout::from_size_align(size.checked_add(align)?, align).ok()
 }
 
@@ -2039,6 +2087,30 @@ mod tests {
         let process = unsafe { GetCurrentProcess() };
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
+    }
+
+    #[test]
+    fn era_fields_split_the_attribute_word() {
+        // Words Xbox2Windows saw at Bink's and AMD's calls.
+        let bink = EraFields::decode(0x05e5_0000);
+        let heap = EraFields {
+            allocator_id: 0xe5,
+            alignment: 5,
+            ..Default::default()
+        };
+        assert_eq!(bink, heap);
+        assert_eq!(bink.alignment_bytes(), 32);
+        let amd = EraFields {
+            page_size: 1,
+            alignment: 8,
+            memory_type: 5,
+            ..Default::default()
+        };
+        assert_eq!(EraFields::decode(0xa800_4000), amd);
+        let tagged = EraFields::decode(0x1234 | 3 << 33);
+        assert_eq!((tagged.object_type, tagged.reserved), (0x1234, 3));
+        assert_eq!(tagged.alignment_bytes(), 16);
+        assert_eq!(size_of::<EraFields>(), 32);
     }
 
     #[test]

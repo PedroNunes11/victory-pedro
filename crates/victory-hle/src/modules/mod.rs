@@ -20,6 +20,7 @@ pub mod dstorage;
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
+pub mod keymap;
 #[cfg(windows)]
 pub mod lifecycle;
 #[cfg(windows)]
