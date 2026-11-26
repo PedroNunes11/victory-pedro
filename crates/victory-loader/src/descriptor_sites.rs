@@ -2,16 +2,10 @@
 //! `port_descriptors`): the title's own code that copies descriptor records
 //! into its shader-visible heap as bytes tells the layer which slots it wrote.
 //!
-//! What the title does (game_scarlett_master.exe): each draw's and each
-//! dispatch's descriptor tables are allocated from its frame allocator
-//! (image +0x4d9f400; the allocator's memory is the placed shader-visible
-//! view heap) and filled by two functions, +0x4d9efd0 (graphics) and
-//! +0x4eec8e0 (compute), three loops each, one record at a time:
-//! `and r, 7FE0h` (the slot's byte offset in the table), `vmovups ymm0,
-//! [record]`, `vmovups [table + r], ymm0`. Found with `dumpbin /disasm` from
-//! the write faults of run faults-6 (book records "the instruction at a made
-//! the fault"); a search of all of `.text` for the same instruction shape
-//! finds these six stores and no other.
+//! Sites patched (game_scarlett_master.exe 1.0.2.1, image offsets): six
+//! stores of 32-byte records (`and r, 7FE0h`, `vmovups ymm0, [record]`,
+//! `vmovups [table + r], ymm0`), three in the title's graphics table filler
+//! and three in its compute one, listed in [`SITES`].
 //!
 //! Each store becomes a jump to code of ours that does the store, then, if
 //! the address lies in the heap `victory-gpu` names in [`Marks`], sets the
@@ -41,13 +35,13 @@ pub struct Site {
 /// The six record stores of the table fillers (game_scarlett_master.exe
 /// 1.0.2.1, image offsets).
 pub const SITES: [Site; 6] = [
-    // +0x4d9efd0, loop 1: [rcx+rsi]
+    // graphics filler, loop 1: [rcx+rsi]
     Site { window: 0x4d9f04f, store: 10, len: 5, bytes: &[0x81, 0xe1, 0xe0, 0x7f, 0x00, 0x00, 0xc5, 0xfc, 0x10, 0x00, 0xc5, 0xfc, 0x11, 0x04, 0x31, 0x0f, 0xb6, 0x47, 0x0b, 0x39, 0xc5] },
     // loop 2: [rcx+rsi]
     Site { window: 0x4d9f10d, store: 10, len: 5, bytes: &[0x81, 0xe1, 0xe0, 0x7f, 0x00, 0x00, 0xc5, 0xfc, 0x10, 0x00, 0xc5, 0xfc, 0x11, 0x04, 0x31, 0x0f, 0xb6, 0x47, 0x0f, 0x41, 0x39, 0xc5] },
     // loop 3: [r9+rsi]
     Site { window: 0x4d9f19c, store: 12, len: 6, bytes: &[0x41, 0x81, 0xe1, 0xe0, 0x7f, 0x00, 0x00, 0xc4, 0xc1, 0x7c, 0x10, 0x02, 0xc4, 0xc1, 0x7c, 0x11, 0x04, 0x31, 0x44, 0x0f, 0xb6, 0x4f, 0x0d, 0x44, 0x39, 0xc8] },
-    // +0x4eec8e0, loop 1: [r9+r8]
+    // compute filler, loop 1: [r9+r8]
     Site { window: 0x4eec95d, store: 11, len: 6, bytes: &[0x41, 0x81, 0xe1, 0xe0, 0x7f, 0x00, 0x00, 0xc5, 0xfc, 0x10, 0x00, 0xc4, 0x81, 0x7c, 0x11, 0x04, 0x01, 0x0f, 0xb6, 0x42, 0x0b, 0x39, 0xc5] },
     // loop 2: [rdi+r8]
     Site { window: 0x4eeca08, store: 10, len: 6, bytes: &[0x81, 0xe7, 0xe0, 0x7f, 0x00, 0x00, 0xc5, 0xfc, 0x10, 0x06, 0xc4, 0xa1, 0x7c, 0x11, 0x04, 0x07, 0x0f, 0xb6, 0x72, 0x0d, 0x39, 0xf0] },
@@ -189,11 +183,9 @@ pub const TITLE_MEMCPY: usize = 0x5f4_0560;
 /// The other writers of descriptor records into the heap, which the six
 /// stores do not cover (the fallback of runs port2-2 and pop-1 found 150-300
 /// view records a frame no store had told of, on 16 of the ~290 pages
-/// written): the frame allocator's two copiers, +0x4d9f200 (a table of
-/// exactly 128 bytes: four `vmovups` stores of `ymm3..ymm0` to
-/// `[rbx+60h..rbx]`, else `memcpy(rbx, r12, r14)`) and +0x4d9f540
-/// (`memcpy(rax, r15, rbx)`). Found from PORT-PATCH-2.md's suspects with the
-/// image's bytes (POPIN.md).
+/// written): two table copiers of the title's frame allocator, one of which
+/// also copies tables of exactly 128 bytes with four `vmovups` stores
+/// ([`COPY_128`]) and sends the others, like the second, to its `memcpy`.
 ///
 /// A call: the window's offset, the `call rel32`'s offset in it, the bytes
 /// (the call's own five included: its target must be [`TITLE_MEMCPY`]).
@@ -204,9 +196,9 @@ pub struct CallSite {
 }
 
 pub const COPY_CALLS: [CallSite; 2] = [
-    // +0x4d9f200, tables of another size: mov rcx, rbx ; mov rdx, r12 ; mov r8, r14 ; call memcpy
+    // first copier, tables of another size: mov rcx, rbx ; mov rdx, r12 ; mov r8, r14 ; call memcpy
     CallSite { window: 0x4d9_f37d, call: 9, bytes: &[0x48, 0x89, 0xd9, 0x4c, 0x89, 0xe2, 0x4d, 0x89, 0xf0, 0xe8, 0xd5, 0x11, 0x1a, 0x01] },
-    // +0x4d9f540: mov rcx, rax ; mov rdx, r15 ; mov r8, rbx ; mov r14, rax ; call memcpy
+    // second copier: mov rcx, rax ; mov rdx, r15 ; mov r8, rbx ; mov r14, rax ; call memcpy
     CallSite {
         window: 0x4d9_f540,
         call: 12,
@@ -214,12 +206,12 @@ pub const COPY_CALLS: [CallSite; 2] = [
     },
 ];
 
-/// The 128-byte table copy of +0x4d9f200: the window (its four stores, then
-/// `mov rcx, r15 ; mov rdx, rsi ; mov r8, rbx ; xor r9d, r9d`, which sets the
-/// flags before any use), and where its last two stores (9 bytes) are
-/// replaced by a jump. Not the `mov rcx, r15` after them: the `memcpy` path
-/// for other sizes jumps back to it (+0x4d9f38b `jmp +0x4d9f272`; run pop-3
-/// ran into the jump's last byte there and stopped).
+/// The 128-byte table copy of the first copier: the window (its four stores,
+/// then `mov rcx, r15 ; mov rdx, rsi ; mov r8, rbx ; xor r9d, r9d`, which sets
+/// the flags before any use), and where its last two stores (9 bytes) are
+/// replaced by a jump. Not the `mov rcx, r15` after them: another path of the
+/// title jumps back to it (run pop-3 ran into the jump's last byte there and
+/// stopped).
 pub const COPY_128: Site = Site {
     window: 0x4d9_f25f,
     store: 10,

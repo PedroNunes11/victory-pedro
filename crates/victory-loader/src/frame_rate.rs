@@ -1,45 +1,24 @@
 //! The title's frame rate (`VICTORY_FRAME_INTERVAL_MS`, off without it): the
-//! rate Grand Theft Auto VI asks for is a setting of its own, and two
-//! places in its code are changed at load to read another.
+//! rate Grand Theft Auto VI asks for is a setting of its own (30 on Series X),
+//! and three reads of it in the title's code are changed at load to read
+//! another.
 //!
-//! What the title does (game_scarlett_master.exe 1.0.2.1, image offsets):
+//! Sites patched (game_scarlett_master.exe 1.0.2.1, image offsets, see
+//! [`SITES`]):
 //!
-//! - Its graphics settings hold a frame rate (+0x210 of the settings object,
-//!   30 on Series X). Two functions that apply the settings, +0x1e0fb30 and
-//!   +0x22434a0, turn it into a frame time: `frame_us = 1e6 /
-//!   clamp(rate)`, 0 and 1000 or more being 1000 (the code's "no limit"),
-//!   stored at +0x98f84ac.
-//! - +0x247ab10 sets the frame interval from it: the display's rate is 60,
-//!   or 120 if its mode list (the output's `GetDisplayModeList`) has a
-//!   120 Hz mode (+0x2481ca0); the divisor is `min(display / rate, 4)`, or
-//!   1 for a rate above the display's; the interval is a table at
-//!   +0x61ece60 (`[16667, 16667, 33333, 50000, 66667]` at 60 Hz, `[8333,
-//!   8333, 16667, 25000, 33333]` at 120 Hz) and goes to
-//!   `SetFrameIntervalX` (device +0x270), with `ScheduleFrameEventX`
-//!   (+0x278) after it. At 30 and 60 Hz: 33,333 us, the flat 33.3 ms of the
-//!   menus and videos.
-//! - +0x120530, once a flag (+0x7453ec9, set by +0x21b77c0) is up, is a
-//!   limiter of its own on `QueryPerformanceCounter`: it waits until
-//!   `1000 / trunc(1e6 / frame_us)` ms have passed since the last frame.
-//! - +0x3eaf5d0 hands `1e6 / frame_us` to scripts, and +0x234490 scales
-//!   per-frame amounts by it (1.0 below 60 except 0.7 at 40, 0.5 from 60).
+//! - Two loads of the setting (`mov eax, [reg+210h]`), where the frame time is
+//!   made of it, become `mov eax, rate ; nop`: the title's frame time,
+//!   interval and own limiter follow the rate asked for.
+//! - The read that gives the timers' shortest step returns the rate too (1000
+//!   for no limit), so the shortest step follows. Left alone, game time moves
+//!   at least 1/30 s a frame: at 60 frames a second the game ran at twice its
+//!   speed (run fps-1, menus).
 //!
-//! - The simulation: +0x22264d0 hands each of its timers the real time
-//!   since the last frame (`QueryPerformanceCounter`); +0x2226040 makes the
-//!   step of it, at most 1/15 s and at least `1 / rate` (+0x6849844, made
-//!   at +0x22435de and +0x2241190 from +0x2241fd0, which reads the same
-//!   setting). So at 30 every frame shorter than 33.3 ms still moves game
-//!   time 33.3 ms: a fixed 30 Hz step for fast frames, delta time for slow
-//!   ones.
-//!
-//! So reporting a 120 Hz display alone changes nothing at 30 (divisor 4,
-//! 33,333 us). Here the two loads of the setting (`mov eax, [reg+210h]`)
-//! become `mov eax, rate ; nop`, so the title's frame time, interval and
-//! own limiter follow the rate asked for, and +0x2241fd0 returns the rate
-//! too (1000 for no limit), so the shortest step follows; the setting
-//! itself is left as it is. Each site's bytes, from the load to the store of the frame time, are
-//! compared before anything is written; a site whose bytes differ is left
-//! alone and said so (another build of the title).
+//! The setting itself is left as it is. Reporting a 120 Hz display alone
+//! changes nothing at 30 (the title still asks for 33,333 us). Each site's
+//! bytes, from the load to the store of the frame time, are compared before
+//! anything is written; a site whose bytes differ is left alone and said so
+//! (another build of the title).
 
 /// The switch: the interval in milliseconds our frame clock ticks at
 /// (`victory-gpu`'s `frame`), 0 for no wait at all. `None` if unset or
@@ -101,17 +80,16 @@ pub enum Kind {
     /// `mov eax, [reg+210h]` before the frame time is made of it: becomes
     /// `mov eax, rate ; nop` (6 bytes).
     Load,
-    /// +0x2241fd0, the rate the timers' shortest step is made of (`1 /
-    /// rate`, +0x6849844): `cmp dword [rax+210h], 0` becomes `mov eax, rate
-    /// ; jmp` to its `vcvtsi2ss` (7 bytes). Left as it was, the timers step at
-    /// least 1/30 s however short the frame: at 60 frames a second the game
-    /// ran at twice its speed (run fps-1, menus). For no limit, 1000.
+    /// The read of the rate the timers' shortest step is made of: `cmp dword
+    /// [rax+210h], 0` becomes `mov eax, rate ; jmp` to its `vcvtsi2ss` (7
+    /// bytes). Left as it was, the timers step at least 1/30 s however short
+    /// the frame (run fps-1, menus). For no limit, 1000.
     SimRate,
 }
 
 /// The three reads (game_scarlett_master.exe 1.0.2.1, image offsets).
 pub const SITES: [Site; 3] = [
-    // +0x1e0fb30: mov eax, [rdi+210h] ... mov [+0x98f84ac], eax
+    // first frame time: mov eax, [rdi+210h] ... mov [FRAME_US], eax
     Site {
         at: 0x1e0fc62,
         kind: Kind::Load,
@@ -121,7 +99,7 @@ pub const SITES: [Site; 3] = [
             0xf2, 0x5e, 0xc0, 0xc4, 0xe1, 0xfa, 0x2c, 0xc0, 0x89, 0x05, 0x12, 0x88, 0xae, 0x07,
         ],
     },
-    // +0x22434a0: mov eax, [rsi+210h] ... mov [+0x98f84ac], eax
+    // second frame time: mov eax, [rsi+210h] ... mov [FRAME_US], eax
     Site {
         at: 0x224359a,
         kind: Kind::Load,
@@ -131,7 +109,7 @@ pub const SITES: [Site; 3] = [
             0xc2, 0xc5, 0xf2, 0x5e, 0xc0, 0xc4, 0xe1, 0xfa, 0x2c, 0xc0, 0x89, 0x05, 0xd8, 0x4e, 0x6b, 0x07,
         ],
     },
-    // +0x2241fd0: cmp dword [rax+210h], 0 ; je ; call ; mov eax, [rax+210h] ; vcvtsi2ss xmm0, xmm0, rax
+    // shortest step: cmp dword [rax+210h], 0 ; je ; call ; mov eax, [rax+210h] ; vcvtsi2ss xmm0, xmm0, rax
     Site {
         at: 0x2241fdb,
         kind: Kind::SimRate,
@@ -142,12 +120,12 @@ pub const SITES: [Site; 3] = [
     },
 ];
 
-/// Title data worth seeing while it runs (`VICTORY_TIMER_LOG=1`): the frame
-/// time (+0x98f84ac) and the limiter's flag (+0x7453ec9).
+/// Title data `VICTORY_TIMER_LOG=1` logs while it runs (and the test of
+/// [`SITES`] checks): the frame time and the limiter's flag.
 pub const FRAME_US: usize = 0x98f84ac;
 pub const LIMITER_ON: usize = 0x7453ec9;
-/// The title's timers (each set up at +0x22261a9 with a step of 0.05 s and
-/// 50 ms): +0 and +4 times, +0xc the step in seconds, +0x10 in milliseconds.
+/// The title's timers, logged by `VICTORY_TIMER_LOG=1`: +0 and +4 times, +0xc
+/// the step in seconds, +0x10 in milliseconds.
 pub const TIMERS: [usize; 7] = [0xa943788, 0x856c6b4, 0xabbef40, 0xa958358, 0xa958380, 0x74fa558, 0xa943768];
 
 /// What goes at a site of `kind` for `rate`.
@@ -276,7 +254,7 @@ mod tests {
             // mov edx, 1000 follows; the window ends with the store of eax.
             assert_eq!(&site.bytes[6..11], &[0xba, 0xe8, 0x03, 0x00, 0x00]);
             assert_eq!(&site.bytes[site.bytes.len() - 6..site.bytes.len() - 4], &[0x89, 0x05]);
-            // RIP-relative: the store is of +0x98f84ac.
+            // RIP-relative: the store is of FRAME_US.
             let disp = i32::from_le_bytes(site.bytes[site.bytes.len() - 4..].try_into().unwrap());
             let end = site.at + site.bytes.len();
             assert_eq!(end as i64 + i64::from(disp), FRAME_US as i64);

@@ -4,11 +4,9 @@
 //! default; read in [`on`]).
 //!
 //! What the title does (game_scarlett_master.exe; `victory-loader`'s
-//! `descriptor_sites` has the code): its placed shader-visible view heap is
-//! the memory of its frame allocator (image +0x4d9f400), which hands out the
-//! draws' and dispatches' descriptor tables and much else (constants, list
-//! nodes). The tables are filled one 32-byte record at a time by six stores
-//! in two functions (+0x4d9efd0, +0x4eec8e0); views made by our calls
+//! `descriptor_sites` has the sites): its draws' and dispatches' descriptor
+//! tables are filled one 32-byte record at a time by six stores, in a heap
+//! that also holds other data of the title; views made by our calls
 //! (`Create*View`, `CopyDescriptors*`) are mirrored where they are made
 //! (`descriptor::mirror`). What the layer did before: the write watch's
 //! changed 64 KiB pages of the heap, every slot on them read and compared

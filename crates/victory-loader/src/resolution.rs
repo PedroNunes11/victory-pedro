@@ -1,46 +1,31 @@
 //! The title's output size and render scale (`VICTORY_OUTPUT`,
 //! `VICTORY_RENDER_SCALE`, `VICTORY_FFX_SCALE`, `VICTORY_UPSCALER`; each off
-//! without it): places
-//! in the title's code changed at load, each compared byte for byte first
-//! and left alone, said so, if it differs (another build of the title).
+//! without it): places in the title's code changed at load, each compared
+//! byte for byte first and left alone, said so, if it differs (another
+//! build of the title).
 //!
-//! What the title does (game_scarlett_master.exe 1.0.2.1, image offsets):
+//! Sites patched (game_scarlett_master.exe 1.0.2.1, image offsets):
 //!
-//! - **Output size.** Its settings (`settings.xml` in its storage,
-//!   `video/resolutionFullscreen`, 3840x2160 as a Series X wrote it; read
-//!   into the live settings at +0x204/+0x208, the defaults' 1920x1080 at
-//!   +0x5b37a20 overwritten) are applied by +0x22434a0: from +0x224352b it
-//!   hands them to +0x2478130, the one writer of the screen size
-//!   (+0xa9438cc/+0xa9438d0), and when the height changes calls +0xd8c3a0.
-//!   The back buffers (+0x247ad10, by +0x501f4a0 and +0xcc2780) take that
-//!   size through the copy +0x5eb24f0 makes (+0x75e6fe0). The display mode
-//!   list it matches against is its own (+0x5a38910: 1280x720, 1664x936,
-//!   1920x1080, 2560x1440, 3840x2160 at 60 Hz, table +0x615c0c0), not the
-//!   DXGI output's, which is why `VICTORY_DISPLAY_MODE` changes nothing.
-//!   Here that block becomes: write the size asked for into the settings
-//!   (+0x204/+0x208), then the title's own else-path (screen size set,
-//!   +0xd8c3a0 if the height changed). Everything that reads the settings
-//!   after it (the device parameters +0x1e0fb30, the render size +0x7b4e10)
-//!   sees the same size. The back buffers' pool (64 MB on Series X) is
-//!   checked to be used up but for 2 MB (+0x247af25, an `int3`); for another
-//!   size that check is jumped over.
-//! - **Render scale.** The upscaler the title picks (+0x7e93f0: 6, its own,
-//!   except on Series S with a flag, 7, AMD FidelityFX) gives the render
-//!   size from the output size (+0x7e92f0 → the upscaler's +0x50 method):
-//!   its own (+0x7e9440) multiplies by a scale at +0x90 of it, set to 2/3 at
-//!   +0x28f1e78 (so 2560x1440 for 4K, 1280x720 for 1080p);
-//!   `VICTORY_RENDER_SCALE` replaces that constant (Series X; run res-4 at
-//!   1.0). FidelityFX's (+0x28ef680, Series S) multiplies by 1.0 on Series X,
-//!   2/3 on Series S; `VICTORY_FFX_SCALE` points its two loads at a constant
-//!   in its padding (as pull request #53 did). That one is not safe: at 0.5
-//!   on Series S (run res-6) FidelityFX's jitter phase count came back 0 and
-//!   the title divided by it (+0x28f03e8) 49 s in.
-//! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker return
-//!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
+//! - **Output size.** [`OUTPUT`] (+0x224352b): the settings' output size is
+//!   written here before the title applies it, so everything that reads the
+//!   settings afterwards sees the size asked for. Only the title's own modes
+//!   ([`MODES`]) are accepted; the DXGI output's list has no say, which is why
+//!   `VICTORY_DISPLAY_MODE` changes nothing. [`POOL_CHECK`] (+0x247af25): a
+//!   check on the back buffers' pool stops the title (`int3`) at any size but
+//!   3840x2160 (run res-1); for another size it is jumped over.
+//! - **Render scale.** [`OWN_SCALE`] (+0x28f1e78): the title's own upscaler's
+//!   2/3 scale (so 2560x1440 for 4K) becomes `VICTORY_RENDER_SCALE` (Series X;
+//!   run res-4 at 1.0). [`FFX_SCALE`] (+0x28ef680): FidelityFX's two scale
+//!   loads (1.0 on Series X, 2/3 on Series S) are pointed at a constant of
+//!   ours for `VICTORY_FFX_SCALE` (as pull request #53 did). That one is not
+//!   safe: at 0.5 on Series S (run res-6) the title divided by zero 49 s in.
+//! - **Upscaler.** [`PICKER`] (+0x7e93f0): `VICTORY_UPSCALER=<kind>` makes
+//!   the picker return `kind` (pull request #53): 6 the title's own, 7
+//!   FidelityFX.
 
 use crate::frame_rate::Patched;
 
-/// Sizes the title has a display mode for (its own list, +0x615c0c0).
+/// Sizes the title has a display mode for.
 pub const MODES: [(u32, u32); 5] = [(1280, 720), (1664, 936), (1920, 1080), (2560, 1440), (3840, 2160)];
 
 /// `VICTORY_OUTPUT=<w>x<h>`: one of [`MODES`]. `None` if unset or not one
@@ -62,9 +47,8 @@ pub fn parse_output(spec: &str) -> Option<(u32, u32)> {
 
 /// `VICTORY_RENDER_SCALE=<s>`, 0.5 to 1.0 (0.5: half the output's width and
 /// height): the title's own upscaler's scale (Series X; 2/3 without it).
-/// Tested at 1.0 (run res-4); below 2/3 the title's largest render size
-/// (+0x94, max(2/3, scale)) stays at 2/3. `None` if unset or out of range
-/// (said why).
+/// Tested at 1.0 (run res-4); below 2/3 not every render size of the title
+/// follows. `None` if unset or out of range (said why).
 pub fn asked_render_scale() -> Option<f32> {
     let spec = std::env::var("VICTORY_RENDER_SCALE").ok()?;
     let scale = parse_render_scale(&spec);
@@ -107,37 +91,35 @@ pub struct Site {
     pub bytes: &'static [u8],
 }
 
-/// The screen size setter, its screen height, and what +0x22434a0 calls when
-/// the height changed.
+/// Addresses [`output_code`] calls or reads: the title's screen size setter,
+/// the screen height it keeps, and what it calls when the height changed (the
+/// same targets the original block uses, checked by the tests).
 pub const SET_SCREEN_SIZE: usize = 0x2478130;
 pub const SCREEN_HEIGHT: usize = 0xa9438d0;
 pub const HEIGHT_CHANGED: usize = 0xd8c3a0;
 
-/// +0x22434a0 from +0x224352b to +0x2243568: the settings' size handed to
-/// the screen size.
+/// The settings' output size handed to the screen size (61 bytes).
 pub const OUTPUT: Site = Site {
     at: 0x224352b,
     what: "settings' output size applied",
     bytes: &[
-        0x8b, 0x0d, 0x9b, 0x03, 0x70, 0x08, // mov ecx, [+0xa9438cc]
+        0x8b, 0x0d, 0x9b, 0x03, 0x70, 0x08, // mov ecx, [screen width]
         0x8b, 0x86, 0x04, 0x02, 0x00, 0x00, // mov eax, [rsi+204h]
         0x39, 0xc1, 0x75, 0x0d, // cmp ecx, eax ; jne
         0x8b, 0x96, 0x08, 0x02, 0x00, 0x00, // mov edx, [rsi+208h]
-        0xe8, 0xea, 0x4b, 0x23, 0x00, 0xeb, 0x20, // call +0x2478130 ; jmp +0x2243568
+        0xe8, 0xea, 0x4b, 0x23, 0x00, 0xeb, 0x20, // call screen size setter ; jmp end
         0x8b, 0xbe, 0x08, 0x02, 0x00, 0x00, // mov edi, [rsi+208h]
-        0x8b, 0x2d, 0x7c, 0x03, 0x70, 0x08, // mov ebp, [+0xa9438d0]
+        0x8b, 0x2d, 0x7c, 0x03, 0x70, 0x08, // mov ebp, [screen height]
         0x89, 0xc1, 0x89, 0xfa, // mov ecx, eax ; mov edx, edi
-        0xe8, 0xd3, 0x4b, 0x23, 0x00, // call +0x2478130
+        0xe8, 0xd3, 0x4b, 0x23, 0x00, // call screen size setter
         0x39, 0xfd, 0x74, 0x07, 0xb1, 0x01, // cmp ebp, edi ; je ; mov cl, 1
-        0xe8, 0x38, 0x8e, 0xb4, 0xfe, // call +0xd8c3a0
+        0xe8, 0x38, 0x8e, 0xb4, 0xfe, // call height changed
     ],
 };
 
-/// +0x247ad10, after the back buffers are made in their pool (64 MB on
-/// Series X, 82 MB on Series S, from +0x247ad45): `int3` unless less than
-/// 2 MB of the pool is left over. Sized for 3840x2160; at 1920x1080 49 MB
-/// are left (run res-1 stopped here). With another output size the check
-/// becomes a jump over the `int3`; the pool stays as large.
+/// The back buffers' pool check: `int3` unless less than 2 MB of the pool is
+/// left over. Sized for 3840x2160; at 1920x1080 it fired (run res-1 stopped
+/// here). With another output size the check becomes a jump over the `int3`.
 pub const POOL_CHECK: Site = Site {
     at: 0x247af25,
     what: "back buffer pool's left-over check",
@@ -151,17 +133,15 @@ pub fn pool_check_code() -> Vec<u8> {
     c
 }
 
-/// The title's own upscaler, its method +0x28f1e70: `mov dword [rcx+90h],
-/// 2/3` (the scale +0x7e9440 renders at).
+/// The title's own upscaler's render scale: `mov dword [rcx+90h], 2/3`.
 pub const OWN_SCALE: Site = Site {
     at: 0x28f1e78,
     what: "the title's own upscaler's render scale",
     bytes: &[0xc7, 0x81, 0x90, 0x00, 0x00, 0x00, 0xab, 0xaa, 0x2a, 0x3f],
 };
 
-/// FidelityFX's render size method, +0x28ef680, and its padding: the scale
-/// is 1.0 (+0x5fc6ed8) or, on Series S, 2/3 (+0x615d95c), loaded at +0x28
-/// and +0x32.
+/// FidelityFX's render size function and its padding: the scale is loaded at
+/// +0x28 and +0x32 of it (1.0, or 2/3 on Series S).
 pub const FFX_SCALE: Site = Site {
     at: 0x28ef680,
     what: "FidelityFX's render scale",
@@ -175,7 +155,7 @@ pub const FFX_SCALE: Site = Site {
     ],
 };
 
-/// The upscaler picker, +0x7e93f0, to its first `ret`.
+/// The upscaler picker, to its first `ret`.
 pub const PICKER: Site = Site {
     at: 0x7e93f0,
     what: "upscaler picker",
