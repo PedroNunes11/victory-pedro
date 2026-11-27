@@ -118,6 +118,18 @@ pub fn run(
             && let Some(real) = dll.export("ffxDispatch")
         {
             victory_hle::modules::ffx::set_real_dispatch(real);
+            // With a DLSS plugin the title's context calls are looked at, and contexts the
+            // console's DLL refuses are answered (`victory_hle::modules::ffx`).
+            if victory_hle::modules::ffx::dlss() {
+                if let Some(real) = dll.export("ffxCreateContext") {
+                    victory_hle::modules::ffx::set_real_create(real);
+                }
+                victory_hle::modules::ffx::set_real_others(
+                    dll.export("ffxDestroyContext"),
+                    dll.export("ffxQuery"),
+                    dll.export("ffxConfigure"),
+                );
+            }
         }
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
@@ -182,13 +194,22 @@ pub fn run(
             dll: &str,
             symbol: &victory_pe::ImportSymbol,
         ) -> victory_loader::Resolution {
-            let ours = dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
-                && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "ffxDispatch");
-            if ours {
-                return victory_loader::Resolution::Found {
-                    address: victory_hle::modules::ffx::dispatch_address(),
-                    provenance: victory_loader::Provenance::Hle,
-                };
+            use victory_hle::modules::ffx;
+            let ours = match symbol {
+                victory_pe::ImportSymbol::Name { name, .. } if dll.eq_ignore_ascii_case(ffx::LOADER) => {
+                    match name.as_str() {
+                        "ffxDispatch" => Some(ffx::dispatch_address()),
+                        "ffxCreateContext" if ffx::dlss() => Some(ffx::create_address()),
+                        "ffxDestroyContext" if ffx::dlss() => Some(ffx::destroy_address()),
+                        "ffxQuery" if ffx::dlss() => Some(ffx::query_address()),
+                        "ffxConfigure" if ffx::dlss() => Some(ffx::configure_address()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(address) = ours {
+                return victory_loader::Resolution::Found { address, provenance: victory_loader::Provenance::Hle };
             }
             self.0.resolve(dll, symbol)
         }

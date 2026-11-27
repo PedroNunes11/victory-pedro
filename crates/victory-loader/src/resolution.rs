@@ -167,6 +167,16 @@ pub const PICKER: Site = Site {
     ],
 };
 
+/// The picker's per-frame copy: the title asks it each frame, so a picker patched alone was
+/// asked again with the console's answer (Vertex's title patches changed both, as "upscaler
+/// choice" and "upscaler choice (the per-frame copy)"). Its first six bytes, the signature that
+/// table checked; [`picker_code`] is as long.
+pub const PICKER_COPY: Site = Site {
+    at: 0x540_0190,
+    what: "upscaler picker (the per-frame copy)",
+    bytes: &[0x48, 0x83, 0xec, 0x28, 0x48, 0x8b],
+};
+
 /// `rel32` from the end of an instruction at image offset `next` to `to`.
 fn rel(to: usize, next: usize) -> [u8; 4] {
     ((to as i64 - next as i64) as i32).to_le_bytes()
@@ -292,6 +302,7 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     }
     if let Some(kind) = asked_upscaler() {
         asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
+        asked.push((&PICKER_COPY, picker_code(kind), format!("returns {kind}")));
     }
     for (site, code, value) in asked {
         // SAFETY: the caller's promise.
