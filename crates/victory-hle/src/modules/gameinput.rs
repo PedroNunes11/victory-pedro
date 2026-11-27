@@ -31,7 +31,7 @@ pub mod binds;
 pub mod menu;
 pub(crate) mod mouse;
 use binds::Part;
-use mouse::{MenuStepper, Mouse, Pace, WheelStick};
+use mouse::{MapCursor, MenuStepper, Mouse, Pace, WheelStick};
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -452,6 +452,8 @@ struct State {
     menu_stepper: MenuStepper,
     /// Mouse motion -> held radial stick on Weapon / Radio Wheel (native mode).
     wheel_stick: WheelStick,
+    /// Mouse motion -> the map screen's cursor, as distance (native mode).
+    map_cursor: MapCursor,
     /// Latched mouse wheel notches (0x81 WheelUp, 0x82 WheelDown) so quick scrolls aren't lost.
     wheel_latch: Latch,
     /// Latched map zoom pulses from mouse wheel (1 = zoom in RT, 2 = zoom out LT).
@@ -528,6 +530,7 @@ impl Hub {
                 unseen: Unseen::default(),
                 menu_stepper: MenuStepper::default(),
                 wheel_stick: WheelStick::default(),
+                map_cursor: MapCursor::default(),
                 wheel_latch: Latch::default(),
                 map_zoom_latch: Latch::default(),
             }),
@@ -642,7 +645,8 @@ impl State {
             Vec::new()
         };
         // Native mode context routing (told by the loader from the game's own actions):
-        // - Map screen: mouse smoothly pans the map cursor (left stick), wheel zooms (RT/LT).
+        // - Map screen: the mouse moves the map cursor as far as the mouse went (left stick,
+        //   MapCursor), wheel zooms (RT/LT); a click accepts (waypoint) where that cursor is.
         // - Other menus (pause/settings): mouse steps D-pad up/down/left/right cleanly without
         //   fighting WASD; wheel scrolls up/down via native WheelUp/WheelDown keys.
         // - Weapon/Radio Wheel: mouse drives a virtual radial stick (holds angle on right stick).
@@ -704,6 +708,13 @@ impl State {
             self.menu_stepper.clear();
             0
         };
+        // The map: the mouse's distance moves the title's map cursor as far, at any frame rate.
+        let map_stick = if *NATIVE && in_menu && in_map {
+            self.map_cursor.step(mouse.raw, binds::mouse_options().sensitivity)
+        } else {
+            self.map_cursor.clear();
+            (0.0, 0.0)
+        };
         let wheel_pos = if *NATIVE && !in_menu && in_wheel {
             self.wheel_stick.step(mouse.raw, binds::mouse_options().sensitivity)
         } else {
@@ -722,7 +733,7 @@ impl State {
         let to_menu = |mut p: PadState| {
             if *NATIVE && in_menu {
                 if in_map {
-                    (p.left_x, p.left_y) = (p.right_x, p.right_y);
+                    (p.left_x, p.left_y) = map_stick;
                     p.left_trigger = p.left_trigger.max(map_zoom_triggers.0);
                     p.right_trigger = p.right_trigger.max(map_zoom_triggers.1);
                 } else {

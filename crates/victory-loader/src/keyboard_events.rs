@@ -99,10 +99,12 @@ struct KeyMap {
     modified: Option<std::time::SystemTime>,
     looked: Option<std::time::Instant>,
     entries: Vec<KeyEntry>,
+    /// `(key, action, value)`: axis actions written with a direction (`NAME-` / `NAME+`).
+    signs: Vec<(u32, u32, f32)>,
 }
 
 static KEY_MAP: std::sync::Mutex<KeyMap> =
-    std::sync::Mutex::new(KeyMap { file: None, modified: None, looked: None, entries: Vec::new() });
+    std::sync::Mutex::new(KeyMap { file: None, modified: None, looked: None, entries: Vec::new(), signs: Vec::new() });
 
 impl KeyMap {
     /// Reads the file again if it changed since it was read.
@@ -120,6 +122,7 @@ impl KeyMap {
         match std::fs::read_to_string(&file) {
             Ok(text) => {
                 self.entries = parse_native_keys(&text);
+                self.signs = native_key_signs(&text);
                 self.modified = modified;
                 tracing::info!(target: "keyboard_events", keys = self.entries.len(), file = %file.display(), "native keys read: each key stands for the game's own actions");
             }
@@ -513,10 +516,26 @@ fn key_code(name: &str) -> Option<u32> {
     None
 }
 
+/// An action's name without a direction written after it (`INPUT_FRONTEND_MAP_MOVE_UD-`), and that
+/// direction.
+fn action_and_sign(name: &str) -> (&str, Option<f32>) {
+    let name = name.trim();
+    if let Some(n) = name.strip_suffix('-') {
+        (n.trim_end(), Some(-1.0))
+    } else if let Some(n) = name.strip_suffix('+') {
+        (n.trim_end(), Some(1.0))
+    } else {
+        (name, None)
+    }
+}
+
 /// `native-keys.txt`: lines `KEY = INPUT_ACTION, ... | INPUT_MENU_ACTION, ...` ('#' comments);
-/// the actions after `|` are for menus only.
+/// the actions after `|` are for menus only. An axis action may carry the direction the key pushes
+/// it (`INPUT_FRONTEND_MAP_MOVE_UD-`: up); without one, the direction of the title's binding.
 fn parse_native_keys(text: &str) -> Vec<KeyEntry> {
-    let ids = |s: &str| -> Vec<u32> { s.split(',').map(str::trim).filter(|a| !a.is_empty()).map(joaat).collect() };
+    let ids = |s: &str| -> Vec<u32> {
+        s.split(',').map(str::trim).filter(|a| !a.is_empty()).map(|a| joaat(action_and_sign(a).0)).collect()
+    };
     text.lines()
         .map(|l| l.split('#').next().unwrap_or(""))
         .filter_map(|l| {
@@ -525,6 +544,26 @@ fn parse_native_keys(text: &str) -> Vec<KeyEntry> {
             let (play, menu) = actions.split_once('|').unwrap_or((actions, ""));
             let (play, menu) = (ids(play), ids(menu));
             (!play.is_empty() || !menu.is_empty()).then_some((key, play, menu))
+        })
+        .collect()
+}
+
+/// The directions written in `native-keys.txt`: `(key, action, value)` for each `NAME-` / `NAME+`.
+fn native_key_signs(text: &str) -> Vec<(u32, u32, f32)> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or(""))
+        .filter_map(|l| {
+            let (key, actions) = l.split_once('=')?;
+            Some((key_code(key)?, actions))
+        })
+        .flat_map(|(key, actions)| {
+            actions
+                .split([',', '|'])
+                .filter_map(move |a| match action_and_sign(a) {
+                    (name, Some(v)) if !name.is_empty() => Some((key, joaat(name), v)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -581,13 +620,14 @@ fn resolve_active_source(base: usize, actions: &[u32]) -> Option<(u32, u32, bool
 /// On the title's thread, inside the keyboard's event broadcast.
 unsafe fn translate(me: &Relay, e: &Event) {
     let key = e.source >> 8;
-    let (play, menu) = {
+    let (play, menu, signs) = {
         let mut map = KEY_MAP.lock().unwrap_or_else(|p| p.into_inner());
         if e.kind == 7 {
             map.refresh();
         }
         let Some((_, play, menu)) = map.entries.iter().find(|(k, _, _)| *k == key) else { return };
-        (play.clone(), menu.clone())
+        let signs: Vec<(u32, f32)> = map.signs.iter().filter(|(k, _, _)| *k == key).map(|&(_, a, v)| (a, v)).collect();
+        (play.clone(), menu.clone(), signs)
     };
     let base = IMAGE.load(Ordering::Relaxed);
     // SAFETY (both): the title's action array and its objects, read only.
@@ -659,6 +699,11 @@ unsafe fn translate(me: &Relay, e: &Event) {
                 return;
             }
             if let Some((id, source, axis, value)) = resolve_active_source(base, &actions) {
+                // A direction written for this key wins over the binding's.
+                let value = match signs.iter().find(|(a, _)| *a == id) {
+                    Some(&(_, v)) if axis => v,
+                    _ => value,
+                };
                 if !in_menu {
                     if matches!(id, OPEN_WHEEL_ACTION | OPEN_EMOTE_WHEEL | SELECT_ITEM_WHEEL) {
                         *WHEEL_HOLD.lock().unwrap_or_else(|p| p.into_inner()) =
@@ -1016,6 +1061,16 @@ mod tests {
         assert_eq!(map[3].0, 0x82);
         assert_eq!(map[4].0, 0x74);
         assert_eq!(map.len(), 5);
+        // Directions: the name hashes without them, and each key keeps its own.
+        let text = "W = INPUT_MOVE_UP_ONLY | INPUT_FRONTEND_MAP_MOVE_UD-, INPUT_FRONTEND_UP
+S = | INPUT_FRONTEND_MAP_MOVE_UD +
+";
+        let map = parse_native_keys(text);
+        assert_eq!(map[0].2[0], joaat("INPUT_FRONTEND_MAP_MOVE_UD"));
+        assert_eq!(map[1].2, vec![joaat("INPUT_FRONTEND_MAP_MOVE_UD")]);
+        let ud = joaat("INPUT_FRONTEND_MAP_MOVE_UD");
+        assert_eq!(native_key_signs(text), vec![(0x57, ud, -1.0), (0x53, ud, 1.0)]);
+        assert_eq!(ud, 0xaea8_cf77, "the title's id for it");
     }
 
     #[test]

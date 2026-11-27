@@ -106,7 +106,106 @@ pub(super) fn note_pad_frame(now_us: u64) {
     }
     PAD_LAST_US.store(now_us, Ordering::Relaxed);
     PAD_DT_US.store(gap.clamp(MIN_DT_US, MAX_DT_US), Ordering::Relaxed);
+    PAD_GAP_US.store(gap, Ordering::Relaxed);
     PAD_FRAME.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The last gap between two reads of the stand-in pad, not clamped (the map cursor's frames at
+/// 3 fps are 330 ms).
+static PAD_GAP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(33_333);
+
+/// The map screen's cursor driven by the mouse as a distance, not a speed: the title moves its map
+/// cursor with the left stick (`INPUT_FRONTEND_MAP_MOVE_LR/UD`) at a speed for each deflection, so
+/// mouse counts are owed distance (a fraction of the screen's width, whatever the output or render
+/// size) and each frame the stick is set to cover what is owed during the title's next frame, what
+/// the last frame covered paid off. Nothing is dropped between the title's reads, so the cursor
+/// lands where the mouse went at 3 fps as at 30.
+///
+/// `VICTORY_MAP_CURSOR_SPEED` (screen widths per second at full stick, 0.6),
+/// `VICTORY_MAP_DEAD_ZONE` (the title's map stick dead zone, 0.24) and
+/// `VICTORY_MAP_CURSOR_COUNTS` (mouse counts per screen width at sensitivity 1, 1600) tune it.
+pub(super) struct MapCursor {
+    /// Owed distance, screen widths (x right, y up).
+    owed: (f32, f32),
+    /// The deflection beyond the dead zone sent for the frame now running (0..1).
+    sent: (f32, f32),
+    frame: u64,
+    speed: f32,
+    dead_zone: f32,
+    counts: f32,
+}
+
+impl Default for MapCursor {
+    fn default() -> Self {
+        let env = |name: &str, default: f32, range: std::ops::RangeInclusive<f32>| {
+            std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| range.contains(v)).unwrap_or(default)
+        };
+        Self {
+            owed: (0.0, 0.0),
+            sent: (0.0, 0.0),
+            frame: PAD_FRAME.load(Ordering::Relaxed),
+            speed: env("VICTORY_MAP_CURSOR_SPEED", 0.6, 0.05..=10.0),
+            dead_zone: env("VICTORY_MAP_DEAD_ZONE", 0.24, 0.0..=0.9),
+            counts: env("VICTORY_MAP_CURSOR_COUNTS", 1600.0, 100.0..=20000.0),
+        }
+    }
+}
+
+impl MapCursor {
+    /// Owed distance kept at most (a screen width): a fling does not run on for seconds.
+    const MOST_OWED: f32 = 1.0;
+
+    pub fn clear(&mut self) {
+        self.owed = (0.0, 0.0);
+        self.sent = (0.0, 0.0);
+        self.frame = PAD_FRAME.load(Ordering::Relaxed);
+    }
+
+    /// Adds raw mouse motion (down positive) and returns the stick for the title's next frame (up
+    /// positive).
+    pub fn step(&mut self, (dx, dy): (i32, i32), sensitivity: f32) -> (f32, f32) {
+        let frame = PAD_FRAME.load(Ordering::Relaxed);
+        let gap_s = (PAD_GAP_US.load(Ordering::Relaxed).clamp(5_000, 1_000_000) as f32) * 1e-6;
+        self.step_at(frame, gap_s, (dx, dy), sensitivity)
+    }
+
+    fn step_at(&mut self, frame: u64, gap_s: f32, (dx, dy): (i32, i32), sensitivity: f32) -> (f32, f32) {
+        if frame != self.frame {
+            // The title ran a frame with what was sent: that much is paid.
+            let frames = frame.wrapping_sub(self.frame).min(4) as f32;
+            self.owed.0 -= self.sent.0 * self.speed * gap_s * frames;
+            self.owed.1 -= self.sent.1 * self.speed * gap_s * frames;
+            self.frame = frame;
+            // Overshoot by rounding is not owed back.
+            if self.sent.0 != 0.0 && self.owed.0.signum() != self.sent.0.signum() {
+                self.owed.0 = 0.0;
+            }
+            if self.sent.1 != 0.0 && self.owed.1.signum() != self.sent.1.signum() {
+                self.owed.1 = 0.0;
+            }
+        }
+        let per_count = sensitivity.max(0.05) / self.counts;
+        self.owed.0 = (self.owed.0 + dx as f32 * per_count).clamp(-Self::MOST_OWED, Self::MOST_OWED);
+        self.owed.1 = (self.owed.1 - dy as f32 * per_count).clamp(-Self::MOST_OWED, Self::MOST_OWED);
+        // Less than a thousandth of the screen owed: rest.
+        if self.owed.0.hypot(self.owed.1) < 0.001 {
+            self.sent = (0.0, 0.0);
+            return (0.0, 0.0);
+        }
+        // What covers the owed distance in one frame like the last.
+        let reach = self.speed * gap_s;
+        let (mut x, mut y) = (self.owed.0 / reach, self.owed.1 / reach);
+        let len = x.hypot(y);
+        if len > 1.0 {
+            x /= len;
+            y /= len;
+        }
+        self.sent = (x, y);
+        // The title ignores the dead zone and scales the rest: start past it.
+        let len = x.hypot(y);
+        let push = self.dead_zone + (1.0 - self.dead_zone) * len;
+        (x / len * push, y / len * push)
+    }
 }
 
 /// Frame-locked mouse look: accumulates raw deltas until the title reads the
@@ -1104,6 +1203,28 @@ mod tests {
         assert_eq!(stepper.step(20_000, (0, 25)), super::super::DOWN);
         assert_eq!(stepper.step(30_000, (0, 0)), 0);
         assert_eq!(stepper.step(40_000, (0, -50)), super::super::UP);
+    }
+
+    #[test]
+    fn the_map_cursor_covers_the_mouse_distance_at_any_frame_rate() {
+        // A model of the title: each frame its cursor moves speed * gap * deflection past the dead zone.
+        for gap in [0.033f32, 0.25] {
+            let mut m = MapCursor { speed: 0.6, dead_zone: 0.24, counts: 1600.0, ..MapCursor::default() };
+            m.frame = 0;
+            let mut cursor = 0.0f32;
+            let mut stick = m.step_at(0, gap, (800, 0), 1.0); // half a screen width to the right
+            for f in 1..200u64 {
+                let past = ((stick.0.abs() - 0.24).max(0.0) / 0.76) * stick.0.signum();
+                cursor += past * 0.6 * gap;
+                stick = m.step_at(f, gap, (0, 0), 1.0);
+            }
+            assert!((cursor - 0.5).abs() < 0.01, "gap {gap}: the cursor went {cursor} of 0.5");
+            assert_eq!(stick, (0.0, 0.0), "rests once there");
+        }
+        // Up is up.
+        let mut m = MapCursor::default();
+        m.frame = 0;
+        assert!(m.step_at(0, 0.033, (0, -50), 1.0).1 > 0.0);
     }
 
     #[test]
