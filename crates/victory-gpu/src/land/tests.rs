@@ -83,6 +83,20 @@ fn a_panicking_job_reaches_the_caller() {
     }
 }
 
+/// Large batches with tiny per-item work claim every index once across all
+/// pool threads without losing or duplicating items across rapid rounds.
+#[test]
+fn large_batches_claim_every_item_exactly_once_across_threads() {
+    let pool = Pool::new("victory-land", 8);
+    for count in [0usize, 1, 2, 7, 64, 4096] {
+        let calls: Vec<AtomicUsize> = (0..count).map(|_| AtomicUsize::new(0)).collect();
+        pool.each(count, &|i| {
+            calls[i].fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(calls.iter().all(|c| c.load(Ordering::Relaxed) == 1), "count={count}");
+    }
+}
+
 /// The order pieces are landed in holds every byte of every piece, under its
 /// copy, and no other; blocks come in order, pieces of several copies in one
 /// block stay in the order given, and jobs never cut a block.
