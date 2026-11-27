@@ -569,7 +569,9 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
-    if crate::residency::pressured() {
+    static KEEP_SCRATCH: OnceLock<bool> = OnceLock::new();
+    let keep = *KEEP_SCRATCH.get_or_init(|| crate::switch::on("VICTORY_SCRATCH_KEEP"));
+    if should_trim_scratch(crate::residency::pressured(), keep, crate::residency::critical_commit) {
         trim_spare_chunks();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
@@ -1337,6 +1339,9 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// A fresh replacement held by a logically closed title list. Only its
+    /// next reset may reuse this open recording without resetting D3D12.
+    left_open: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2096,23 +2101,24 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
+/// With VICTORY_SCRATCH_KEEP=1, reuse the bounded spare pool through
+/// ordinary RAM pressure. Sample commit only when it can affect the sweep.
+fn should_trim_scratch(pressure: bool, keep: bool, critical_commit: impl FnOnce() -> bool) -> bool {
+    pressure && (!keep || critical_commit())
+}
+
 /// Drops spare scratch chunks kept idle when host memory is pressured.
 fn trim_spare_chunks() {
-    let freed: Vec<(Chunk, u64)> = {
+    let freed = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.kept.is_empty() {
             return;
         }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
+        std::mem::replace(&mut *spare, Spare::new())
     };
-    let count = freed.len() as u64;
-    let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
-    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
-    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
-    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
-    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
-    drop(freed);
+    ALIVE[3].fetch_sub(freed.kept.len() as u64, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(freed.bytes, Ordering::Relaxed);
+    scratch_release::release(freed);
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -3981,6 +3987,7 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 pub(crate) mod rec;
+mod scratch_release;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
@@ -4453,6 +4460,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                left_open: false.into(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -5858,6 +5866,14 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // A replacement can be submitted again without a title reset, even
+        // on a synchronous queue that never detaches it. Close it once,
+        // before any submission preparation, including for repeated entries.
+        for list in runs {
+            if list.left_open() {
+                list.close();
+            }
+        }
         let was_working = working(true);
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
@@ -6681,8 +6697,24 @@ impl HostList {
         times
     }
 
+    /// Only called on a newly created or just-reset list from the idle pool,
+    /// before handing it to the title as its logically closed replacement.
+    pub(crate) fn prepare_replacement(&mut self) {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("VICTORY_LEAVE_OPEN").is_none_or(|v| v != "0")) {
+            *self.left_open.get_mut() = true;
+        } else {
+            self.close();
+        }
+    }
+
+    pub(crate) fn left_open(&self) -> bool {
+        self.left_open.load(Ordering::Acquire)
+    }
+
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        self.left_open.store(false, Ordering::Release);
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -6756,6 +6788,11 @@ impl HostList {
             if scratch_pool() {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
+        }
+        // The title-side bookkeeping above still applies. D3D12 is already
+        // in its initial recording state if this replacement never ran.
+        if self.left_open.swap(false, Ordering::AcqRel) {
+            return;
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -10853,7 +10890,17 @@ mod trail {
 
 #[cfg(test)]
 mod spare {
-    use super::Spare;
+    use super::{Spare, should_trim_scratch};
+
+    #[test]
+    fn keeping_idle_scratch_changes_only_noncritical_pressure_sweeps() {
+        for keep in [false, true] {
+            assert!(!should_trim_scratch(false, keep, || panic!("no pressure")));
+        }
+        assert!(should_trim_scratch(true, false, || panic!("ordinary sweep")));
+        assert!(!should_trim_scratch(true, true, || false));
+        assert!(should_trim_scratch(true, true, || true));
+    }
 
     /// Kept things come back by size, the last given first, and nothing is
     /// kept past the limit.
