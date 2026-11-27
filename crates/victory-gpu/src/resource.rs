@@ -2076,6 +2076,19 @@ fn sweep_batch(all: &std::collections::BTreeSet<usize>, from: usize, limit: usiz
     batch.take(limit).copied()
 }
 
+/// Whether the card's memory in use is near its budget (95 % of it, or no
+/// reading): only then does letting texture copies go spare the PC's memory,
+/// as what is past the budget the system moves to the PC's. Below it a copy
+/// let go frees the card and not the PC: on a 32 GB PC the game's 25 GB keep
+/// the PC "short" (under 3 GB free) for a whole session, and every idle copy
+/// went after 5 s with 1.6 GB of the card's budget free: 135,421 copies let
+/// go and 41,309 made again in 8 minutes, the textures blurry while they
+/// came back (RTX 5070, Series X, 2560x1440).
+#[cfg(windows)]
+fn card_near_budget(memory: Option<[u64; 4]>) -> bool {
+    memory.is_none_or(|[budget, used, ..]| used >= budget / 100 * 95)
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -2126,7 +2139,7 @@ pub(crate) fn let_go_idle() {
     // system memory is commit too. Short of it ([`crate::residency::pressured`]),
     // idle copies go after seconds, not the minutes room on the card keeps them.
     let (idle_ms, most) = match memory {
-        _ if crate::residency::pressured() => (5_000, u64::MAX),
+        _ if crate::residency::pressured() && card_near_budget(memory) => (5_000, u64::MAX),
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 .saturating_add(crate::shadow::card_room_kept())
