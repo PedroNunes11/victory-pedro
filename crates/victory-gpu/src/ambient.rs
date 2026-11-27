@@ -66,6 +66,19 @@ pub(crate) enum Role {
     /// Gives the reflection rays that found nothing the sky's light
     /// (`CS_RayMiss`, not `CS_RayMiss_Volumetrics` nor the screen probes').
     Miss,
+    /// (Whiplash floor fix, Trexies) Writes the title's reflections for the last time in a frame.
+    /// Without rays they are the sky's, unoccluded, wherever a surface is glossy: floors, counters,
+    /// glass and eyes wear a frosty blue-white glaze far brighter than the room. They are held to a
+    /// part of the light around ([`reflect`], `VICTORY_AMBIENT_REFLECT`).
+    Reflect,
+}
+
+/// (Whiplash) `VICTORY_REFLECT_SCREEN=1`: the reflection hold follows `CS_ResolveScreenSpace`
+/// (where the title resolves its reflections when rays find nothing; `CS_CombinedReflections` is
+/// made but not dispatched in the opening house).
+pub(crate) fn reflect_screen() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFLECT_SCREEN").is_some_and(|v| v == "1"))
 }
 
 /// The program's part in this, by its name in the container.
@@ -77,6 +90,10 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if reflect() > 0.0
+        && (has(b"CS_CombinedReflections") || (reflect_screen() && has(b"CS_ResolveScreenSpace_ed816b5d")))
+    {
+        Some(Role::Reflect)
     } else if is_miss(container) {
         Some(Role::Miss)
     } else {
@@ -100,6 +117,11 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// (Whiplash) Where [`Role::Reflect`] writes the reflections (R9G9B9E5 as 32-bit integers).
+pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
+/// (Whiplash) Where `CS_ResolveScreenSpace` writes its reflections: R11G11B10_FLOAT, a quarter
+/// of the resolve's pixels.
+pub(crate) const REFLECTIONS_SCREEN: (u8, u32) = (1, 128);
 /// Where the miss program writes the reflected light (R11G11B10, half the
 /// picture's size) and where it reads the depth it is given (a 32-bit depth
 /// of the picture's size).
@@ -206,6 +228,33 @@ fn bounds() -> (f32, f32) {
 
 /// The most the air scatters, as a multiple of the light around
 /// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
+/// (Whiplash) The most a reflection may hold, as a part of the light around it
+/// (`VICTORY_AMBIENT_REFLECT=<part>`, 0.5 suggested; unset or 0: the title's own).
+pub(crate) fn reflect() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_REFLECT").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+    })
+}
+
+/// (Whiplash) `VICTORY_AMBIENT_REFLECT_TURNS=<seconds>`: the hold on and off by turns, to compare
+/// one view both ways in one run (the log says when).
+fn reflect_turn() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TURN: OnceLock<u64> = OnceLock::new();
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    let turn = *TURN.get_or_init(|| std::env::var("VICTORY_AMBIENT_REFLECT_TURNS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    turn == 0 || {
+        let now = START.get_or_init(std::time::Instant::now).elapsed().as_secs() / turn;
+        if LAST.swap(now, Ordering::Relaxed) != now {
+            tracing::info!(on = now % 2 == 1, "reflections held, by turns (VICTORY_AMBIENT_REFLECT_TURNS)");
+        }
+        now % 2 == 1
+    }
+}
+
 fn air() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
@@ -488,7 +537,7 @@ void reflect_light(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
-#ifdef RAISE
+#if defined(RAISE) || defined(HOLD)
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
@@ -502,6 +551,49 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
+#endif
+
+#ifdef HOLD
+// (Whiplash floor fix) No brighter than a part (`air`, set to VICTORY_AMBIENT_REFLECT for this pass)
+// of the light around: the estimate at the nearest point, a fifth of it the room's slow mean.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    light.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
+    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+    uint at0 = (q.y * PX + q.x) * 3;
+    float3 around = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    around = lerp(around, cells[CELLS].rgb, 0.2) * level;
+    float cap = air * dot(around, LUMA);
+    float3 c = unpack(light[at.xy]);
+    float has = dot(c, LUMA);
+    if (has > cap) light[at.xy] = pack(c * (cap / max(has, 1e-9)));
+}
+#endif
+
+#ifdef HOLDF
+// (Whiplash) The same hold on `CS_ResolveScreenSpace`'s typed R11G11B10_FLOAT reflections.
+RWTexture2D<float3> refl : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold_float(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    refl.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
+    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+    uint at0 = (q.y * PX + q.x) * 3;
+    float3 around = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    around = lerp(around, cells[CELLS].rgb, 0.2) * level;
+    float cap = air * dot(around, LUMA);
+    float3 c = refl[at.xy];
+    float has = dot(c, LUMA);
+    if (has > cap) refl[at.xy] = c * (cap / max(has, 1e-9));
+}
+#endif
+
+#ifdef RAISE
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
@@ -604,6 +696,8 @@ struct Pass {
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
     reflect: ID3D12PipelineState,
+    hold: ID3D12PipelineState,
+    hold_float: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
     stats: ID3D12Resource,
@@ -637,6 +731,8 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
     let reflect = pipeline("REFLECT", s!("reflect_light"))?;
+    let hold = pipeline("HOLD", s!("hold"))?;
+    let hold_float = pipeline("HOLDF", s!("hold_float"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -647,6 +743,8 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         air,
         reflect,
+        hold,
+        hold_float,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
         stats: made(256)?,
@@ -811,6 +909,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
+    // (Whiplash) The hold needs the estimate: not with a constant.
+    if role == Role::Reflect && (constant > 0.0 || reflect() == 0.0 || !reflect_turn()) {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -834,7 +936,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     let (least, most) = bounds();
     words[9] = most.to_bits();
     words[15] = least.to_bits();
-    words[10] = air().to_bits();
+    // (The hold passes read their part in the air's place.)
+    words[10] = if role == Role::Reflect { reflect() } else { air() }.to_bits();
     words[11] = u32::from(crate::lightprobe::on());
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
@@ -878,6 +981,12 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 run(&pass.gather, 20, 45, 1);
                 run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
+            Role::Reflect => run(
+                if reflect_screen() { &pass.hold_float } else { &pass.hold },
+                views.size[0].div_ceil(8),
+                views.size[1].div_ceil(8),
+                1,
+            ),
         }
     }
     true

@@ -3623,7 +3623,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, MISS_DEPTH, MISS_LIGHT, MissNote, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, MISS_DEPTH, MISS_LIGHT, MissNote, RADIANCE, REFLECTIONS, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3660,6 +3660,10 @@ impl State {
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
             Role::Miss => MISS_LIGHT,
+            // (Whiplash floor fix) The reflections' image: the screen-space resolve's or the
+            // combined one's.
+            Role::Reflect if crate::ambient::reflect_screen() => crate::ambient::REFLECTIONS_SCREEN,
+            Role::Reflect => REFLECTIONS,
         };
         // Variants of the miss program bind the rays' image and the depth at
         // other places of their tables than the one found first (run
@@ -3767,7 +3771,7 @@ impl State {
                         })
                 })
             }),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::Reflect => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
@@ -3806,7 +3810,11 @@ impl State {
             return false;
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        let format = match role {
+            Role::Reflect if crate::ambient::reflect_screen() => 26,
+            Role::Resolve | Role::Reflect => 42,
+            _ => 26,
+        };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         // The miss program's image is of half the picture's size, its depth
         // (32-bit) of the whole.
@@ -5206,7 +5214,8 @@ impl State {
         // run is joined: VNV's `joined` / `unsettle_indirect` have nothing to
         // do here.)
         if kind == DISPATCH
-            && let Some(role @ crate::ambient::Role::Miss) = p.stages.first().and_then(|s| s.shader.ambient)
+            && let Some(role @ (crate::ambient::Role::Miss | crate::ambient::Role::Reflect)) =
+                p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
         {
             if self.ambient(list, p, role) {
