@@ -1327,6 +1327,84 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
     }
 }
 
+/// Bound dynamic raw views to their host buffer. Set VICTORY_RAW_VIEW_CLAMP=0
+/// to use the requested range without querying the host width.
+fn raw_view_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEW_CLAMP").is_none_or(|v| v != "0"))
+}
+
+/// FirstElement is a 64-bit dword index. Only NumElements can be shortened.
+#[derive(Clone, Copy)]
+struct RawRange {
+    first: u64,
+    elements: u32,
+}
+
+/// Why a request lost part of its range, for the counters below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    /// The start is at a position with no complete dword left.
+    Past,
+    /// The buffer width or the 32-bit element count shortened the view.
+    Length,
+    /// The title named less than a dword: one element, as before this guard.
+    Short,
+    /// The start is not on the 16 bytes a raw view needs.
+    Unaligned,
+}
+
+fn raw_range(size: u64, offset: u64, len: u64) -> (Option<RawRange>, Option<Cut>) {
+    if !offset.is_multiple_of(16) {
+        return (None, Some(Cut::Unaligned));
+    }
+    let first = offset / 4;
+    let words = size / 4;
+    if first >= words {
+        return (None, Some(Cut::Past));
+    }
+    // Preserve the one-element floor for short requests when a whole dword fits.
+    let requested = (len / 4).max(1);
+    let elements = requested.min(words - first).min(u64::from(u32::MAX));
+    let cut = if elements < requested {
+        Some(Cut::Length)
+    } else if len < 4 {
+        Some(Cut::Short)
+    } else {
+        None
+    };
+    (Some(RawRange { first, elements: elements as u32 }), cut)
+}
+
+// Since launch, in Cut order: past the end, shortened, sub-dword, unaligned.
+static RAW_SRV_CUTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static RAW_UAV_CUTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn raw_view_counts() -> [[u64; 4]; 2] {
+    [&RAW_SRV_CUTS, &RAW_UAV_CUTS].map(|cuts| cuts.each_ref().map(|n| n.load(Ordering::Relaxed)))
+}
+
+fn raw_view_range(
+    buffer: &ID3D12Resource,
+    offset: u64,
+    len: u64,
+    counts: &[AtomicU64; 4],
+) -> Option<RawRange> {
+    if !raw_view_clamp() {
+        return Some(RawRange {
+            first: offset / 4,
+            elements: (len / 4).clamp(1, u64::from(u32::MAX)) as u32,
+        });
+    }
+    // SAFETY: buffer is a live resource.
+    let size = unsafe { buffer.GetDesc() }.Width;
+    let (range, cut) = raw_range(size, offset, len);
+    if let Some(cut) = cut {
+        counts[cut as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    range
+}
+
 /// Buffer views left null because the host would refuse them
 /// ([`buffer_view_ok`]), since the start.
 pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3253,15 +3331,18 @@ impl HostHeap {
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let Some(range) = raw_view_range(buffer, offset, len, &RAW_SRV_CUTS) else {
+            self.null_raw_at(index);
+            return;
+        };
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -3295,14 +3376,17 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let Some(range) = raw_view_range(buffer, offset, len, &RAW_UAV_CUTS) else {
+            self.null_raw_uav_at(index);
+            return;
+        };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
@@ -5468,6 +5552,47 @@ mod typed_uav_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod raw_ranges {
+        use super::{Cut, raw_range};
+
+        fn check(size: u64, offset: u64, len: u64, expected: Option<(u64, u32)>, reason: Option<Cut>) {
+            let (range, cut) = raw_range(size, offset, len);
+            assert_eq!((range.map(|r| (r.first, r.elements)), cut), (expected, reason));
+        }
+
+        #[test]
+        fn a_start_without_a_whole_dword_left_gives_a_null_view() {
+            check(0, 0, 16, None, Some(Cut::Past));
+            check(64, 64, 16, None, Some(Cut::Past));
+            check(100, 112, 16, None, Some(Cut::Past));
+            check(99, 96, 1, None, Some(Cut::Past));
+        }
+
+        #[test]
+        fn a_short_request_keeps_one_dword_when_it_fits() {
+            for len in 0..4 {
+                check(100, 96, len, Some((24, 1)), Some(Cut::Short));
+            }
+            check(100, 96, 4, Some((24, 1)), None);
+        }
+
+        #[test]
+        fn a_raw_view_requires_a_16_byte_aligned_offset() {
+            for offset in [1, 4, 15, u64::MAX] {
+                check(64, offset, 16, None, Some(Cut::Unaligned));
+            }
+        }
+
+        #[test]
+        fn length_is_limited_to_whole_dwords_and_the_descriptor_count() {
+            check(1024, 16, 7, Some((4, 1)), None);
+            check(1024, 768, 256, Some((192, 64)), None);
+            check(1027, 768, u64::MAX, Some((192, 64)), Some(Cut::Length));
+            let offset = 1u64 << 36;
+            check(u64::MAX, offset, u64::MAX, Some((offset / 4, u32::MAX)), Some(Cut::Length));
+        }
+    }
 
     #[test]
     fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
