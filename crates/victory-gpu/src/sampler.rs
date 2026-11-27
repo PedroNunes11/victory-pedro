@@ -64,12 +64,12 @@ impl Fields {
             AddressU: address_mode(self.address[0]),
             AddressV: address_mode(self.address[1]),
             AddressW: address_mode(self.address[2]),
-            MipLODBias: if self.bias.is_nan() {
-                0.0
-            } else {
-                self.bias
-                    .clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX)
-            },
+            MipLODBias: with_extra(
+                if self.bias.is_nan() { 0.0 } else { self.bias },
+                reduction == 1,
+                min_lod,
+                max_lod,
+            ),
             MaxAnisotropy: if aniso {
                 self.anisotropy.clamp(1, 16)
             } else {
@@ -85,6 +85,33 @@ impl Fields {
             MaxLOD: max_lod,
         }
     }
+}
+
+/// `VICTORY_LOD_BIAS=<levels>` (e.g. `-1`; off when unset): added to every
+/// sampler's own LOD bias, descriptor and static samplers alike, so textures
+/// keep the detail of the output size when the title renders smaller and an
+/// upscaler (DLSS) brings it up: log2(render/output) is the usual amount
+/// (-0.58 for DLSS Quality). Comparison (shadow) samplers and samplers that
+/// see one level only are left as the title made them.
+pub(crate) fn extra_bias() -> f32 {
+    static BIAS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *BIAS.get_or_init(|| {
+        let bias = std::env::var("VICTORY_LOD_BIAS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|b| b.is_finite())
+            .map_or(0.0, |b| b.clamp(-4.0, 4.0));
+        if bias != 0.0 {
+            tracing::info!(bias, "textures sampled with an extra LOD bias (VICTORY_LOD_BIAS)");
+        }
+        bias
+    })
+}
+
+/// A sampler's bias with [`extra_bias`] where it applies, in the host's range.
+pub(crate) fn with_extra(bias: f32, compares: bool, min_lod: f32, max_lod: f32) -> f32 {
+    let extra = if compares || max_lod <= min_lod { 0.0 } else { extra_bias() };
+    (bias + extra).clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX)
 }
 
 /// Whether the host GPU filters anisotropically with point mips

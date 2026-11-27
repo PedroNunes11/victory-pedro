@@ -569,12 +569,15 @@ impl HostPipeline {
                 }
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
+                let filter = s.filter_for_host(aniso_point_mip_supported);
+                // Reduction 1 (bits 7-8) is a comparison sampler.
+                let compares = (filter >> 7) & 3 == 1;
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
+                    Filter: D3D12_FILTER(filter as i32),
                     AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
                     AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
                     AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
-                    MipLODBias: s.mip_lod_bias,
+                    MipLODBias: crate::sampler::with_extra(s.mip_lod_bias, compares, s.min_lod, s.max_lod),
                     MaxAnisotropy: s.max_anisotropy,
                     ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
                     BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
