@@ -88,18 +88,58 @@ const ACTION_ARRAY: usize = 0xab7_7bd8;
 /// The first pad's index in the device registry: the low byte of its events' source.
 const PAD_INDEX: u32 = 1;
 
-/// `VICTORY_KEY_ACTIONS=<key>=<action>/<action>...,...` (hex: Windows virtual key, action ids =
-/// joaat of their `INPUT_*` names, in order of preference).
-static KEY_ACTIONS: std::sync::OnceLock<Vec<(u32, Vec<u32>)>> = std::sync::OnceLock::new();
+/// A key, the actions it stands for in play, and those it stands for in menus (in order of
+/// preference; ids = joaat of their `INPUT_*` names).
+type KeyEntry = (u32, Vec<u32>, Vec<u32>);
+
+/// The keys' actions: from `VICTORY_NATIVE_KEYS` (read again when the file changes, looked at at
+/// most once a second) or `VICTORY_KEY_ACTIONS`.
+struct KeyMap {
+    file: Option<std::path::PathBuf>,
+    modified: Option<std::time::SystemTime>,
+    looked: Option<std::time::Instant>,
+    entries: Vec<KeyEntry>,
+}
+
+static KEY_MAP: std::sync::Mutex<KeyMap> =
+    std::sync::Mutex::new(KeyMap { file: None, modified: None, looked: None, entries: Vec::new() });
+
+impl KeyMap {
+    /// Reads the file again if it changed since it was read.
+    fn refresh(&mut self) {
+        let Some(file) = self.file.clone() else { return };
+        let now = std::time::Instant::now();
+        if self.looked.is_some_and(|l| now.duration_since(l) < std::time::Duration::from_secs(1)) {
+            return;
+        }
+        self.looked = Some(now);
+        let modified = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+        if modified == self.modified && !self.entries.is_empty() {
+            return;
+        }
+        match std::fs::read_to_string(&file) {
+            Ok(text) => {
+                self.entries = parse_native_keys(&text);
+                self.modified = modified;
+                tracing::info!(target: "keyboard_events", keys = self.entries.len(), file = %file.display(), "native keys read: each key stands for the game's own actions");
+            }
+            Err(e) => tracing::warn!(target: "keyboard_events", error = %e, "native keys file not read"),
+        }
+    }
+}
+
+/// The action whose activity tells play from a menu: on foot and in vehicles it is active (+0x158
+/// bit 2); the pause menu and the like turn it off (seen 2026-11-27: 0x0a in play, 0x08 in a menu).
+const PLAY_ACTION: u32 = 0x8fd0_15d8; // INPUT_MOVE_UP_ONLY
 /// Keys down and the pad source each was sent as (axis or button), to release the same one.
 static HELD: std::sync::Mutex<Vec<(u32, u32, bool)>> = std::sync::Mutex::new(Vec::new());
 
-fn parse_key_actions(spec: &str) -> Vec<(u32, Vec<u32>)> {
+fn parse_key_actions(spec: &str) -> Vec<KeyEntry> {
     let hex = |x: &str| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
     spec.split(',')
         .filter_map(|b| {
             let (key, actions) = b.split_once('=')?;
-            Some((hex(key)?, actions.split('/').filter_map(hex).collect()))
+            Some((hex(key)?, actions.split('/').filter_map(hex).collect(), Vec::new()))
         })
         .collect()
 }
@@ -148,15 +188,18 @@ fn key_code(name: &str) -> Option<u32> {
     None
 }
 
-/// `native-keys.txt`: lines `KEY = INPUT_ACTION, INPUT_ACTION ...` ('#' comments).
-fn parse_native_keys(text: &str) -> Vec<(u32, Vec<u32>)> {
+/// `native-keys.txt`: lines `KEY = INPUT_ACTION, ... | INPUT_MENU_ACTION, ...` ('#' comments);
+/// the actions after `|` are for menus only.
+fn parse_native_keys(text: &str) -> Vec<KeyEntry> {
+    let ids = |s: &str| -> Vec<u32> { s.split(',').map(str::trim).filter(|a| !a.is_empty()).map(joaat).collect() };
     text.lines()
         .map(|l| l.split('#').next().unwrap_or(""))
         .filter_map(|l| {
             let (key, actions) = l.split_once('=')?;
             let key = key_code(key)?;
-            let ids: Vec<u32> = actions.split(',').map(str::trim).filter(|a| !a.is_empty()).map(joaat).collect();
-            (!ids.is_empty()).then_some((key, ids))
+            let (play, menu) = actions.split_once('|').unwrap_or((actions, ""));
+            let (play, menu) = (ids(play), ids(menu));
+            (!play.is_empty() || !menu.is_empty()).then_some((key, play, menu))
         })
         .collect()
 }
@@ -174,13 +217,26 @@ fn is_axis(source: u32) -> bool {
 /// # Safety
 /// On the title's thread, inside the keyboard's event broadcast.
 unsafe fn translate(me: &Relay, e: &Event) {
-    let Some(map) = KEY_ACTIONS.get() else { return };
     let key = e.source >> 8;
-    let Some((_, actions)) = map.iter().find(|(k, _)| *k == key) else { return };
+    let (play, menu) = {
+        let mut map = KEY_MAP.lock().unwrap_or_else(|p| p.into_inner());
+        if e.kind == 7 {
+            map.refresh();
+        }
+        let Some((_, play, menu)) = map.entries.iter().find(|(k, _, _)| *k == key) else { return };
+        (play.clone(), menu.clone())
+    };
     let base = IMAGE.load(Ordering::Relaxed);
     // SAFETY (both): the title's action array and its objects, read only.
     let read32 = |at: usize| unsafe { std::ptr::read_volatile(at as *const u32) };
     let read = |at: usize| unsafe { std::ptr::read_volatile(at as *const usize) };
+    let in_menu = {
+        let count = read32(base + ACTION_COUNT) as usize;
+        let array = read(base + ACTION_ARRAY);
+        (0..count).map(|i| array + i * 0x160).find(|&a| read32(a + 0x128) == PLAY_ACTION).is_some_and(|a| read32(a + 0x158) & 2 == 0)
+    };
+    // In play only the play actions; in a menu the menu actions first.
+    let actions: Vec<u32> = if in_menu { menu.iter().chain(play.iter()).copied().collect() } else { play };
     let send = |source: u32, kind: u32, value: f32| {
         let ev = Event { source: source << 8 | PAD_INDEX, kind, extra: 0, value };
         // SAFETY: the title's handler with its own object and an event of the pad's form.
@@ -194,7 +250,7 @@ unsafe fn translate(me: &Relay, e: &Event) {
             }
             let count = read32(base + ACTION_COUNT) as usize;
             let array = read(base + ACTION_ARRAY);
-            for &id in actions {
+            for &id in &actions {
                 let Some(action) = (0..count).map(|i| array + i * 0x160).find(|&a| read32(a + 0x128) == id) else {
                     continue;
                 };
@@ -424,18 +480,13 @@ unsafe fn hook_activation(base: usize) {
 pub fn start(base: usize) {
     IMAGE.store(base, Ordering::Relaxed);
     if let Some(file) = std::env::var_os("VICTORY_NATIVE_KEYS") {
-        match std::fs::read_to_string(&file) {
-            Ok(text) => {
-                let map = parse_native_keys(&text);
-                tracing::info!(target: "keyboard_events", keys = map.len(), file = %std::path::Path::new(&file).display(), "native keys: each key stands for the game's own actions");
-                let _ = KEY_ACTIONS.set(map);
-            }
-            Err(e) => tracing::warn!(target: "keyboard_events", error = %e, "native keys file not read"),
-        }
+        let mut map = KEY_MAP.lock().unwrap_or_else(|p| p.into_inner());
+        map.file = Some(file.into());
+        map.refresh();
     } else if let Ok(spec) = std::env::var("VICTORY_KEY_ACTIONS") {
-        let map = parse_key_actions(&spec);
-        tracing::info!(target: "keyboard_events", keys = map.len(), "keys stand for the title's actions (sent as each active action's pad source)");
-        let _ = KEY_ACTIONS.set(map);
+        let entries = parse_key_actions(&spec);
+        tracing::info!(target: "keyboard_events", keys = entries.len(), "keys stand for the title's actions (sent as each active action's pad source)");
+        KEY_MAP.lock().unwrap_or_else(|p| p.into_inner()).entries = entries;
     }
     if let Ok(spec) = std::env::var("VICTORY_KEY_BINDS") {
         let binds = parse_binds(&spec);
@@ -513,9 +564,9 @@ mod tests {
 
     #[test]
     fn native_keys_lines_parse() {
-        let map = parse_native_keys("# c\nW = INPUT_VEH_ACCELERATE, INPUT_MOVE_UP_ONLY\nLeftClick = INPUT_ATTACK\nF5 = INPUT_X\nbad\n");
-        assert_eq!(map[0], (0x57, vec![0x5b9f_d4e2, 0x8fd0_15d8]));
-        assert_eq!(map[1].0, 0x7c);
+        let map = parse_native_keys("# c\nW = INPUT_VEH_ACCELERATE, INPUT_MOVE_UP_ONLY\nLeftClick = INPUT_ATTACK | INPUT_JUMP\nF5 = INPUT_X\nbad\n");
+        assert_eq!(map[0], (0x57, vec![0x5b9f_d4e2, 0x8fd0_15d8], vec![]));
+        assert_eq!(map[1], (0x7c, vec![joaat("INPUT_ATTACK")], vec![0xd9d0_e1c0]));
         assert_eq!(map[2].0, 0x74);
         assert_eq!(map.len(), 3);
     }
