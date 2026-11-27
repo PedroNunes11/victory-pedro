@@ -452,6 +452,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float left = dot(was, LUMA);
     // Magenta (green far below red and blue) is what the probes' memory held, not light.
     if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+    // Blue-heavy violet can pass both the magenta check and the luminance cap.
+    if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     // For `fresh` seconds after the light around jumped (a new room) the
@@ -692,6 +694,19 @@ mod tests {
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+    }
+
+    #[test]
+    fn raise_filters_magenta_and_violet_before_the_luminance_cap() {
+        let (_, raise) = SOURCE.split_once("void raise(").unwrap();
+        let (_, after_sample) = raise.split_once("float left = dot(was, LUMA);").unwrap();
+        let (filters, _) = after_sample.split_once("float has = dot(was, LUMA);").unwrap();
+        for guard in [
+            "if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;",
+            "if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;",
+        ] {
+            assert_eq!(filters.lines().filter(|line| line.trim() == guard).count(), 1, "{guard}");
+        }
     }
 
     /// The passes compile with the system's compiler and the host takes them.
