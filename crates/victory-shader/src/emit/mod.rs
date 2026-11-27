@@ -593,10 +593,18 @@ pub fn emit(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| {
-            v == "1"
+        // With `VICTORY_WAVE_WIDE` unset, a nonempty `VICTORY_WAVE_WIDE_ONLY`
+        // names programs that take the wide form anyway: the launch sets list
+        // the four programs a 32-lane card translates only in that form, and
+        // without this their draws were dropped (the list alone did nothing).
+        let listed = || {
+            std::env::var_os("VICTORY_WAVE_WIDE_ONLY").is_some_and(|l| !l.is_empty())
                 && wave_wide_hash_matches(std::env::var_os("VICTORY_WAVE_WIDE_ONLY").as_deref(), c.input)
-        });
+        };
+        let wide_on = wide_option.as_ref().map_or_else(
+            || scene_kernel || listed(),
+            |v| v == "1" && wave_wide_hash_matches(std::env::var_os("VICTORY_WAVE_WIDE_ONLY").as_deref(), c.input),
+        );
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
