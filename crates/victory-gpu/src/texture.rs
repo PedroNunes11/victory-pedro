@@ -1439,11 +1439,17 @@ impl Staging {
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
             // is there; nothing at all mapped changes nothing.
-            // shortcut: read again at most every 30 frames (reading around
-            // unmapped pages is slow, and nothing tells us when pages
-            // arrive): a mip that streams in shows up to 30 frames late.
+            // Re-checked every `VICTORY_TEXTURE_PARTIAL_FRAMES` frames
+            // (default 30; lower values sharpen streaming mips sooner).
+            static PARTIAL_FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let interval = *PARTIAL_FRAMES.get_or_init(|| {
+                std::env::var("VICTORY_TEXTURE_PARTIAL_FRAMES")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map_or(30, |n| n.clamp(1, 120))
+            });
             let frame = crate::frame::current();
-            if !exact && last.partial.is_some_and(|at| frame < at + 30) {
+            if !exact && last.partial.is_some_and(|at| frame < at + interval) {
                 return 0;
             }
             last.partial = Some(frame);

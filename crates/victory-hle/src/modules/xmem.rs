@@ -1974,8 +1974,59 @@ pub struct WorkingSet {
     pub kernel_pool_limit: u32,
 }
 
-/// The title's budget and our process's commit as what it uses. No tools
-/// memory: a retail console.
+/// What [`XMemGetWorkingSetStatistics`] answers as the title's use
+/// (`VICTORY_TITLE_USED_MB`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleUsed {
+    /// Unset: all our process has committed, the layer's own memory and the
+    /// card's included.
+    Process,
+    /// A number: that many MiB, whatever is in use.
+    Fixed(usize),
+    /// `title`: the physical pages the title holds (`XMemAllocatePhysicalPages`),
+    /// so the title does not see the layer's own commit and throttle streaming.
+    Title,
+}
+
+fn parse_title_used(value: Option<&str>) -> Result<TitleUsed, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(TitleUsed::Process),
+        Some(v) if v.eq_ignore_ascii_case("process") => Ok(TitleUsed::Process),
+        Some(v) if v.eq_ignore_ascii_case("title") => Ok(TitleUsed::Title),
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .and_then(|mb| mb.checked_mul(MIB))
+            .map(TitleUsed::Fixed)
+            .ok_or_else(|| format!("VICTORY_TITLE_USED_MB={v}: neither a number of MiB nor \"title\"")),
+    }
+}
+
+fn title_used_mode() -> TitleUsed {
+    static MODE: std::sync::OnceLock<TitleUsed> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let raw = std::env::var("VICTORY_TITLE_USED_MB").ok();
+        match parse_title_used(raw.as_deref()) {
+            Ok(mode) => mode,
+            Err(why) => {
+                tracing::warn!("{why}");
+                TitleUsed::Process
+            }
+        }
+    })
+}
+
+fn title_used(mode: TitleUsed, process: usize, physical: usize) -> usize {
+    match mode {
+        TitleUsed::Process => process,
+        TitleUsed::Fixed(bytes) => bytes,
+        TitleUsed::Title => physical,
+    }
+}
+
+/// The title's budget and, as what it uses, our process's commit
+/// (`VICTORY_TITLE_USED_MB` answers otherwise). No tools memory: a retail
+/// console.
 // shortcut: all fields are filled whatever the flags ask for, and use is
 // not split by bandwidth class (GPU-optimal use reads 0); track
 // allocations per class if a title budgets from that field.
@@ -1989,29 +2040,31 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     };
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    let mode = title_used_mode();
+    let physical = if mode == TitleUsed::Title {
+        physical().pages.len() * PAGE
+    } else {
+        0
+    };
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_used: title_used(mode, counters.PagefileUsage, physical),
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
     // What the title is told, logged at the first asking and at every
-    // 1,024th: "used" is all the process has committed, the layer's own
-    // memory and the card's included (27 GB in run 60's gameplay against a
-    // limit of 13.5 GB). A title that budgets its streaming from these two
-    // figures believes it is far over its limit.
-    // shortcut: the figure is not yet the title's own memory alone (its
-    // heaps and the pages it mapped); count those if this line shows the
-    // title asking.
+    // 1,024th.
     static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let asked = ASKED.fetch_add(1, Ordering::Relaxed);
     if asked.is_multiple_of(1024) {
         tracing::info!(
             asked = asked + 1,
             which = _which,
+            ?mode,
             limit_mb = stats.title_limit >> 20,
             used_mb = stats.title_used >> 20,
+            process_mb = counters.PagefileUsage >> 20,
             "the title asks how much memory it uses"
         );
     }

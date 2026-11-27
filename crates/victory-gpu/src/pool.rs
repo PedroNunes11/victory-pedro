@@ -30,8 +30,19 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 const BLOCK: u64 = 64 << 20;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
-/// The same while the card has room ([`room`]): 4 GiB of them.
+/// The same while the card has room ([`room`]): default 4 GiB (64 blocks),
+/// overridable with `VICTORY_TEXTURE_POOL_SPARES` (e.g. 8 on 12 GB cards so
+/// empty blocks do not inflate DXGI usage near the eviction cliff).
 const SPARE_KEPT: usize = 64;
+fn spare_kept() -> usize {
+    static KEPT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KEPT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_POOL_SPARES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(SPARE_KEPT, |n| n.clamp(SPARE, SPARE_KEPT))
+    })
+}
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
@@ -65,7 +76,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => spare_kept(),
         _ => SPARE,
     }
 }
