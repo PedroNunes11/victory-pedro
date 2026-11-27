@@ -1673,3 +1673,24 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
 }
+
+#[test]
+fn readfirstlane_uses_both_halves_of_the_console_wave() {
+    let mut words = vec![
+        sop1(0x04, 12, EXEC),    // save EXEC
+        vopc(0xD3, 0, 0),       // v_cmpx_le_u32 s0, v0
+        vop1(0x02, 6, v(0)),    // v_readfirstlane_b32 s6, v0
+        sop1(0x04, EXEC, 12),   // restore EXEC for the stores
+        vop1(0x01, 2, 6),       // v_mov_b32 v2, s6
+    ];
+    words.extend(stores([2, 0, 0, 0]));
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("split wave64 first-lane read");
+    let _lock = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for threshold in [0, 16, 32, 40, 63] {
+        let Some(actual) = run_lanes(&shader, [threshold, 0, 0, 0], 256) else { return };
+        let want: Vec<_> = (0..64).flat_map(|n| [threshold, n, n, n]).collect();
+        same_as_console(&actual, &want);
+    }
+}

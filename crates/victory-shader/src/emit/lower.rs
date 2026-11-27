@@ -1870,6 +1870,29 @@ impl<'a> Lower<'a> {
             let mut wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
+            let mut first_lane_crosses = false;
+            if wave == 64 && group > 32 && host_max_wave() == 32 {
+                let sources: Vec<_> = insts()
+                    .filter(|i| {
+                        i.name() == "v_readfirstlane_b32"
+                            && !i.writes.first().is_some_and(|w| x.res.waterfall.reads.contains(&w.1))
+                    })
+                    .filter_map(|i| match &i.fields {
+                        Fields::Valu(v) => match v.src.first() {
+                            Some(&Operand::Vector { reg, .. }) => i.read(Reg::V(reg)),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect();
+                if !sources.is_empty() {
+                    let uniform = all_lane_blocks(x.st).map_or_else(HashSet::new, |all| {
+                        lane_uniform(p, x.st, &all, wave_tid(p, x), false)
+                    });
+                    first_lane_crosses = sources.into_iter().any(|v| !uniform.contains(&v));
+                    console_lanes |= first_lane_crosses;
+                }
+            }
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
             // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, `ds_bpermute`, which the ISA
@@ -1879,7 +1902,7 @@ impl<'a> Lower<'a> {
             // lane-constant masks), nor when LDS may be shared within the console wave without
             // barriers (a group over 32 threads with LDS): those still need 64-lane waves.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
-                let crosses = insts().any(|i| {
+                let crosses = first_lane_crosses || insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
