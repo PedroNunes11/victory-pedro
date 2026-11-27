@@ -332,6 +332,12 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     )
 }
 
+/// A window the title made.
+pub(crate) fn is_title_window(hwnd: HWND) -> bool {
+    // SAFETY: a plain query; a null window has no properties.
+    !hwnd.is_null() && unsafe { !wm::GetPropW(hwnd, TITLE_PROC).is_null() }
+}
+
 /// Puts our procedure in front of the title's.
 fn hook(hwnd: HWND) {
     if hwnd.is_null() {
@@ -405,6 +411,37 @@ extern "system" fn window_proc(
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
+    }
+    // While the mouse turns the view there is no cursor over the picture.
+    if message == wm::WM_SETCURSOR
+        && lparam as u32 & 0xFFFF == wm::HTCLIENT
+        && super::gameinput::mouse::taken()
+    {
+        // SAFETY: no cursor, until the next of these messages.
+        unsafe { wm::SetCursor(std::ptr::null_mut()) };
+        return 1;
+    }
+    // The window shows the system's white (the title's class brush) from
+    // its creation until our first present, a second or more at start.
+    // It is black instead, as a console's screen is before its first frame.
+    if message == wm::WM_ERASEBKGND {
+        use windows_sys::Win32::Graphics::Gdi;
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        // SAFETY: the device context the message hands over, for our window.
+        unsafe {
+            wm::GetClientRect(hwnd, &mut rect);
+            Gdi::FillRect(
+                wparam as Gdi::HDC,
+                &rect,
+                Gdi::GetStockObject(Gdi::BLACK_BRUSH) as Gdi::HBRUSH,
+            );
+        }
+        return 1;
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
@@ -768,6 +805,15 @@ mod tests {
             let n = wm::GetWindowTextW(hwnd, text.as_mut_ptr(), 16);
             assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "after");
             assert!(!wm::GetPropW(hwnd, TITLE_PROC).is_null());
+            assert!(is_title_window(hwnd) && !is_title_window(null));
+            // No cursor over the picture while the mouse turns the view.
+            let taken = &crate::modules::gameinput::mouse::TAKEN;
+            let cursor =
+                |at: u32| wm::SendMessageW(hwnd, wm::WM_SETCURSOR, hwnd as usize, at as LPARAM);
+            taken.store(true, Ordering::Relaxed);
+            let (over, border) = (cursor(wm::HTCLIENT), cursor(wm::HTCAPTION));
+            taken.store(false, Ordering::Relaxed);
+            assert_eq!((over, border, cursor(wm::HTCLIENT)), (1, 0, 0));
             wm::DestroyWindow(hwnd);
         }
     }
