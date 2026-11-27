@@ -66,6 +66,21 @@ unsafe extern "system" fn relay(me: *mut c_void, event: *const Event) {
         }
         return;
     }
+    // Once, on the title's thread: a "released" event for every bound key, so the title's drain
+    // makes each key's source state record the way it makes the pad's (an action that activates
+    // with a source that has no record yet made the title end itself).
+    static PRIMED: std::sync::Once = std::sync::Once::new();
+    PRIMED.call_once(|| {
+        let mut keys: Vec<u32> = BINDS.get().map(|b| b.iter().map(|b| b.1).collect()).unwrap_or_default();
+        keys.sort_unstable();
+        keys.dedup();
+        for key in &keys {
+            let released = Event { source: key << 8, kind: 11, extra: 0, value: 0.0 };
+            // SAFETY: the title's handler with its own object and an event of its form.
+            unsafe { (me.handler)(me.object, &released) };
+        }
+        tracing::info!(target: "keyboard_events", keys = ?keys, "released events sent for the bound keys (their source records)");
+    });
     let count = (me.object as usize + BUFFER_COUNT) as *const u16;
     // SAFETY: the buffer object's count; read without its lock, for the log only.
     let before = unsafe { count.read_volatile() };
@@ -132,15 +147,23 @@ unsafe fn add_to(action: usize) {
     let n = read32(desc + 4) as usize;
     let old = read(desc + 8);
     let mut records: Vec<u32> = (0..n * 3).map(|i| read32(old + 4 * i)).collect();
-    let missing: Vec<(u32, u32)> =
-        wanted.into_iter().filter(|&(key, _)| !records.chunks(3).any(|r| r[0] == key)).collect();
+    let base = IMAGE.load(Ordering::Relaxed);
+    let (absent, missing): (Vec<(u32, u32)>, Vec<(u32, u32)>) = wanted
+        .into_iter()
+        .filter(|&(key, _)| !records.chunks(3).any(|r| r[0] == key))
+        .partition(|&(key, _)| !has_record(base, key));
+    if !absent.is_empty() {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 16 {
+            tracing::info!(target: "keyboard_events", action = format_args!("{id:#010x}"), keys = ?absent, "keys left out: no source record yet (the next activation adds them)");
+        }
+    }
     if missing.is_empty() {
         return;
     }
     for &(key, flags) in &missing {
         records.extend([key, 0xf000, flags]);
     }
-    let base = IMAGE.load(Ordering::Relaxed);
     // SAFETY: the title's allocator, called on the title's thread as its own code calls it.
     let block = unsafe {
         std::mem::transmute::<usize, unsafe extern "system" fn(usize, usize) -> *mut u32>(base + ALLOCATE)(
@@ -163,6 +186,48 @@ unsafe fn add_to(action: usize) {
     if times <= 64 || times.is_power_of_two() {
         tracing::info!(target: "keyboard_events", action = format_args!("{id:#010x}"), keys = ?missing, records = records.len() / 3, times, "keyboard bindings added at activation");
     }
+}
+
+/// The title's map of source state records (title 0x14ab77e80: `{u32 groups, u32 size, groups}`;
+/// a group is 16 control bytes and 16 records of 0x78 bytes, the code first), looked up the way
+/// title +0x5091ff0 does, without inserting.
+const SOURCE_MAP: usize = 0xab7_7e80;
+
+fn has_record(base: usize, code: u32) -> bool {
+    // SAFETY (both): the title's map and its groups, read only.
+    let read32 = |at: usize| unsafe { std::ptr::read_volatile(at as *const u32) };
+    let read8 = |at: usize| unsafe { std::ptr::read_volatile(at as *const u8) };
+    let map = base + SOURCE_MAP;
+    let groups = read32(map) as usize;
+    // SAFETY: as above.
+    let table = unsafe { std::ptr::read_volatile((map + 8) as *const usize) };
+    if groups == 0 || table == 0 || !groups.is_power_of_two() {
+        return false;
+    }
+    let mut h = code ^ (code >> 16);
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^= h >> 16;
+    let tag = (h & 0x7f) as u8;
+    let mut g = (h >> 7) as usize & (groups - 1);
+    for _ in 0..groups {
+        let group = table + g * 0x790;
+        let mut empty = false;
+        for i in 0..16 {
+            let c = read8(group + i);
+            if c == tag && read32(group + 0x10 + i * 0x78) == code {
+                return true;
+            }
+            // vpsignb + vpmovmskb in the title: only 0x80 (empty) ends the search.
+            empty |= c == 0x80;
+        }
+        if empty {
+            return false;
+        }
+        g = (g + 1) & (groups - 1);
+    }
+    false
 }
 
 /// Puts [`activate`] in front of the title's activation.
