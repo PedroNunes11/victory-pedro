@@ -1501,14 +1501,58 @@ static WAITING: std::sync::Mutex<std::collections::BTreeMap<usize, Vec<u64>>> =
 #[cfg(windows)]
 static MADE_LATE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
+/// Whether [`MADE_LATE`] may have entries, so [`make_waiting`] skips locking
+/// on submissions that created no host texture copies.
+#[cfg(windows)]
+static MADE_LATE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+fn push_made_late(
+    list: &std::sync::Mutex<Vec<usize>>,
+    pending: &std::sync::atomic::AtomicBool,
+    resource: usize,
+) {
+    let mut made = list.lock().unwrap_or_else(|e| e.into_inner());
+    made.push(resource);
+    pending.store(true, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(windows)]
+fn take_made_late(
+    list: &std::sync::Mutex<Vec<usize>>,
+    pending: &std::sync::atomic::AtomicBool,
+) -> Vec<usize> {
+    if !pending.load(std::sync::atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
+    let mut guard = list.lock().unwrap_or_else(|e| e.into_inner());
+    pending.store(false, std::sync::atomic::Ordering::Release);
+    std::mem::take(&mut *guard)
+}
+
 /// Title texture `resource` was given its host copy (called under that
 /// texture's own lock: nothing else is locked here).
 #[cfg(windows)]
 pub(crate) fn texture_made(resource: usize) {
-    MADE_LATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(resource);
+    push_made_late(&MADE_LATE, &MADE_LATE_PENDING, resource);
+}
+
+#[cfg(windows)]
+fn take_waiting_for(
+    waiting: &mut std::collections::BTreeMap<usize, Vec<u64>>,
+    mut made: Vec<usize>,
+) -> Vec<(usize, Vec<u64>)> {
+    made.sort_unstable();
+    made.dedup();
+    let mut out = Vec::new();
+    for resource in made {
+        if let Some(handles) = waiting.remove(&resource)
+            && !handles.is_empty()
+        {
+            out.push((resource, handles));
+        }
+    }
+    out
 }
 
 /// The slot at `handle` was written with a view of texture `resource`,
@@ -1541,22 +1585,36 @@ fn wait_for(resource: usize, handle: u64) {
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
-    let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
-    for resource in made {
-        let handles = WAITING
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&resource);
-        for handle in handles.into_iter().flatten() {
+    let made = take_made_late(&MADE_LATE, &MADE_LATE_PENDING);
+    if made.is_empty() {
+        return;
+    }
+    let pending = {
+        let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        take_waiting_for(&mut waiting, made)
+    };
+    if pending.is_empty() {
+        return;
+    }
+    // (The heap stays while the lock is held: `mirror`.)
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut cached_heap: Option<(u64, u64, usize)> = None;
+    for (resource, handles) in pending {
+        for handle in handles {
             // Only if the slot still holds a view of that texture: the
             // title may have written it since (and a view of another
             // texture without a host copy must go on waiting).
             // (Looked up first: the handle is read only while its heap is
             // there.)
-            // (The heap stays while the lock is held: `mirror`.)
-            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-            let Some(&(_, _, at)) = heaps.iter().find(|&&(start, end, _)| (start..end).contains(&handle)) else {
-                continue;
+            let at = match cached_heap {
+                Some((start, end, at)) if (start..end).contains(&handle) => at,
+                _ => {
+                    let Some(&(start, end, at)) = heaps.iter().find(|&&(start, end, _)| (start..end).contains(&handle)) else {
+                        continue;
+                    };
+                    cached_heap = Some((start, end, at));
+                    at
+                }
             };
             // SAFETY: a registered heap, live while the lock is held.
             let heap = unsafe { &*(at as *const Heap) };
@@ -2477,5 +2535,38 @@ mod tests {
         }
         eprintln!("words that tell shapes apart: {identity:?}");
         assert!(padding.0 <= 4, "padding alone made {} shapes out of {N}", padding.0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn take_waiting_for_dedups_and_batches_removals() {
+        let mut waiting = std::collections::BTreeMap::new();
+        waiting.insert(10usize, vec![100u64, 104]);
+        waiting.insert(20usize, vec![]);
+        waiting.insert(30usize, vec![300u64]);
+        waiting.insert(40usize, vec![400u64]);
+
+        let taken = take_waiting_for(&mut waiting, vec![30, 10, 30, 20, 99, 10]);
+        assert_eq!(taken, vec![(10, vec![100, 104]), (30, vec![300])]);
+        assert!(!waiting.contains_key(&10));
+        assert!(!waiting.contains_key(&20));
+        assert!(!waiting.contains_key(&30));
+        assert_eq!(waiting.get(&40), Some(&vec![400]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn take_made_late_fast_paths_when_clear_and_clears_pending_when_drained() {
+        let list = std::sync::Mutex::new(vec![0x1111usize]);
+        let pending = std::sync::atomic::AtomicBool::new(false);
+        // Fast path skips the mutex when `pending` is false.
+        assert!(take_made_late(&list, &pending).is_empty());
+        assert_eq!(list.lock().unwrap().len(), 1);
+
+        push_made_late(&list, &pending, 0x2222);
+        assert!(pending.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(take_made_late(&list, &pending), vec![0x1111, 0x2222]);
+        assert!(!pending.load(std::sync::atomic::Ordering::Acquire));
+        assert!(take_made_late(&list, &pending).is_empty());
     }
 }
