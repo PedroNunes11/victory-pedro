@@ -2396,6 +2396,9 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Index of `Step::GpuWrite` entries in `copies` so [`declared_writes`]
+    /// avoids scanning thousands of non-write steps on the submission thread.
+    gpu_write_steps: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
@@ -4153,24 +4156,25 @@ fn declare_once() -> bool {
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
+    if runs.iter().all(|list| list.deferred().gpu_write_steps.is_empty()) {
+        return Vec::new();
+    }
     let mut back: Vec<Declared> = Vec::new();
     // Where each copy is in it, and the ranges seen: dispatches declare the
     // same ranges thousands of times a frame.
     let mut places: ByCopy<usize> = ByCopy::default();
     let mut seen = std::collections::HashSet::<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>::default();
     for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
-                let key = std::sync::Arc::as_ptr(shadow) as usize;
-                if !seen.insert((key, *address, *len)) {
-                    continue;
-                }
-                let i = *places.entry(key).or_insert_with(|| {
-                    back.push((shadow.clone(), Vec::new()));
-                    back.len() - 1
-                });
-                back[i].1.push((*address, *address + *len));
+        for (shadow, address, len) in &list.deferred().gpu_write_steps {
+            let key = std::sync::Arc::as_ptr(shadow) as usize;
+            if !seen.insert((key, *address, *len)) {
+                continue;
             }
+            let i = *places.entry(key).or_insert_with(|| {
+                back.push((shadow.clone(), Vec::new()));
+                back.len() - 1
+            });
+            back[i].1.push((*address, *address + *len));
         }
     }
     back
@@ -7399,6 +7403,7 @@ impl HostList {
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
             deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+            deferred.gpu_write_steps.push((shadow.clone(), address, len));
         }
     }
 
@@ -11778,6 +11783,40 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn declared_writes_uses_gpu_write_index_and_clears_on_reset() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list_a = host.new_list().expect("list_a");
+        let list_b = host.new_list().expect("list_b");
+        assert!(super::declared_writes(&[&list_a, &list_b]).is_empty());
+
+        let mut backing = vec![0u8; 4096];
+        let base = backing.as_mut_ptr() as u64;
+        let shadow = crate::shadow::Shadow::unbacked(base, backing.as_mut_ptr(), 4096, false);
+        list_a.defer_gpu_write(&shadow, base as usize, 128);
+        list_a.defer_gpu_write(&shadow, base as usize + 256, 64);
+        // Duplicate across lists must be deduplicated by declared_writes.
+        list_b.defer_gpu_write(&shadow, base as usize, 128);
+
+        let declared = super::declared_writes(&[&list_a, &list_b]);
+        assert_eq!(declared.len(), 1);
+        assert_eq!(
+            declared[0].1,
+            vec![
+                (base as usize, base as usize + 128),
+                (base as usize + 256, base as usize + 320),
+            ]
+        );
+
+        list_a.close();
+        list_a.reset();
+        list_b.close();
+        list_b.reset();
+        assert!(super::declared_writes(&[&list_a, &list_b]).is_empty());
     }
 }
 
