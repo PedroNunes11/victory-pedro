@@ -20,6 +20,9 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+#[path = "round_even.rs"]
+mod round_even;
+
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
@@ -4557,7 +4560,7 @@ impl<'a> Lower<'a> {
     fn trig_turns(&mut self, x: V, cosine: bool) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);
-        let whole = self.unary(26, x);
+        let whole = self.rndne_f32(x);
         let part = self.s.m.bin(c, Bin::Sub, x, whole);
         let is_zero = self.s.m.cmp(c, pred::OEQ, x, zero);
         let part = self.s.m.select(c, is_zero, x, part);
@@ -9363,6 +9366,7 @@ impl<'a> Lower<'a> {
                 let r = match op {
                     12 | 13 => self.trig_turns(a, op == 12),
                     22 => self.fract(a, 1.0, f32::from_bits(0x3F7F_FFFF)),
+                    26 => self.rndne_f32(a),
                     _ => self.unary(op, a),
                 };
                 float(self, r)
@@ -10408,6 +10412,7 @@ impl<'a> Lower<'a> {
                         12 | 13 => self.trig_turns(a, op == 12),
                         // Any f16 in (-2^-11, 0) has fract >= 1 - 2^-12; clamp to 0x3bff (1 - 2^-11).
                         22 => self.fract(a, 1.0 - 1.0 / 4096.0, 1.0 - 1.0 / 2048.0),
+                        26 => self.rndne_f32(a),
                         _ => self.unary(op, a),
                     }
                 }
@@ -11083,7 +11088,7 @@ impl<'a> Lower<'a> {
                 // byte src1[1:0] of src2.
                 let f = self.fsrc(inst, 0)?;
                 let (b, d) = (s(self, 1)?, s(self, 2)?);
-                let f = self.unary(26, f);
+                let f = self.rndne_f32(f);
                 let (zero, max) = (self.s.m.f32(0), self.s.m.f32(255.0f32.to_bits()));
                 let f = self.binary(35, f, zero);
                 let f = self.binary(36, f, max);
@@ -12378,7 +12383,7 @@ impl<'a> Lower<'a> {
                         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
                         let zero = self.s.m.f32(0);
                         let lod = self.binary(35, lod, zero); // maximum
-                        let lod = self.unary(26, lod); // round to nearest
+                        let lod = self.rndne_f32(lod); // round to nearest even
                         let mip = self.s.m.cast(c, Cast::FpToUi, lod, i32t);
                         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
                         let d = self
