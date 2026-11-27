@@ -540,12 +540,12 @@ pub extern "system" fn ReadFile(
     let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
     );
-    if let Some(r) = research {
-        archive_read::after(r, buffer, len, done != 0);
-    }
     // The call's error is the title's to ask for.
     // SAFETY: plain calls.
     let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    if let Some(r) = research {
+        archive_read::after(r, buffer, len, done != 0, error);
+    }
     // shortcut: a read that goes on after the call (overlapped) is written
     // into pages the kernel has locked by now: it lands all the same, but a
     // refresh that guards its blocks before it does will not see it.
@@ -838,7 +838,7 @@ pub(crate) mod archive_read {
         (ok != 0 && got == len).then_some(out)
     }
 
-    pub(crate) fn after(b: Before, buffer: *mut u8, len: u32, done: bool) {
+    pub(crate) fn after(b: Before, buffer: *mut u8, len: u32, done: bool, error: u32) {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
@@ -849,6 +849,7 @@ pub(crate) mod archive_read {
             len,
             buffer = format_args!("{buffer:p}"),
             done,
+            error,
             "rpf read"
         );
         let Some(dir) = std::env::var_os("VICTORY_READ_DUMP_DIR") else { return };
