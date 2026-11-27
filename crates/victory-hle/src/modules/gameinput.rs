@@ -747,6 +747,52 @@ extern "system" fn timestamp(_: This) -> u64 {
     now()
 }
 
+
+/// Research (the in-game controls work): which title functions read input, and how often.
+/// `VICTORY_INPUT_CALLERS=1` logs each distinct call chain (title `module+rva` frames) into
+/// `GetCurrentReading` by kind, `GetKeyCount`, `GetKeyState` and `GetGamepadState`, again at
+/// every power-of-two count, so a session shows whether the title reads the keyboard at all and
+/// which of its functions turn readings into its own input state. Nothing runs without the switch.
+mod callers {
+    use std::sync::{Mutex, OnceLock};
+
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_INPUT_CALLERS").is_some_and(|v| v == "1"))
+    }
+
+    #[inline(never)]
+    pub(super) fn note(what: &'static str, kind: u32) {
+        if !on() {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+            let mut frames = [std::ptr::null_mut(); 8];
+            // SAFETY: fills at most `frames.len()` return addresses; skips this function and the
+            // export that called it, so the first frame is the title's call site.
+            let n = unsafe { RtlCaptureStackBackTrace(2, frames.len() as u32, frames.as_mut_ptr(), std::ptr::null_mut()) };
+            let chain: Vec<_> = frames[..usize::from(n)].iter().map(|&f| victory_loader::locate(f as usize)).collect();
+            let key = format!("{what} kind={kind:#x} at {}", chain.join(" < "));
+            static SEEN: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let count = if let Some(e) = seen.iter_mut().find(|(k, _)| *k == key) {
+                e.1 += 1;
+                e.1
+            } else if seen.len() < 64 {
+                seen.push((key.clone(), 1));
+                1
+            } else {
+                return;
+            };
+            if count.is_power_of_two() {
+                tracing::info!(target: "input_callers", count, "{key}");
+            }
+        }
+    }
+}
+
 extern "system" fn current_reading(
     this: This,
     kind: u32,
@@ -754,6 +800,7 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     LOOKS.fetch_add(1, Ordering::Relaxed);
+    callers::note("GetCurrentReading", kind);
     let hub = hub(this);
     let mut state = hub.state();
     let newest = |i: usize| {
@@ -1178,12 +1225,14 @@ extern "system" fn reading_device(this: *const Reading, out: *mut *const Device)
     }
 }
 extern "system" fn key_count(this: *const Reading) -> u32 {
+    callers::note("GetKeyCount", 0);
     match &reading(this).value {
         Value::Keys(keys) => keys.len() as u32,
         Value::Pad(_) => 0,
     }
 }
 extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
+    callers::note("GetKeyState", 0);
     let Value::Keys(keys) = &reading(this).value else {
         return 0;
     };
@@ -1196,6 +1245,7 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
+    callers::note("GetGamepadState", 0);
     match &reading(this).value {
         Value::Pad(state) if !out.is_null() => {
             // SAFETY: checked non-null.
