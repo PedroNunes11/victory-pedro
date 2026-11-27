@@ -18,7 +18,10 @@
 //! 0x14ab77b90: actions of 0x160 bytes, count at +0x44, array at +0x48; id at
 //! +0x128; entry +0x10 -> `{capacity, count, records}`, records of 12 bytes
 //! `{source, second source or 0xf000, flags}`). An action links its sources
-//! when its context activates, so this runs early (start screen).
+//! when it activates (title +0x1d67c0), and the title rebuilds these arrays
+//! from its data and frees them (e.g. around the pause menu): the records go
+//! in from a hook on that activation, every time, in blocks of the title's own
+//! allocator (title +0x4d9c140), on the title's thread.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,10 +80,6 @@ unsafe extern "system" fn relay(me: *mut c_void, event: *const Event) {
     }
 }
 
-/// The input system's action array (count, first), as offsets in the image.
-const ACTION_COUNT: usize = 0xab7_7bd4;
-const ACTION_ARRAY: usize = 0xab7_7bd8;
-
 fn parse_binds(spec: &str) -> Vec<(u32, u32, u32)> {
     spec.split(',')
         .filter_map(|b| {
@@ -90,70 +89,140 @@ fn parse_binds(spec: &str) -> Vec<(u32, u32, u32)> {
         .collect()
 }
 
-/// Adds the asked keyboard records once the title has its actions.
-fn add_binds(base: usize, binds: Vec<(u32, u32, u32)>) {
-    let read32 = |at: usize| -> u32 {
-        // SAFETY: words of the mapped image or of title objects it points at.
-        unsafe { std::ptr::read_volatile(at as *const u32) }
-    };
-    let read = |at: usize| -> usize {
-        // SAFETY: as above.
-        unsafe { std::ptr::read_volatile(at as *const usize) }
-    };
-    let (count, array) = loop {
-        let count = read32(base + ACTION_COUNT) as usize;
-        let array = read(base + ACTION_ARRAY);
-        if count > 0 && array != 0 {
-            break (count, array);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    };
-    let _ = (count, array);
-    // The title fills and reworks its actions during "Game Init" (a patch then crashed it): wait
-    // `VICTORY_KEY_BINDS_AFTER` seconds (default 0) first.
-    let after = std::env::var("VICTORY_KEY_BINDS_AFTER").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-    std::thread::sleep(std::time::Duration::from_secs(after));
-    for (id, key, flags) in binds {
-        // The actions are filled in after the array appears: look again for a minute.
-        let mut found = None;
-        for _ in 0..300 {
-            let count = read32(base + ACTION_COUNT) as usize;
-            let array = read(base + ACTION_ARRAY);
-            if let Some(action) = (0..count).map(|i| array + i * 0x160).find(|&a| read32(a + 0x128) == id) {
-                let first = read(action + 8);
-                if read32(action + 4) != 0 && first != 0 && read(first) != 0 && read(read(first) + 0x10) != 0 {
-                    found = Some(read(read(first) + 0x10));
-                    break;
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-        let Some(desc) = found else {
-            tracing::warn!(target: "keyboard_events", action = format_args!("{id:#010x}"), "no such action with bindings");
-            continue;
-        };
-        let n = read32(desc + 4) as usize;
-        let old = read(desc + 8);
-        let mut records: Vec<u32> = (0..n * 3).map(|i| read32(old + 4 * i)).collect();
-        records.extend([key, 0xf000, flags]);
-        let new = Box::leak(records.into_boxed_slice());
-        // SAFETY: the action's binding descriptor: records first, then count and capacity, so a reader
-        // never sees a count past its records.
-        unsafe {
-            std::ptr::write_volatile((desc + 8) as *mut usize, new.as_ptr() as usize);
-            std::ptr::write_volatile((desc + 4) as *mut u32, (n + 1) as u32);
-            std::ptr::write_volatile(desc as *mut u32, (n + 1) as u32);
-        }
-        tracing::info!(target: "keyboard_events", action = format_args!("{id:#010x}"), key = format_args!("{key:#x}"), flags, records = n + 1, "keyboard binding added");
+/// The title's action activation (it links an action's sources to it), its first 19 bytes (all
+/// position independent), and its allocator `(align, size) -> block`.
+const ACTIVATE: usize = 0x1d_67c0;
+const ACTIVATE_PROLOGUE: [u8; 19] =
+    [0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x56, 0x57, 0x55, 0x53, 0x48, 0x81, 0xec, 0xc8, 0, 0, 0];
+const ALLOCATE: usize = 0x4d9_c140;
+
+static BINDS: std::sync::OnceLock<Vec<(u32, u32, u32)>> = std::sync::OnceLock::new();
+static TRAMPOLINE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static IMAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ADDED: AtomicU64 = AtomicU64::new(0);
+
+/// Before the title links an action's sources: the asked keyboard records go into its bindings,
+/// in a block of the title's own allocator (the title frees and rebuilds these arrays, e.g. around
+/// the pause menu, then links again: this runs each time).
+unsafe extern "system" fn activate(action: usize) {
+    // SAFETY: the title's action object, on the title's thread, before its activation reads it.
+    unsafe { add_to(action) };
+    let original = TRAMPOLINE.load(Ordering::Relaxed);
+    // SAFETY: the trampoline runs the displaced prologue and goes on in the title's function.
+    unsafe { std::mem::transmute::<usize, unsafe extern "system" fn(usize)>(original)(action) }
+}
+
+/// # Safety
+/// `action` is one of the title's input actions, being activated on this thread.
+unsafe fn add_to(action: usize) {
+    let Some(binds) = BINDS.get() else { return };
+    // SAFETY (both): fields of the title's action, its entry and binding descriptor.
+    let read32 = |at: usize| unsafe { std::ptr::read_volatile(at as *const u32) };
+    let read = |at: usize| unsafe { std::ptr::read_volatile(at as *const usize) };
+    let id = read32(action + 0x128);
+    let wanted: Vec<(u32, u32)> = binds.iter().filter(|b| b.0 == id).map(|b| (b.1, b.2)).collect();
+    if wanted.is_empty() || read32(action + 4) == 0 || read(action + 8) == 0 {
+        return;
     }
+    let entry = read(read(action + 8));
+    if entry == 0 || read(entry + 0x10) == 0 {
+        return;
+    }
+    let desc = read(entry + 0x10);
+    let n = read32(desc + 4) as usize;
+    let old = read(desc + 8);
+    let mut records: Vec<u32> = (0..n * 3).map(|i| read32(old + 4 * i)).collect();
+    let missing: Vec<(u32, u32)> =
+        wanted.into_iter().filter(|&(key, _)| !records.chunks(3).any(|r| r[0] == key)).collect();
+    if missing.is_empty() {
+        return;
+    }
+    for &(key, flags) in &missing {
+        records.extend([key, 0xf000, flags]);
+    }
+    let base = IMAGE.load(Ordering::Relaxed);
+    // SAFETY: the title's allocator, called on the title's thread as its own code calls it.
+    let block = unsafe {
+        std::mem::transmute::<usize, unsafe extern "system" fn(usize, usize) -> *mut u32>(base + ALLOCATE)(
+            4,
+            records.len() * 4,
+        )
+    };
+    if block.is_null() {
+        return;
+    }
+    // SAFETY: a block of `records.len()` u32 just allocated; then the descriptor: records first,
+    // then count and capacity. The old block is left to the title.
+    unsafe {
+        std::ptr::copy_nonoverlapping(records.as_ptr(), block, records.len());
+        std::ptr::write_volatile((desc + 8) as *mut usize, block as usize);
+        std::ptr::write_volatile((desc + 4) as *mut u32, (records.len() / 3) as u32);
+        std::ptr::write_volatile(desc as *mut u32, (records.len() / 3) as u32);
+    }
+    let times = ADDED.fetch_add(1, Ordering::Relaxed) + 1;
+    if times <= 64 || times.is_power_of_two() {
+        tracing::info!(target: "keyboard_events", action = format_args!("{id:#010x}"), keys = ?missing, records = records.len() / 3, times, "keyboard bindings added at activation");
+    }
+}
+
+/// Puts [`activate`] in front of the title's activation.
+///
+/// # Safety
+/// The image at `base` is mapped and none of its code has run yet.
+unsafe fn hook_activation(base: usize) {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualProtect,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let at = base + ACTIVATE;
+    // SAFETY: inside the mapped image; nothing runs yet.
+    let found = unsafe { std::slice::from_raw_parts(at as *const u8, ACTIVATE_PROLOGUE.len()) };
+    if found != ACTIVATE_PROLOGUE {
+        tracing::warn!(target: "keyboard_events", "the action activation is not the expected code (another build?); no bindings");
+        return;
+    }
+    let jump = |to: usize| -> [u8; 14] {
+        let mut j = [0xff, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        j[6..].copy_from_slice(&(to as u64).to_le_bytes());
+        j
+    };
+    // SAFETY: a fresh page of our own for the trampoline.
+    let trampoline =
+        unsafe { VirtualAlloc(std::ptr::null(), 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) }.cast::<u8>();
+    if trampoline.is_null() {
+        return;
+    }
+    // SAFETY: our page: the displaced prologue, then a jump back after it.
+    unsafe {
+        std::ptr::copy_nonoverlapping(ACTIVATE_PROLOGUE.as_ptr(), trampoline, ACTIVATE_PROLOGUE.len());
+        let back = jump(at + ACTIVATE_PROLOGUE.len());
+        std::ptr::copy_nonoverlapping(back.as_ptr(), trampoline.add(ACTIVATE_PROLOGUE.len()), back.len());
+    }
+    TRAMPOLINE.store(trampoline as usize, Ordering::Relaxed);
+    IMAGE.store(base, Ordering::Relaxed);
+    let mut patch = [0x90u8; 19];
+    patch[..14].copy_from_slice(&jump(activate as unsafe extern "system" fn(usize) as usize));
+    let mut old = 0;
+    // SAFETY: the title's function head (checked above), made writable for the write and put back.
+    unsafe {
+        if VirtualProtect(at as *const _, patch.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return;
+        }
+        std::ptr::copy_nonoverlapping(patch.as_ptr(), at as *mut u8, patch.len());
+        VirtualProtect(at as *const _, patch.len(), old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), at as *const _, patch.len());
+    }
+    tracing::info!(target: "keyboard_events", binds = BINDS.get().map_or(0, Vec::len), "keyboard bindings go in at each action activation");
 }
 
 /// Starts the subscriber thread when `VICTORY_KEYBOARD_EVENTS` is `1` or `log`.
 pub fn start(base: usize) {
     if let Ok(spec) = std::env::var("VICTORY_KEY_BINDS") {
         let binds = parse_binds(&spec);
-        if !binds.is_empty() {
-            let _ = std::thread::Builder::new().name("key binds".into()).spawn(move || add_binds(base, binds));
+        if !binds.is_empty() && BINDS.set(binds).is_ok() {
+            // SAFETY: called before the title runs (run.rs, with the other image patches).
+            unsafe { hook_activation(base) };
         }
     }
     let forward = match std::env::var("VICTORY_KEYBOARD_EVENTS").as_deref() {
