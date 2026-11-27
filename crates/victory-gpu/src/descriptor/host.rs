@@ -5407,6 +5407,10 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 #[cfg(test)]
+#[path = "anisotropic_sampler_tests.rs"]
+mod anisotropic_sampler_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
