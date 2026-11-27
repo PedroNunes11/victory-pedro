@@ -44,6 +44,9 @@ pub enum Preset {
     Balanced,
     #[serde(alias = "high")]
     HighQuality,
+    /// High Quality's settings at 3840x2160 rendered at full size (DLAA).
+    #[serde(rename = "native-4k")]
+    Native4k,
 }
 
 /// NVIDIA DLSS Super Resolution mode (intercepts the game's FidelityFX upscale).
@@ -907,10 +910,12 @@ impl Profile {
                 self.card_buffers_mb = 1536;
                 self.card_windows_mb = 1024;
             }
-            Preset::HighQuality => {
-                // Sharpest picture & textures: 1440p DLAA (native 1.0x render scale) + aggressive mip sharpening.
+            Preset::HighQuality | Preset::Native4k => {
+                // Sharpest picture & textures: DLAA (native 1.0x render scale) + aggressive mip sharpening.
+                // 4K Native is the same at 3840x2160: the engine grows the title's render target heaps
+                // and pool for a render size past the console's 2560x1440 (resolution.rs).
                 self.console = Console::SeriesX;
-                self.output_resolution = "2560x1440".into();
+                self.output_resolution = if preset == Preset::Native4k { "3840x2160" } else { "2560x1440" }.into();
                 self.dlss = DlssMode::Dlaa;
                 self.lod_bias = Some(-0.50);
                 self.texture_room_percent = 96;
@@ -985,6 +990,14 @@ mod tests {
         assert_eq!(val(&p, "VICTORY_OUTPUT").as_deref(), Some("2560x1440"));
         assert_eq!(val(&p, "VICTORY_FFX_SCALE").as_deref(), Some("1.0"));
         assert_eq!(val(&p, "VICTORY_TEXTURE_PARTIAL_FRAMES").as_deref(), Some("4"));
+
+        p.apply_preset(Preset::Native4k);
+        assert_eq!(val(&p, "VICTORY_OUTPUT").as_deref(), Some("3840x2160"));
+        assert_eq!(val(&p, "VICTORY_FFX_SCALE").as_deref(), Some("1.0"));
+        assert_eq!(val(&p, "VICTORY_UPSCALER").as_deref(), Some("7"));
+        assert_eq!(val(&p, "VICTORY_LOD_BIAS").as_deref(), Some("-0.50"));
+        assert_eq!(val(&p, "VICTORY_TEXTURE_ROOM_PERCENT").as_deref(), Some("96"));
+        assert_eq!(serde_json::to_string(&Preset::Native4k).unwrap(), "\"native-4k\"");
     }
 
     #[test]

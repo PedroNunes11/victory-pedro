@@ -44,6 +44,11 @@ window.STR = {
         desc: "1440p DLAA Native · Max texture detail",
         fps: "Sharpest image",
       },
+      "native-4k": {
+        title: "4K Native",
+        desc: "2160p DLAA Native · High Quality textures",
+        fps: "Heavy: about 3–6 fps on 12 GB",
+      },
     },
     start: "Play",
     stop: "Stop Game",

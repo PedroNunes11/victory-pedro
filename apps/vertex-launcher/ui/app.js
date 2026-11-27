@@ -461,7 +461,7 @@
       ),
     );
 
-    const modeKeys = ["performance", "balanced", "high-quality"];
+    const modeKeys = ["performance", "balanced", "high-quality", "native-4k"];
     const modeField = h(
       "div",
       { class: "field" },
@@ -595,7 +595,7 @@
     const G = S.graphics;
     const rb = restartBadge();
 
-    const modeOpts = ["performance", "balanced", "high-quality"].map((k) => ({
+    const modeOpts = ["performance", "balanced", "high-quality", "native-4k"].map((k) => ({
       value: k,
       title: S.home.modes[k].title,
       text: S.home.modes[k].desc + " · " + S.home.modes[k].fps,

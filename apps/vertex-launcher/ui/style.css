@@ -520,7 +520,7 @@ body.ingame-open .top { top: 48px; }
 }
 .btn.warn-btn:hover { background: rgba(251, 191, 36, 0.26); border-color: #fbbf24; }
 
-.mode-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.mode-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
 .mode-card {
   text-align: left; cursor: pointer;
   padding: 12px 13px; border-radius: 14px;

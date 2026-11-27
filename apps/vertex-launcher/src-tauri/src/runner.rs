@@ -56,16 +56,10 @@ pub struct Found {
 
 pub const ENGINE_EXES: [&str; 3] = ["vertex-axx.exe", "vertex.exe", "victory.exe"];
 
+/// The engine in `dir`: the first of [`ENGINE_EXES`] there, by that order alone. Not the newest
+/// file: a test build copied beside the engine (or a touched backup) must never take over a run.
 fn engine_in(dir: &Path) -> Option<PathBuf> {
-    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    ENGINE_EXES
-        .iter()
-        .map(|n| dir.join(n))
-        .filter(|p| p.is_file())
-        .fold(None, |best: Option<PathBuf>, p| match best {
-            Some(b) if modified(&b) >= modified(&p) => Some(b),
-            _ => Some(p),
-        })
+    ENGINE_EXES.iter().map(|n| dir.join(n)).find(|p| p.is_file())
 }
 
 pub fn find_victory(chosen: &str) -> Found {
