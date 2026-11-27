@@ -3224,15 +3224,28 @@ mod stale_tests {
     }
 }
 
-/// Copies of windows outside buffers let go since the start, and their
-/// bytes.
-static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Copies of windows outside buffers let go since the start: how many, the
+/// title memory they spanned (their logical length, a window in place
+/// included), and of that the bytes of host copies they owned
+/// ([`copy_bytes`]; none for a window in place, which is the title's own
+/// memory). Neither says resident memory fell at once: a copy goes through
+/// `retire`.
+static LET_GO: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// For the memory line: the windows let go since the start and their
-/// bytes, and of the bytes of the windows alive, how many lie between the
-/// lowest and the highest address ever asked for in each.
+/// The windows a sweep lets go, as `(logical length, owned copy bytes)`
+/// each: how many, the span, and the owned bytes, for [`LET_GO`].
+fn let_go_tally(gone: impl Iterator<Item = (u64, u64)>) -> [u64; 3] {
+    gone.fold([0; 3], |[n, span, owned], (len, copy)| {
+        [n + 1, span.saturating_add(len), owned.saturating_add(copy)]
+    })
+}
+
+/// For the memory line: the windows let go since the start, the title
+/// memory they spanned and the host-copy bytes they owned ([`LET_GO`]), and
+/// of the bytes of the windows alive, how many lie between the lowest and
+/// the highest address ever asked for in each.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn windows() -> [u64; 3] {
+pub(crate) fn windows() -> [u64; 4] {
     let asked: u64 = {
         let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         loose
@@ -3244,7 +3257,12 @@ pub(crate) fn windows() -> [u64; 3] {
             })
             .sum()
     };
-    [LET_GO[0].load(Ordering::Relaxed), LET_GO[1].load(Ordering::Relaxed), asked]
+    [
+        LET_GO[0].load(Ordering::Relaxed),
+        LET_GO[1].load(Ordering::Relaxed),
+        LET_GO[2].load(Ordering::Relaxed),
+        asked,
+    ]
 }
 
 /// For the memory line, of the windows alive: the bytes of their pages
@@ -3282,7 +3300,8 @@ pub(crate) fn window_use() -> [u64; 8] {
 
 /// Optional byte cap for loose title-window copies, in MiB. Unset or `0`
 /// keeps today's sweep. A positive value caps the copies only in the Watch
-/// and High RAM bands; Calm is unchanged.
+/// and High RAM bands; Calm is unchanged. The cap is on every loose copy's
+/// bytes, held or idle (#450); only idle ones can go to meet it.
 fn window_budget() -> Option<u64> {
     static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *MB.get_or_init(|| {
@@ -3294,28 +3313,43 @@ fn window_budget() -> Option<u64> {
     })
 }
 
-/// Oldest eligible copies to remove until their unique bytes fit `keep`.
-/// Entries are `(last-used moment, bytes, unique copy identity)`, already
-/// sorted oldest first; one copy standing under several keys counts once.
-fn window_victims(entries: &[(u64, u64, usize)], keep: u64) -> Vec<usize> {
-    let mut left = 0u64;
+/// The bytes of title memory a loose copy holds a copy of: none for one in
+/// place (`crate::inplace`), which is the title's own memory.
+fn copy_bytes(shadow: &Shadow) -> u64 {
+    if shadow.in_place() { 0 } else { shadow.len }
+}
+
+/// The unique bytes of every loose copy, eligible to go or not
+/// ([`copy_bytes`]); one copy standing under several keys counts once.
+fn loose_bytes<'a>(copies: impl Iterator<Item = &'a Arc<Shadow>>) -> u64 {
     let mut seen = std::collections::HashSet::new();
-    for &(_, bytes, id) in entries {
-        if seen.insert(id) {
-            left = left.saturating_add(bytes);
+    copies.filter(|s| seen.insert(Arc::as_ptr(s) as usize)).map(|s| copy_bytes(s)).sum()
+}
+
+/// The eligible copies that go, by index. Entries are `(bytes, unique copy
+/// identity, due)`, sorted oldest first. A `due` copy has been idle for as
+/// long as the sweep asks without a budget and goes whatever the budget: a
+/// budget never keeps more than none. The others go, oldest first, while
+/// `total` (the unique bytes of every loose copy, [`loose_bytes`]) is over
+/// `keep`. A copy standing under several keys goes under all of them and
+/// counts once.
+fn window_victims(entries: &[(u64, usize, bool)], total: u64, keep: u64) -> Vec<usize> {
+    let mut left = total;
+    let mut gone = std::collections::HashSet::new();
+    for &(bytes, id, due) in entries {
+        if due && gone.insert(id) {
+            left = left.saturating_sub(bytes);
         }
     }
-    let mut out = Vec::new();
-    for (i, &(_, bytes, id)) in entries.iter().enumerate() {
+    for &(bytes, id, _) in entries {
         if left <= keep {
             break;
         }
-        if seen.remove(&id) {
+        if bytes > 0 && gone.insert(id) {
             left = left.saturating_sub(bytes);
-            out.push(i);
         }
     }
-    out
+    (0..entries.len()).filter(|&i| gone.contains(&entries[i].1)).collect()
 }
 
 /// Kept between sweeps so one sample near a watermark does not toggle the
@@ -3342,7 +3376,10 @@ pub(crate) fn let_go_idle() {
     // Before the windows: their table may be empty while the pool is not.
     let_go_idle_snapshots();
     let budget = window_budget();
-    let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    // Without a budget (or in Calm) copies idle this long go; under a
+    // budget they still do, and others idle for less go to meet it.
+    let due_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let mut idle_ms = due_ms;
     let mut keep = u64::MAX;
     if let Some(bytes) = budget
         && let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample()
@@ -3368,7 +3405,7 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map
+        let mut eligible: Vec<(u64, (u64, u64), usize, u64, bool)> = map
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
@@ -3376,30 +3413,37 @@ pub(crate) fn let_go_idle() {
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(&key, s)| {
-                (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len)
+                let used = s.used.load(Ordering::Relaxed);
+                let due = crate::host::long_ago(used, due_ms, IDLE_FRAMES);
+                (used, key, Arc::as_ptr(s) as usize, copy_bytes(s), due)
             })
             .collect();
-        eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
+        eligible.sort_unstable_by_key(|&(used, ..)| used);
         let victims = if keep == u64::MAX {
             (0..eligible.len()).collect()
         } else {
-            let entries: Vec<(u64, u64, usize)> = eligible
+            let entries: Vec<(u64, usize, bool)> = eligible
                 .iter()
-                .map(|&(used, _, id, len)| (used, len, id))
+                .map(|&(_, _, id, bytes, due)| (bytes, id, due))
                 .collect();
-            window_victims(&entries, keep)
+            window_victims(&entries, loose_bytes(map.values()), keep)
         };
         victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
     };
     if !gone.is_empty() {
-        let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
+        let [went, span, owned] = let_go_tally(gone.iter().map(|s| (s.len, copy_bytes(s))));
+        for (counter, value) in LET_GO.iter().zip([went, span, owned]) {
+            counter.fetch_add(value, Ordering::Relaxed);
+        }
         crate::host::trail(|| {
-            format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
+            format!(
+                "sweep: {went} host copies of windows of title memory let go ({} KiB spanned, {} KiB of owned copies), held by no list and no slot",
+                span >> 10,
+                owned >> 10
+            )
         });
     }
     for shadow in gone {
-        LET_GO[0].fetch_add(1, Ordering::Relaxed);
-        LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         // Nothing runs now and nothing names it: freed at once unless a
         // submission is running after all.
         crate::host::retire(shadow);
@@ -6052,7 +6096,7 @@ pub(crate) fn exact_line(frames: f64) {
 mod window_tests {
     use super::{
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of, window_victims,
+        let_go_tally, tail_of, window_of, window_victims,
     };
 
     #[test]
@@ -6085,19 +6129,71 @@ mod window_tests {
         const M: u64 = 1 << 20;
         // Oldest first: 10, 20 and 30 MiB. Keeping 50 MiB must free only the
         // oldest copy (60 MiB left before, 50 MiB after).
-        let entries = [(1u64, 10 * M, 1usize), (2, 20 * M, 2), (3, 30 * M, 3)];
-        assert_eq!(window_victims(&entries, 50 * M), vec![0]);
+        let entries = [(10 * M, 1usize, false), (20 * M, 2, false), (30 * M, 3, false)];
+        assert_eq!(window_victims(&entries, 60 * M, 50 * M), vec![0]);
         // A tighter cap takes the newest as well.
-        assert_eq!(window_victims(&entries, 20 * M), vec![0, 1, 2]);
+        assert_eq!(window_victims(&entries, 60 * M, 20 * M), vec![0, 1, 2]);
     }
 
     #[test]
     fn window_budget_counts_one_copy_under_several_keys_once() {
         const M: u64 = 1 << 20;
         // The first two entries are one copy; 50 MiB is live, not 80.
-        // Without dedupe both would be picked to reach a 40 MiB cap.
-        let entries = [(1u64, 30 * M, 7usize), (2, 30 * M, 7), (3, 20 * M, 8)];
-        assert_eq!(window_victims(&entries, 40 * M), vec![0]);
+        // Without dedupe both copies would be picked to reach a 40 MiB cap.
+        // The copy goes under both its keys: under one alone it would stay.
+        let entries = [(30 * M, 7usize, false), (30 * M, 7, false), (20 * M, 8, false)];
+        assert_eq!(window_victims(&entries, 50 * M, 40 * M), vec![0, 1]);
+    }
+
+    /// #450 (the issue's row): copies held by a list or a slot, or used
+    /// lately, count against the budget too. 3,072 MiB held and 1,536 MiB
+    /// idle against 2,048 MiB: every idle copy goes, the held ones stay.
+    /// Counting the idle ones alone (1,536 under 2,048) let none go.
+    #[test]
+    fn window_budget_counts_the_copies_that_cannot_go() {
+        const M: u64 = 1 << 20;
+        let held = 3_072 * M;
+        let idle = [(512 * M, 1usize, false), (512 * M, 2, false), (512 * M, 3, false)];
+        let total = held + idle.iter().map(|e| e.0).sum::<u64>();
+        assert_eq!(total, 4_608 * M);
+        assert_eq!(window_victims(&idle, total, 2_048 * M), vec![0, 1, 2]);
+        // Only as many as it takes: with 4,096 MiB kept, the oldest one.
+        assert_eq!(window_victims(&idle, total, 4_096 * M), vec![0]);
+        // Under the budget, nothing that is not due goes.
+        assert!(window_victims(&idle, total, 8_192 * M).is_empty());
+    }
+
+    /// #450: a budget never keeps more copies than none. Those idle for the
+    /// time the sweep asks without one go even when everything fits.
+    #[test]
+    fn window_budget_never_keeps_what_the_sweep_lets_go_without_one() {
+        const M: u64 = 1 << 20;
+        let entries = [(100 * M, 1usize, true), (100 * M, 2, false), (100 * M, 3, true)];
+        assert_eq!(window_victims(&entries, 300 * M, 2_048 * M), vec![0, 2]);
+        // Over the budget, the others go too, oldest first.
+        assert_eq!(window_victims(&entries, 300 * M, 50 * M), vec![0, 1, 2]);
+    }
+
+    /// The sweep's tally keeps the window span and the owned copy bytes
+    /// apart: a window in place spans title memory but owns no copy.
+    #[test]
+    fn let_go_tally_keeps_span_and_owned_copy_bytes_apart() {
+        const M: u64 = 1 << 20;
+        // akimfomin's two-window case (#466): a 4 MiB window in place (no
+        // bytes of its own) and an 8 MiB allocated copy. The span is 12 MiB,
+        // the owned copies 8 MiB.
+        let gone = [(4 * M, 0), (8 * M, 8 * M)];
+        assert_eq!(let_go_tally(gone.into_iter()), [2, 12 * M, 8 * M]);
+        assert_eq!(let_go_tally(std::iter::empty()), [0, 0, 0]);
+    }
+
+    /// In place a copy holds no bytes of its own: it neither counts against
+    /// the budget nor goes to meet it (it still goes once due).
+    #[test]
+    fn window_budget_passes_over_copies_in_place() {
+        const M: u64 = 1 << 20;
+        let entries = [(0, 1usize, false), (64 * M, 2, false), (0, 3, true)];
+        assert_eq!(window_victims(&entries, 64 * M, 0), vec![1, 2]);
     }
 
     #[test]

@@ -898,14 +898,15 @@ fn log_memory() {
         mb(targets[9]),
     );
     tracing::info!(
-        "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
-         {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
-         asked for in each",
+        "memory let go since the start: {} windows outside buffers {:.0} MB spanned ({:.0} MB of \
+         owned host copies; a window in place owns none), {} staging buffers {:.0} MB; of the \
+         windows alive, {:.0} MB lie between the lowest and highest address asked for in each",
         windows[0],
         mb(windows[1]),
+        mb(windows[2]),
         stagings[0],
         mb(stagings[1]),
-        mb(windows[2]),
+        mb(windows[3]),
     );
     tracing::info!(
         "memory: {:.0} MB private ({:.0} MB of it in memory; the PC has {:.0} MB free and {:.0} MB \
