@@ -189,19 +189,26 @@ pub fn start(base: usize) {
     // our own breakpoints while they are armed.
     unsafe { AddVectoredExceptionHandler(1, Some(trap)) };
     let spawned = std::thread::Builder::new().name("input watch".into()).spawn(move || {
-        // Wait for the title to make its pads.
+        // Wait for the title to make its pads (and, for the buffer, to subscribe it to the first pad).
+        let buffer = std::env::var("VICTORY_INPUT_WATCH_TARGET").is_ok_and(|v| v == "buffer");
         let slot = (base + PAD_SLOT) as *const usize;
         let pad = loop {
-            // SAFETY: a pointer-sized global of the mapped image.
+            // SAFETY: a pointer-sized global of the mapped image, and the pad's subscriber list head.
             let pad = unsafe { std::ptr::read_volatile(slot) };
-            if pad != 0 {
+            if pad != 0 && (!buffer || unsafe { std::ptr::read_volatile((pad + 8) as *const usize) } != 0) {
                 break pad;
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
         };
-        let addresses: Vec<(usize, u64)> = FIELDS.iter().map(|&(off, len, _)| (pad + off, len)).collect();
-        let names: Vec<&str> = FIELDS.iter().map(|f| f.2).collect();
-        tracing::info!(target: "input_watch", pad = format_args!("{pad:#x}"), secs, "watching the first pad's fields");
+        let (addresses, names): (Vec<(usize, u64)>, Vec<&str>) = if buffer {
+            // The title's event buffer (the pad's subscriber): its event list and its count.
+            // SAFETY: the subscriber node's object, a pointer-sized word.
+            let object = unsafe { std::ptr::read_volatile(std::ptr::read_volatile((pad + 8) as *const usize) as *const usize) };
+            (vec![(object + 0x26b0, 8), (object + 0x26b8, 4)], vec!["event list", "event count", "", ""])
+        } else {
+            (FIELDS.iter().map(|&(off, len, _)| (pad + off, len)).collect(), FIELDS.iter().map(|f| f.2).collect())
+        };
+        tracing::info!(target: "input_watch", pad = format_args!("{pad:#x}"), first = format_args!("{:#x}", addresses[0].0), buffer, secs, "watching");
         ARMED.store(true, Ordering::Relaxed);
         let mut done = Vec::new();
         let started = std::time::Instant::now();
