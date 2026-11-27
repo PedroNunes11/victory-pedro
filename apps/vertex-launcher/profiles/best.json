@@ -1,0 +1,82 @@
+{
+  "updated": "2026-11-27",
+  "about": "Measured Vertex-AXX profiles (AnyXboxX + Vertex + Victory-NVIDIA). Modes set real VICTORY_OUTPUT, DLSS SR, LOD bias, honest title memory reporting, wide copies, 64-shard journal, and SUBMIT_FRAMES=2.",
+  "entries": [
+    {
+      "id": "rtx5070-12gb-9950x3d",
+      "pc": "RTX 5070 12 GB, Ryzen 9 9950X3D, 32 GB RAM (1440p)",
+      "match": {
+        "gpu": "RTX 5070",
+        "vram_gb": 12,
+        "ram_gb": 32,
+        "cpu": "9950X3D"
+      },
+      "console": "series-x",
+      "work": "balanced",
+      "preset": "balanced",
+      "env": {
+        "VICTORY_OUTPUT": "2560x1440",
+        "VICTORY_TEXTURE_ROOM_PERCENT": "95",
+        "VICTORY_TEXTURE_POOL_SPARES": "8",
+        "VICTORY_TEXTURE_PARTIAL_FRAMES": "6",
+        "VICTORY_TITLE_USED_MB": "title",
+        "VICTORY_WIDE_COPY": "1",
+        "VICTORY_PORT_JOURNAL": "1",
+        "VICTORY_SUBMIT_FRAMES": "2"
+      },
+      "cache_dir": "D:\\dev\\Vertex-AXX\\cache",
+      "data_dir": "D:\\dev\\Vertex-AXX\\data",
+      "lossless": {
+        "multiplier": 2,
+        "flow_scale": 75,
+        "max_frame_latency": 1,
+        "auto_scale": true,
+        "auto_scale_delay": 10,
+        "draw_fps": true
+      },
+      "measured": {
+        "run": 47,
+        "fps_median": 22.0,
+        "pc": "RTX 5070 12 GB, Ryzen 9 9950X3D, 32 GB RAM",
+        "note": "Vertex-AXX 1440p DLSS Quality + streaming & submission upgrades (25-30 fps in Performance 1080p)"
+      }
+    },
+    {
+      "id": "rtx5070-12gb-generic",
+      "pc": "12 GB NVIDIA GPU, 32 GB RAM",
+      "match": {
+        "vram_gb": 12,
+        "ram_gb": 32
+      },
+      "console": "series-x",
+      "work": "balanced",
+      "preset": "balanced",
+      "env": {
+        "VICTORY_OUTPUT": "2560x1440",
+        "VICTORY_TEXTURE_ROOM_PERCENT": "95",
+        "VICTORY_TEXTURE_POOL_SPARES": "8",
+        "VICTORY_TEXTURE_PARTIAL_FRAMES": "6",
+        "VICTORY_TITLE_USED_MB": "title",
+        "VICTORY_WIDE_COPY": "1",
+        "VICTORY_PORT_JOURNAL": "1",
+        "VICTORY_SUBMIT_FRAMES": "2"
+      },
+      "cache_dir": "D:\\dev\\Vertex-AXX\\cache",
+      "data_dir": "D:\\dev\\Vertex-AXX\\data",
+      "lossless": {
+        "multiplier": 2,
+        "flow_scale": 75,
+        "max_frame_latency": 1,
+        "auto_scale": true,
+        "auto_scale_delay": 10,
+        "draw_fps": true
+      },
+      "measured": {
+        "run": 47,
+        "fps_median": 22.0,
+        "pc": "12 GB NVIDIA GPU, 32 GB RAM",
+        "note": "Vertex-AXX Balanced 1440p DLSS Quality"
+      }
+    }
+  ]
+}

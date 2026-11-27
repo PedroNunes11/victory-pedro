@@ -1,0 +1,15 @@
+{
+  "name": "vertex-launcher",
+  "private": true,
+  "version": "0.1.0",
+  "license": "GPL-3.0-or-later",
+  "description": "Vertex launcher window (Tauri 2, plain HTML/CSS/JS front end).",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build --no-bundle"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

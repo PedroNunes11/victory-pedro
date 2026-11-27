@@ -1,0 +1,11 @@
+# Downloaded and built: never committed.
+node_modules/
+src-tauri/target/
+# Made by the build: the icon (src-tauri/build.rs draws it) and Tauri's
+# generated schemas.
+src-tauri/icons/
+src-tauri/gen/
+dist/
+# Copied by the build from the launcher assets folder (src-tauri/build.rs):
+# the owner's art and sound, kept out of the text-only repository.
+ui/assets/

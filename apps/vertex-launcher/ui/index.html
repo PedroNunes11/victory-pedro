@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vertex</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="bg" aria-hidden="true">
+    <div class="bg-img"></div>
+    <div class="bg-glow"></div>
+    <div class="bg-shade"></div>
+  </div>
+
+  <div class="ingame-bar hidden" id="ingame-bar">
+    <div class="ingame-bar-left">
+      <span class="badge live-pill">IN-GAME MENU</span>
+      <span class="ingame-fps" id="ingame-fps"></span>
+      <span class="ingame-hint" id="ingame-hint"></span>
+    </div>
+    <div class="ingame-bar-right">
+      <button class="btn warn-btn small hidden" id="ingame-restart-btn" type="button"></button>
+      <button class="btn primary small" id="resume-game-btn" type="button"></button>
+    </div>
+  </div>
+
+  <header class="top" id="top-bar">
+    <div class="brand">
+      <img class="brand-logo" src="assets/logo-v-256.png" alt="">
+      <div>
+        <div class="brand-name" id="brand-name"></div>
+        <div class="brand-tag" id="brand-tag"></div>
+      </div>
+    </div>
+    <div class="top-right">
+      <div class="audio">
+        <button class="icon-btn round" id="mute" type="button"></button>
+        <input id="volume" type="range" min="0" max="100" step="1">
+      </div>
+      <button class="btn glass" id="open-controls" type="button" data-sfx="page"></button>
+      <button class="btn glass" id="open-settings" type="button" data-sfx="page"></button>
+    </div>
+  </header>
+
+  <main class="home" id="home"></main>
+
+  <section class="settings hidden" id="settings" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <aside class="set-side">
+      <button class="btn ghost back" id="close-settings" type="button" data-sfx="page"></button>
+      <h2 class="set-title" id="settings-title"></h2>
+      <nav id="nav"></nav>
+      <div class="set-foot" id="set-foot"></div>
+    </aside>
+    <div class="set-main" id="set-main"></div>
+  </section>
+
+  <div class="modal hidden" id="modal"></div>
+  <div class="tooltip hidden" id="tooltip" role="tooltip"></div>
+  <div class="toast hidden" id="toast"></div>
+  <script src="strings.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
