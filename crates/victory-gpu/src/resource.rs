@@ -1782,11 +1782,36 @@ pub(crate) fn targets_room_kept() -> u64 {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or_else(|| targets_room_default(output_size()), |mb| mb.min(8192) << 20)
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
     most.saturating_sub(targets)
+}
+
+/// The room kept for render targets when `VICTORY_CARD_ROOM_FOR_TARGETS_MB`
+/// is unset: 3,072 MB was measured at a 3840x2160 output (2.3 GB of targets
+/// at the first world frame, 2.8-3.1 GB two minutes on), and the targets
+/// scale with the output's pixels. At 2560x1440 the session's targets held
+/// 1,887 MB while 3,072 stayed kept: about 1.2 GB of the card the textures
+/// could not have, with 2.1 GB of the budget free and 2,800 texture passes
+/// refused (RTX 5070, Series X). A smaller output keeps its share of the
+/// 3,072, a quarter of it at least.
+fn targets_room_default(output: Option<(u64, u64)>) -> u64 {
+    const AT_4K: u64 = 3072 << 20;
+    match output {
+        Some((w, h)) if w > 0 && h > 0 && w * h < 3840 * 2160 => {
+            (AT_4K / (3840 * 2160) * (w * h)).max(AT_4K / 4)
+        }
+        _ => AT_4K,
+    }
+}
+
+/// The output size the title was set to (`VICTORY_OUTPUT=<w>x<h>`), if any.
+fn output_size() -> Option<(u64, u64)> {
+    let spec = std::env::var("VICTORY_OUTPUT").ok()?;
+    let (w, h) = spec.trim().split_once(['x', 'X'])?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -4725,5 +4750,23 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod targets_room_tests {
+    use super::targets_room_default;
+
+    #[test]
+    fn the_room_kept_for_targets_follows_the_output() {
+        const MB: u64 = 1 << 20;
+        assert_eq!(targets_room_default(None), 3072 * MB);
+        assert_eq!(targets_room_default(Some((3840, 2160))), 3072 * MB);
+        // 2560x1440 is 4/9 of 4K's pixels.
+        let qhd = targets_room_default(Some((2560, 1440)));
+        assert!((1360 * MB..=1366 * MB).contains(&qhd), "{}", qhd / MB);
+        // Never under a quarter.
+        assert_eq!(targets_room_default(Some((1280, 720))), 768 * MB);
+        assert_eq!(targets_room_default(Some((0, 0))), 3072 * MB);
     }
 }
