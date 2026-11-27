@@ -4,6 +4,8 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
+//! `VICTORY_SETTLE_ROOM=1|alt` gives flights more room before a wait (off by
+//! default, see [`settle_room`]).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -2826,9 +2828,10 @@ mod relay_tests {
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    let base = *MOST.get_or_init(|| {
         std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    });
+    settle_room::list_limit(base, settle_room::on())
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3321,7 +3324,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // copy of its own there. With [`card_steps`] the pages of the
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
-        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        let mut runs_left = settle_room::merge_budget(card_steps::stage() > 0, settle_room::on());
         UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
@@ -4055,6 +4058,7 @@ mod place;
 pub(crate) mod rec;
 mod scratch_release;
 mod send;
+mod settle_room;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
@@ -5635,6 +5639,8 @@ impl Host {
         };
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
+        // Keep the same limit if an `alt` phase ends while this flight is waiting.
+        let limit = late_most();
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
@@ -5658,7 +5664,7 @@ impl Host {
                 texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
-            *flying >= late_most()
+            *flying >= limit
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         RELAY_MOVED.notify_one();
@@ -5668,7 +5674,7 @@ impl Host {
             self.settle(&mut submitted, WHY_READ);
         } else if most && relay_exact() {
             // Until there are fewer, not until there are none.
-            relay_wait(WHY_MOST, |line| line.lists < late_most());
+            relay_wait(WHY_MOST, |line| line.lists < limit);
         } else if most {
             self.settle(&mut submitted, WHY_MOST);
         } else {
@@ -11292,6 +11298,57 @@ mod refresh_tests {
                 unsafe { std::ptr::copy_nonoverlapping((self.data + a) as *const u8, card.2[a..b].as_mut_ptr(), b - a) };
             }
         }
+    }
+
+    #[test]
+    fn settle_room_merges_without_waiting_and_preserves_flight_bytes() {
+        let _one = crate::watch::one_asking_test();
+        // Five 64 KiB blocks, each with 128 separate changes too long for
+        // a word scatter. The flight also writes in the gaps between them.
+        const LEN: usize = 5 * PAGE;
+        const STRIDE: usize = 512;
+        let mut expected = vec![0u8; LEN];
+        for chunk in expected.chunks_exact_mut(STRIDE) {
+            chunk[..320].fill(0x35);
+            chunk[STRIDE - 4..].fill(0x72);
+        }
+        let run = |extra| {
+            let at = title(LEN, false);
+            let copy = Carded::new(at, LEN, 0);
+            copy.shadow.update(at, LEN);
+            copy.send();
+            copy.shadow.writing(at, LEN);
+            let (fence, fetched) = {
+                let mut card = copy.card.lock().unwrap();
+                for (i, chunk) in card.2.chunks_exact_mut(STRIDE).enumerate() {
+                    chunk[STRIDE - 4..].fill(0x72);
+                    // SAFETY: inside the test's private title allocation.
+                    unsafe { std::ptr::write_bytes((at + i * STRIDE) as *mut u8, 0x35, 320) };
+                }
+                (card.0, card.2.clone())
+            };
+            let mut budget = super::settle_room::merge_budget(false, extra);
+            let wait = copy.shadow.merge_under_writes(at, LEN, &mut budget);
+            assert_eq!(wait, !extra, "640 changed runs");
+            if !wait {
+                copy.send();
+            }
+            copy.shadow.card_merge_relay(0, &fetched, fence, &mut Vec::new());
+            copy.shadow.copy_back_done(&[(at, at + LEN)]);
+            if wait {
+                copy.shadow.update(at, LEN);
+                copy.send();
+            }
+            // SAFETY: the CPU is finished writing both private allocations.
+            for address in [at, copy.data] {
+                let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, LEN) };
+                assert!(bytes == expected, "title or upload bytes, extra room {extra}");
+            }
+            copy.card.into_inner().unwrap().2
+        };
+        let normal = run(false);
+        assert!(normal == expected);
+        assert!(run(true) == normal);
     }
 
     /// Everything at once: the title writes its memory on two threads, the
