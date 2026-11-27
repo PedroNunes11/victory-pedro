@@ -9697,6 +9697,12 @@ impl Meter {
                             / crate::resource::SWEPT_US[0].load(Ordering::Relaxed).max(1) as f64,
                         crate::resource::SWEPT_US[2].load(Ordering::Relaxed) as f64 / 1e3
                     );
+                    if let Some(cap) = crate::tiles::max_size() {
+                        tracing::info!(
+                            "texture size cap {cap} (VICTORY_TEXTURE_MAX_SIZE): lifted from {} textures the card copies into or out of",
+                            crate::resource::CAP_LIFTED.load(Ordering::Relaxed)
+                        );
+                    }
                 }
                 {
                     let mode = crate::watch::page_writes();

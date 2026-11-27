@@ -1183,6 +1183,13 @@ pub(crate) struct HostTexture {
     /// Made in place of one with fewer levels: the slots that show that one
     /// are made again once this one was filled whole.
     pub(crate) grown: std::sync::atomic::AtomicBool,
+    /// Taken out of its texture's host side for a copy with other levels
+    /// ([`want_level`], [`keep_whole`]), said before the texture's staging
+    /// buffer is let go: a staging buffer made for this copy after that (by
+    /// a thread that took it before) is not kept as the texture's
+    /// (`crate::texture` `staging`), so the first level a read finds staged
+    /// ([`staged_first`]) is never this copy's.
+    pub(crate) replaced: std::sync::atomic::AtomicBool,
     /// What the last submitted upload put in it.
     pub(crate) holds: std::sync::Arc<Holds>,
     /// Who makes its first upload (`crate::texture::ahead`).
@@ -1250,6 +1257,12 @@ struct Hosted {
     /// its memory: 1 + the change count of its memory's bucket
     /// ([`TARGET_CHANGES`]) when it was found; 0 while none is kept.
     no_target: std::sync::atomic::AtomicU32,
+    /// The host copy is made with every level whatever the size cap says
+    /// ([`keep_whole`]): the card copies into or out of it.
+    whole: std::sync::atomic::AtomicBool,
+    /// The host copy begins at a later level than its views ask for, because
+    /// of the size cap ([`cap_base`]).
+    capped: std::sync::atomic::AtomicBool,
 }
 
 /// Whether a texture the title places in memory is read, kept and uploaded
@@ -1405,11 +1418,13 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    if host.base == 0 || host.base <= base_level(&r.desc, first).max(cap_base(r)) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
-    // Under the lock, as in `let_go_idle`.
+    // Under the lock, as in `let_go_idle`; said of the copy first (see
+    // [`HostTexture::replaced`]).
+    host.replaced.store(true, Relaxed);
     crate::texture::unstage(this);
     r.host.grown.store(true, Relaxed);
     HELD[2].fetch_add(1, Relaxed);
@@ -1417,6 +1432,60 @@ pub(crate) fn want_level(this: This, first: u32) {
         REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
     }
 }
+
+/// The level the host copy of placed texture `r` begins at, at the least,
+/// for the size cap (`crate::tiles::max_size`): the first level within it
+/// that the host can have as a texture's level 0 ([`base_level`]). 0 without
+/// a cap, for a texture within it, and for one the card copies into or out
+/// of ([`keep_whole`]).
+#[cfg(windows)]
+fn cap_base(r: &Resource) -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(cap) = crate::tiles::max_size() else {
+        return 0;
+    };
+    if r.host.whole.load(Relaxed) || r.desc.mip_levels <= 1 {
+        return 0;
+    }
+    let first = crate::tiles::first_within(r.desc.width, u64::from(r.desc.height), u32::from(r.desc.mip_levels), cap);
+    if first == 0 { 0 } else { base_level(&r.desc, first) }
+}
+
+/// Copies and resolves name a texture's levels by number, and the host copy
+/// of a capped texture has fewer ([`cap_base`]): before the card copies into
+/// or out of texture `this`, it is made to keep every level from then on.
+/// A host copy the cap cut is replaced by a whole one, made and filled at
+/// this use (as [`want_level`] does for a view of a larger level). Nothing
+/// without a cap, for a texture the title does not fill, or once done.
+#[cfg(windows)]
+pub(crate) fn keep_whole(this: This) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() || crate::tiles::max_size().is_none() {
+        return;
+    }
+    let r = resource(this);
+    if !fills(&r.desc) || r.host.whole.swap(true, Relaxed) {
+        return;
+    }
+    CAP_LIFTED.fetch_add(1, Relaxed);
+    let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    let capped = r.host.capped.swap(false, Relaxed);
+    let Some((host, _)) = made.as_ref().filter(|_| capped) else {
+        return;
+    };
+    // See [`HostTexture::replaced`].
+    host.replaced.store(true, Relaxed);
+    crate::texture::unstage(this);
+    r.host.grown.store(true, Relaxed);
+    if let Some(old) = made.take() {
+        REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
+    }
+}
+
+/// Textures the size cap was lifted from because the card copies into or
+/// out of them ([`keep_whole`]), since the start.
+#[cfg(windows)]
+pub(crate) static CAP_LIFTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Counts for the memory line: host copies of textures the title fills
 /// alive and their bytes; such copies let go as idle since the start and
@@ -1676,9 +1745,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             // What the upload can read: a console layout, no XOR mode
             // (`crate::texture` `staging`).
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+            // (Or one whose level 0 is over the size cap, `VICTORY_TEXTURE_MAX_SIZE`: its
+            // levels over the cap are never held, so it never holds them all.)
             let partly = readable
                 && bytes >= crate::tiles::floor()
-                && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
+                && ((crate::tiles::over_cap(r.desc.width, u64::from(r.desc.height))
+                    && !r.host.whole.load(Relaxed))
+                    || !crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
             let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
@@ -1704,14 +1777,20 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             if first != u32::MAX {
                 base = base_level(&r.desc, first);
             }
+            // The size cap: the copy begins no earlier than the first level
+            // within it (and the store's larger levels are not wanted).
+            let capped = cap_base(r);
             // The store has its larger levels: made whole at once.
             if base > 0
+                && capped == 0
                 && tiled.is_none()
                 && let Some(found) = stored_levels(r, first)
             {
                 base = 0;
                 prefill = Some(found);
             }
+            r.host.capped.store(capped > base, Relaxed);
+            base = base.max(capped);
         }
         let texture = match texture {
             Some(texture) => Some(texture),
@@ -2487,6 +2566,7 @@ impl HostTexture {
             base: 0,
             serial: SERIAL.fetch_add(1, Relaxed) + 1,
             grown: Default::default(),
+            replaced: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             prefill: Default::default(),
@@ -2514,6 +2594,7 @@ impl HostTexture {
             base: 0,
             serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             grown: Default::default(),
+            replaced: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             prefill: Default::default(),
@@ -2898,6 +2979,8 @@ fn hand_out_resource(
             host_written: std::sync::atomic::AtomicBool::new(false),
             staged_first: std::sync::atomic::AtomicU32::new(u32::MAX),
             no_target: std::sync::atomic::AtomicU32::new(0),
+            whole: std::sync::atomic::AtomicBool::new(false),
+            capped: std::sync::atomic::AtomicBool::new(false),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -4927,6 +5010,248 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// A BC7 texture of `side` x `side` texels and a whole chain of levels
+    /// as the title places it (the description as words; console layout as
+    /// in [`a_placed_texture_is_kept_from_the_level_viewed`]).
+    #[cfg(windows)]
+    fn placed_bc7(side: u32) -> [u32; 14] {
+        let levels = 32 - side.leading_zeros();
+        [3, 0, 0, 0, side, 0, side, levels << 16 | 1, 98, 1, 0, 0x105, 0, 0]
+    }
+
+    /// The size cap: a 4096 texture's host copy begins at its 1024 level
+    /// (the title's description stays 4096 with 13 levels), a view of level
+    /// 0 does not bring the larger levels back, a 1024 texture is left whole,
+    /// and a copy by the card lifts the cap from the texture for good.
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_over_the_size_cap_keeps_the_levels_within_it() {
+        use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() || !held_only() {
+            return;
+        }
+        crate::tiles::TEST_MAX_SIZE.with(|cap| cap.set(Some(1024)));
+        let big = placed_bc7(4096);
+        let small = placed_bc7(1024);
+        let whole = placed_bytes(&big).unwrap();
+        // SAFETY: address space of our own that stays (the copies are not
+        // filled here, so nothing reads it).
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole as usize * 2, MEM_RESERVE, PAGE_READWRITE) } as u64;
+        assert_ne!(at, 0);
+        let texture = texture_at(at, &big).unwrap();
+        let copy = host_copy(texture).unwrap();
+        // SAFETY: a live texture.
+        let d = unsafe { copy.texture.GetDesc() };
+        assert_eq!((copy.base, d.Width, d.Height, d.MipLevels), (2, 1024, 1024, 11));
+        assert!(copy.bytes * 12 < whole, "{} of {whole} bytes on the card", copy.bytes);
+        assert_eq!(resource(texture).desc.width, 4096, "the title's texture is as it described it");
+        want_level(texture, 0);
+        assert_eq!(host_copy(texture).unwrap().serial, copy.serial, "a view of level 0 keeps the capped copy");
+        // Within the cap: whole.
+        let other = texture_at(at + whole.next_multiple_of(1 << 16), &small).unwrap();
+        // SAFETY: as above.
+        let d = unsafe { host_copy(other).unwrap().texture.GetDesc() };
+        assert_eq!((d.Width, d.MipLevels), (1024, 11));
+        // The card copies into it: every level from then on.
+        keep_whole(texture);
+        let lifted = host_copy(texture).unwrap();
+        // SAFETY: as above.
+        let d = unsafe { lifted.texture.GetDesc() };
+        assert_eq!((lifted.base, d.Width, d.MipLevels), (0, 4096, 13));
+        assert!(lifted.serial != copy.serial && lifted.grown.load(std::sync::atomic::Ordering::Relaxed));
+        crate::tiles::TEST_MAX_SIZE.with(|cap| cap.set(None));
+    }
+
+    /// Moves the last use of every texture of `areas` that has one back
+    /// past the sweep's times (10 s and 4 frames).
+    #[cfg(windows)]
+    fn age(areas: &[Vec<This>]) {
+        use std::sync::atomic::Ordering::Relaxed;
+        for _ in 0..5 {
+            crate::frame::test_advance();
+        }
+        let now = crate::host::moment();
+        let back = ((now >> 32).saturating_sub(4) << 32 | (now & 0xffff_ffff).saturating_sub(100)).max(1);
+        for &t in areas.iter().flatten() {
+            let r = resource(t);
+            if r.host.used.load(Relaxed) != 0 {
+                r.host.used.store(back, Relaxed);
+            }
+        }
+    }
+
+    /// Synthetic VRAM churn under the launcher's 8 GB preset. Run it once
+    /// with `VICTORY_TEXTURE_MAX_SIZE=1024` and once without, each in its
+    /// own process, with `VICTORY_TEXTURE_ROOM_PERCENT=85` and
+    /// `VICTORY_BURY_LAG=0` (what is let go is dropped at once in a process
+    /// that submits nothing):
+    /// `cargo test -p victory-gpu --lib --release -- --ignored --exact resource::tests::vram_churn --nocapture`.
+    ///
+    /// Each cycle the title streams in an area of textures shaped like a
+    /// world's (4 at 4096, 16 at 2048 and 48 at 1024 texels, BC7 with whole
+    /// chains, at new addresses), uses the last `VRAM_CHURN_ACTIVE` areas
+    /// (20) and none of the older ones, which stay alive and go idle; it
+    /// makes four 1920x1080 RGBA16F render targets and releases the previous
+    /// cycle's. The sweep (`let_go_idle`) runs once a cycle with the older
+    /// areas idle past its times. Per cycle: the process's use of the card
+    /// and its budget (DXGI `QueryVideoMemoryInfo`), the bytes of host
+    /// textures, how many copies were let go and made again. At the end the
+    /// targets go and every copy is let go, and what is still in use is
+    /// compared with the start: memory not given back fails the test.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "VRAM bench: about three minutes, and it fills the card's budget"]
+    fn vram_churn() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const MB: u64 = 1 << 20;
+        let env = |name: &str, default: u64| {
+            std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+        };
+        let cycles = env("VRAM_CHURN_CYCLES", 60);
+        let active = env("VRAM_CHURN_ACTIVE", 20) as usize;
+        // A cycle's length: the texture pool uses a piece given back only
+        // 2.5 s later (`crate::pool` `REST`).
+        let pace = std::time::Duration::from_millis(env("VRAM_CHURN_MS", 3000));
+        let Some(host) = crate::host::host() else { return };
+        let Some([budget, start, ..]) = host.video_memory() else { return };
+        eprintln!(
+            "cap {:?}, room {} %, budget {} MB, in use at the start {} MB, {cycles} cycles, {active} areas in use",
+            crate::tiles::max_size(),
+            room_percent(),
+            budget / MB,
+            start / MB
+        );
+        // An idle texture is one last used at least 5 s and 4 frames ago.
+        std::thread::sleep(std::time::Duration::from_millis(11_000));
+        let shapes = [(4096u32, 4usize), (2048, 16), (1024, 48)];
+        let stride = |side: u32| placed_bytes(&placed_bc7(side)).unwrap().next_multiple_of(1 << 16);
+        let area_bytes: u64 = shapes.iter().map(|&(side, n)| stride(side) * n as u64).sum();
+        let mut areas: Vec<Vec<This>> = Vec::new();
+        let mut targets: Vec<This> = Vec::new();
+        let target = ResourceDesc { flags: 1, ..texture(1920, 1080, 10, 1) };
+        let (mut peak, mut peak_host, mut over) = (0u64, 0u64, 0u64);
+        let mut steady = Vec::new();
+        let mut slowest = 0;
+        for cycle in 0..cycles {
+            // A new area at new addresses (address space only: the copies
+            // are not filled here).
+            // SAFETY: address space of our own that stays.
+            let at = unsafe { VirtualAlloc(std::ptr::null(), area_bytes as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
+            assert_ne!(at, 0);
+            let mut next = at;
+            let mut area = Vec::new();
+            for &(side, n) in &shapes {
+                for _ in 0..n {
+                    area.push(texture_at(next, &placed_bc7(side)).unwrap());
+                    next += stride(side);
+                }
+            }
+            areas.push(area);
+            // Render targets: four new ones, the previous four released.
+            let old = std::mem::take(&mut targets);
+            for _ in 0..4 {
+                let mut out = std::ptr::null();
+                let made = create_committed(
+                    std::ptr::null(),
+                    &PROPERTIES,
+                    0,
+                    &target,
+                    4,
+                    std::ptr::null(),
+                    &RESOURCE_IIDS[0],
+                    &mut out,
+                );
+                assert_eq!(made, S_OK);
+                assert!(host_resource(out).is_some());
+                targets.push(out);
+            }
+            for t in old {
+                slot::<Release>(t, 0x10)(t);
+            }
+            let first_active = areas.len().saturating_sub(active);
+            // The areas in use: their host copies made (again) and used.
+            let making = std::time::Instant::now();
+            for &t in areas[first_active..].iter().flatten() {
+                assert!(host_copy(t).is_some());
+            }
+            let made_ms = making.elapsed().as_millis();
+            slowest = slowest.max(made_ms);
+            std::thread::sleep(pace);
+            // Used again, as every frame does, and the older areas idle;
+            // then what the host's sweep does once a second (`host.rs`
+            // `sweep`).
+            age(&areas[..first_active]);
+            for &t in areas[first_active..].iter().flatten() {
+                assert!(host_copy(t).is_some());
+            }
+            let_go_idle();
+            crate::pool::room(host.video_memory());
+            let [b, used, ..] = host.video_memory().unwrap();
+            let held = HOST_TEXTURES[1].load(Relaxed);
+            peak = peak.max(used);
+            peak_host = peak_host.max(held);
+            over += u64::from(used > b);
+            if cycle >= cycles / 2 {
+                steady.push(used);
+            }
+            eprintln!(
+                "cycle {cycle:3}: in use {:5} MB of {:5} MB ({:3} %), host textures {:5} MB, free in texture blocks {:5} MB, let go {:6} ({:6} MB), made again {:6}, making {made_ms} ms",
+                used / MB,
+                b / MB,
+                used * 100 / b.max(1),
+                held / MB,
+                crate::pool::texture_room() / MB,
+                KINDS[2].load(Relaxed),
+                KINDS[3].load(Relaxed) / MB,
+                KINDS[4].load(Relaxed)
+            );
+        }
+        // The end: targets released, every copy let go.
+        for t in std::mem::take(&mut targets) {
+            slot::<Release>(t, 0x10)(t);
+        }
+        for &t in areas.iter().flatten() {
+            let made = resource(t).host.made.lock().unwrap().take();
+            if let Some((copy, _)) = made {
+                crate::texture::unstage(t);
+                crate::host::retire(copy);
+            }
+        }
+        // The pool's rest, then its once-a-second look.
+        std::thread::sleep(pace);
+        crate::pool::room(host.video_memory());
+        let [_, end, ..] = host.video_memory().unwrap();
+        let spare = crate::pool::texture_room();
+        let (low, high) = steady.iter().fold((u64::MAX, 0), |(l, h), &u| (l.min(u), h.max(u)));
+        let half = steady.len() / 2;
+        let mean = |s: &[u64]| s.iter().sum::<u64>() / (s.len().max(1) as u64);
+        eprintln!(
+            "summary: area {} MB as described; peak in use {} MB ({} % of the budget), peak host textures {} MB, \
+             {over} of {cycles} cycles over the budget; second half {}..{} MB, its quarters' means {} -> {} MB; \
+             at the end {} MB in use against {} MB at the start ({} MB of it empty texture blocks kept); let go {} ({} MB), made again {}; \
+             the slowest cycle's making {slowest} ms",
+            area_bytes / MB,
+            peak / MB,
+            peak * 100 / budget.max(1),
+            peak_host / MB,
+            low / MB,
+            high / MB,
+            mean(&steady[..half]) / MB,
+            mean(&steady[half..]) / MB,
+            end / MB,
+            start / MB,
+            spare / MB,
+            KINDS[2].load(Relaxed),
+            KINDS[3].load(Relaxed) / MB,
+            KINDS[4].load(Relaxed)
+        );
+        // Empty blocks the pool keeps while the card has room are its
+        // choice (`crate::pool` `SPARE_KEPT`); anything else is not given back.
+        let lost = end.saturating_sub(spare).saturating_sub(start);
+        assert!(lost <= 64 * MB, "{} MB not given back", lost / MB);
     }
 }
 
