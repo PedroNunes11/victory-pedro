@@ -22,7 +22,7 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -145,9 +145,7 @@ impl Pending {
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
-        let (lock, done) = &DONE;
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        done.notify_all();
+        notify_done_if_waited();
     }
 }
 
@@ -180,8 +178,39 @@ pub(crate) fn hashes(p: &Pending) -> String {
     hashes.join("+")
 }
 
-/// Signalled whenever a worker has made a pipeline.
+/// Signalled whenever a worker has made a pipeline while at least one caller
+/// is waiting in [`wait`].
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+/// Number of threads currently waiting in [`wait`].
+static DONE_WAITERS: AtomicU32 = AtomicU32::new(0);
+#[cfg(test)]
+static DONE_NOTIFIES: AtomicU64 = AtomicU64::new(0);
+
+struct DoneWaiter;
+
+impl DoneWaiter {
+    fn enter() -> Self {
+        DONE_WAITERS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for DoneWaiter {
+    fn drop(&mut self) {
+        DONE_WAITERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn notify_done_if_waited() {
+    std::sync::atomic::fence(Ordering::SeqCst);
+    if DONE_WAITERS.load(Ordering::SeqCst) > 0 {
+        let (lock, done) = &DONE;
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+        #[cfg(test)]
+        DONE_NOTIFIES.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
@@ -303,6 +332,8 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let _waiter = DoneWaiter::enter();
+    std::sync::atomic::fence(Ordering::SeqCst);
     while p.made.get().is_none() {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
@@ -311,6 +342,7 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
+    drop(_waiter);
     let waited = started.elapsed().min(left);
     waiting.end();
     if screen && waited > Duration::from_millis(500) {
@@ -433,7 +465,11 @@ impl Queue {
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
-static AVAILABLE: Condvar = Condvar::new();
+/// General workers wait here; waking one avoids thundering-herd wakeups and
+/// never wakes screen-only workers for non-screen pipelines.
+static AVAILABLE_GENERAL: Condvar = Condvar::new();
+/// Dedicated screen-pass workers wait here.
+static AVAILABLE_SCREEN: Condvar = Condvar::new();
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -452,9 +488,12 @@ fn start(p: &Arc<Pending>, priority: u8) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
-        // (One woken could be a worker that takes passes over the screen
-        // alone: it would leave the pipeline to nobody.)
-        AVAILABLE.notify_all();
+        if priority == REQUESTED && p.screen && screens_first() {
+            AVAILABLE_SCREEN.notify_one();
+            AVAILABLE_GENERAL.notify_one();
+        } else {
+            AVAILABLE_GENERAL.notify_one();
+        }
     }
 }
 
@@ -463,11 +502,12 @@ const SCREEN_WORKERS: usize = 2;
 
 fn next(screens_only: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let wake = if screens_only { &AVAILABLE_SCREEN } else { &AVAILABLE_GENERAL };
     loop {
         if let Some(p) = queue.pop(screens_only, slow_limit()) {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        queue = wake.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -521,7 +561,9 @@ fn workers() -> bool {
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now -= 1;
-                            AVAILABLE.notify_all();
+                            if !queue.slow.is_empty() {
+                                AVAILABLE_GENERAL.notify_one();
+                            }
                         }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
@@ -575,6 +617,10 @@ mod tests {
         assert_eq!(missing(&pending).as_deref(), Some("being made"));
     }
 
+    /// Serialises tests that observe or drive the process-wide `DONE_WAITERS` /
+    /// `DONE_NOTIFIES` statics so parallel `cargo test` runs cannot interleave.
+    static DONE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
         assert_eq!(worker_count(None, 1), 2);
@@ -592,6 +638,7 @@ mod tests {
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
     fn first_use_is_made_by_a_worker() {
+        let _serial = DONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p = Arc::new(Pending::new(Vec::new(), None));
         assert!(ready(&p).is_none());
         assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
@@ -604,6 +651,7 @@ mod tests {
 
     #[test]
     fn pending_pipeline_is_recorded_for_the_next_launch() {
+        let _serial = DONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut p = Pending::new(Vec::new(), None);
         p.key = "pending-pipeline-test".to_owned();
         // Simulate a worker that has taken the job but cannot finish it yet.
@@ -675,5 +723,42 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn unawaited_make_skips_done_notify_and_awaited_make_wakes_waiter() {
+        let _serial = DONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(DONE_WAITERS.load(Ordering::SeqCst), 0);
+
+        let p_bg = Pending::new(Vec::new(), None);
+        let before = DONE_NOTIFIES.load(Ordering::Relaxed);
+        p_bg.make();
+        assert_eq!(DONE_NOTIFIES.load(Ordering::Relaxed), before);
+
+        // Park a thread in `wait()` on a pending item, then complete it from
+        // this thread and confirm the waiter wakes well before the wait budget.
+        let p_waited = Arc::new(Pending::new(Vec::new(), None));
+        let p_for_waiter = Arc::clone(&p_waited);
+        let waiter = std::thread::spawn(move || {
+            let began = Instant::now();
+            wait(&p_for_waiter, u64::MAX - 1);
+            began.elapsed()
+        });
+        let spin_start = Instant::now();
+        while DONE_WAITERS.load(Ordering::SeqCst) == 0 {
+            assert!(spin_start.elapsed() < Duration::from_secs(2), "waiter did not enter wait()");
+            std::thread::yield_now();
+        }
+        // Let the waiter enter `condvar::wait_timeout` before notifying.
+        std::thread::sleep(Duration::from_millis(20));
+        let before_waited = DONE_NOTIFIES.load(Ordering::Relaxed);
+        p_waited.make();
+        let waited = waiter.join().expect("waiter thread panicked");
+        assert!(DONE_NOTIFIES.load(Ordering::Relaxed) > before_waited);
+        assert!(p_waited.made.get().is_some());
+        assert!(
+            waited < Duration::from_millis(250),
+            "waiter was not woken promptly by make(): waited {waited:?}"
+        );
     }
 }
