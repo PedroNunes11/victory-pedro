@@ -31,7 +31,7 @@ pub mod binds;
 pub mod menu;
 pub(crate) mod mouse;
 use binds::Part;
-use mouse::{Mouse, Pace};
+use mouse::{MenuStepper, Mouse, Pace, WheelStick};
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -448,6 +448,14 @@ struct State {
     /// The title's looks at the stand-in pad.
     pace: Pace,
     unseen: Unseen,
+    /// Mouse motion -> D-pad steps in pause/settings menus (native mode).
+    menu_stepper: MenuStepper,
+    /// Mouse motion -> held radial stick on Weapon / Radio Wheel (native mode).
+    wheel_stick: WheelStick,
+    /// Latched mouse wheel notches (0x81 WheelUp, 0x82 WheelDown) so quick scrolls aren't lost.
+    wheel_latch: Latch,
+    /// Latched map zoom pulses from mouse wheel (1 = zoom in RT, 2 = zoom out LT).
+    map_zoom_latch: Latch,
 }
 
 pub struct Hub {
@@ -518,6 +526,10 @@ impl Hub {
                 running: Vec::new(),
                 pace: Pace::default(),
                 unseen: Unseen::default(),
+                menu_stepper: MenuStepper::default(),
+                wheel_stick: WheelStick::default(),
+                wheel_latch: Latch::default(),
+                map_zoom_latch: Latch::default(),
             }),
             returned: Condvar::new(),
         }));
@@ -629,36 +641,113 @@ impl State {
         } else {
             Vec::new()
         };
-        let motion_only = Mouse { buttons: Vec::new(), stick: mouse.stick };
+        // Native mode context routing (told by the loader from the game's own actions):
+        // - Map screen: mouse smoothly pans the map cursor (left stick), wheel zooms (RT/LT).
+        // - Other menus (pause/settings): mouse steps D-pad up/down/left/right cleanly without
+        //   fighting WASD; wheel scrolls up/down via native WheelUp/WheelDown keys.
+        // - Weapon/Radio Wheel: mouse drives a virtual radial stick (holds angle on right stick).
+        // - Play: mouse drives crisp frame-locked camera look (right stick).
+        #[cfg(windows)]
+        let (in_menu, in_map, in_wheel) = if *NATIVE {
+            (
+                victory_loader::keyboard_events::IN_MENU.load(Ordering::Relaxed),
+                victory_loader::keyboard_events::IN_MAP.load(Ordering::Relaxed),
+                victory_loader::keyboard_events::IN_WHEEL.load(Ordering::Relaxed),
+            )
+        } else {
+            (false, false, false)
+        };
+        #[cfg(not(windows))]
+        let (in_menu, in_map, in_wheel) = (false, false, false);
+
+        let now = now();
+        let looks = LOOKS.load(Ordering::Relaxed);
+        let instant_now = Instant::now();
+
+        let mut wheel_keys: Vec<KeyState> = Vec::new();
+        let mut map_zoom_triggers = (0.0f32, 0.0f32);
+        if *NATIVE {
+            let wheel_now: Vec<u32> = if !in_map {
+                match mouse.wheel.cmp(&0) {
+                    std::cmp::Ordering::Greater => vec![0x81],
+                    std::cmp::Ordering::Less => vec![0x82],
+                    std::cmp::Ordering::Equal => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            for vk in self.wheel_latch.report(&wheel_now, looks, instant_now) {
+                let scan = if vk == 0x81 { 0x69 } else { 0x6a };
+                wheel_keys.push(KeyState { scan_code: scan, virtual_key: vk as u8, ..Default::default() });
+            }
+            let zoom_now: Vec<u32> = if in_menu && in_map {
+                match mouse.wheel.cmp(&0) {
+                    std::cmp::Ordering::Greater => vec![1],
+                    std::cmp::Ordering::Less => vec![2],
+                    std::cmp::Ordering::Equal => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            for z in self.map_zoom_latch.report(&zoom_now, looks, instant_now) {
+                if z == 1 {
+                    map_zoom_triggers.1 = 1.0; // RT = zoom in
+                } else if z == 2 {
+                    map_zoom_triggers.0 = 1.0; // LT = zoom out
+                }
+            }
+        }
+
+        let menu_dpad = if *NATIVE && in_menu && !in_map {
+            self.menu_stepper.step(now, mouse.raw)
+        } else {
+            self.menu_stepper.clear();
+            0
+        };
+        let wheel_pos = if *NATIVE && !in_menu && in_wheel {
+            self.wheel_stick.step(mouse.raw, binds::mouse_options().sensitivity)
+        } else {
+            self.wheel_stick.clear();
+            (0.0, 0.0)
+        };
+
+        let motion_only = Mouse {
+            buttons: Vec::new(),
+            stick: mouse.stick,
+            raw: mouse.raw,
+            wheel: mouse.wheel,
+        };
         let (pad_keys, pad_mouse): (Vec<KeyState>, &Mouse) =
             if *NATIVE { (Vec::new(), &motion_only) } else { (keys.clone(), mouse) };
-        // Native, in a menu (pause menu, map: told by the loader from the game's own actions): the
-        // mouse moves the menu's cursor, the left stick, instead of the camera.
-        #[cfg(windows)]
-        let in_menu = *NATIVE && victory_loader::keyboard_events::IN_MENU.load(Ordering::Relaxed);
-        #[cfg(not(windows))]
-        let in_menu = false;
         let to_menu = |mut p: PadState| {
-            if in_menu {
-                (p.left_x, p.left_y) = (p.right_x, p.right_y);
+            if *NATIVE && in_menu {
+                if in_map {
+                    (p.left_x, p.left_y) = (p.right_x, p.right_y);
+                    p.left_trigger = p.left_trigger.max(map_zoom_triggers.0);
+                    p.right_trigger = p.right_trigger.max(map_zoom_triggers.1);
+                } else {
+                    p.buttons |= menu_dpad;
+                }
                 (p.right_x, p.right_y) = (0.0, 0.0);
+            } else if *NATIVE && in_wheel {
+                (p.right_x, p.right_y) = wheel_pos;
             }
             p
         };
-        // The keyboard device sees the native-only keys and (native) the mouse buttons too; the
-        // stand-in pad does not.
+        // The keyboard device sees the native-only keys and (native) the mouse buttons + wheel too;
+        // the stand-in pad does not.
         let with_native = |keys: Vec<KeyState>| {
             let mut all = keys;
             let extra: Vec<KeyState> = native
                 .iter()
                 .chain(mouse_keys.iter())
+                .chain(wheel_keys.iter())
                 .filter(|n| !all.iter().any(|k| k.virtual_key == n.virtual_key))
                 .copied()
                 .collect();
             all.extend(extra);
             all
         };
-        let now = now();
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
             // The keyboard and mouse by the player's binds, taps kept until the
@@ -891,6 +980,7 @@ extern "system" fn current_reading(
         let now = now();
         state.pace.look(now);
         state.unseen.looked(now);
+        mouse::note_pad_frame(now);
     }
     hr
 }
@@ -1521,8 +1611,7 @@ mod host {
             }
             down.into_iter()
                 .map(|vk| KeyState {
-                    // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+                    scan_code: vk_scan_code(vk),
                     virtual_key: vk,
                     // shortcut: no characters (code point 0);
                     // the title reads scan codes and virtual keys only.
@@ -1535,8 +1624,7 @@ mod host {
             native_asked()
                 .into_iter()
                 .map(|vk| KeyState {
-                    // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+                    scan_code: vk_scan_code(vk),
                     virtual_key: vk,
                     ..Default::default()
                 })
@@ -1554,6 +1642,17 @@ mod host {
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+    }
+
+    /// Scan code for a virtual key, ensuring extended navigation keys carry the `0xE000` prefix
+    /// that RAGE's keyboard mapper (`0x1443A1F60`) requires to tell Arrow/Nav keys from Numpad keys.
+    fn vk_scan_code(vk: u8) -> u32 {
+        // SAFETY: plain query.
+        let sc = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) };
+        match vk {
+            0x21..=0x28 | 0x2D | 0x2E => sc | 0xE000,
+            _ => sc,
         }
     }
 
@@ -2163,6 +2262,7 @@ mod tests {
         host.lock().unwrap().mouse = Mouse {
             buttons: vec![mouse::LEFT, mouse::RIGHT],
             stick: (0.5, -0.5),
+            ..Default::default()
         };
         hub.poll();
         let want = PadState {

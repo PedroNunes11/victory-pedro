@@ -10,6 +10,7 @@
 //! [`host::TICK`]), not when the title reads the pad: a slow frame does not
 //! let the cursor out.
 
+#[cfg(test)]
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -31,10 +32,21 @@ const RIGHT_ALT: u8 = 0xA5;
 /// Keys that give the mouse back while held. Right Alt alone does not (it
 /// can be bound to a control), with Tab it does.
 const LET_GO: [u8; 4] = [RELEASE, ESC, LEFT_WIN, RIGHT_WIN];
+/// In native KB/M mode, Esc pauses and navigates menus so it must NOT release
+/// mouse capture (Left Alt, Win keys, RightAlt+Tab, or focus loss still do).
+const LET_GO_NATIVE: [u8; 3] = [RELEASE, LEFT_WIN, RIGHT_WIN];
 
 /// Whether the keys held give the mouse back.
+#[cfg(test)]
 pub(super) fn letting_go(mut down: impl FnMut(u8) -> bool) -> bool {
-    LET_GO.into_iter().any(&mut down) || (down(super::TAB) && down(RIGHT_ALT))
+    letting_go_mode(&mut down, true)
+}
+
+/// Whether the keys held give the mouse back; `esc_releases` is false in
+/// native KB/M mode so Esc can pause and navigate menus without dropping mouse.
+pub(super) fn letting_go_mode(mut down: impl FnMut(u8) -> bool, esc_releases: bool) -> bool {
+    let keys: &[u8] = if esc_releases { &LET_GO } else { &LET_GO_NATIVE };
+    keys.iter().copied().any(&mut down) || (down(super::TAB) && down(RIGHT_ALT))
 }
 
 /// What the mouse does to the stand-in pad; nothing while it is not taken.
@@ -44,6 +56,10 @@ pub(super) struct Mouse {
     pub buttons: Vec<u8>,
     /// The right stick, up positive.
     pub stick: (f32, f32),
+    /// Raw mouse motion since the previous poll (down positive), while taken.
+    pub raw: (i32, i32),
+    /// Scroll wheel notches since the previous poll (+up, -down), while taken.
+    pub wheel: i32,
 }
 
 /// The title's window has the mouse.
@@ -55,21 +71,211 @@ pub(crate) fn taken() -> bool {
 }
 
 /// Mouse counts per second that push the stick all the way, at sensitivity 1.
+#[cfg(test)]
 const FULL_SPEED: f32 = 2000.0;
 /// Titles ignore a stick this close to its centre (XInput's value for the
 /// right stick), so the slowest motion starts here.
+#[cfg(test)]
 const DEAD_ZONE: f32 = 8689.0 / 32767.0;
+
+/// Frame-locked camera look tuning (no sliding-window bleed, crisp inverse curve).
+const CAM_FULL_SPEED: f32 = 1400.0;
+const CAM_DEAD_ZONE: f32 = 0.13;
+const CAM_CURVE_EXP: f32 = 0.62;
+/// Minimum/maximum frame delta used when normalizing per-frame raw counts.
+const MIN_DT_US: u64 = 10_000;
+const MAX_DT_US: u64 = 80_000;
+const IDLE_RESET_US: u64 = 150_000;
+
+/// Counter bumped whenever the title actually reads a new stand-in pad frame.
+static PAD_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PAD_LAST_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PAD_DT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(33_333);
+
+/// Called from `current_reading` when the title reads the stand-in pad.
+pub(super) fn note_pad_frame(now_us: u64) {
+    let prev = PAD_LAST_US.load(Ordering::Relaxed);
+    if prev == 0 {
+        PAD_LAST_US.store(now_us, Ordering::Relaxed);
+        PAD_FRAME.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let gap = now_us.saturating_sub(prev);
+    if gap < Pace::SAME_FRAME {
+        return;
+    }
+    PAD_LAST_US.store(now_us, Ordering::Relaxed);
+    PAD_DT_US.store(gap.clamp(MIN_DT_US, MAX_DT_US), Ordering::Relaxed);
+    PAD_FRAME.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Frame-locked mouse look: accumulates raw deltas until the title reads the
+/// pad once, then zeroes immediately so motion NEVER bleeds into the next frame.
+pub(super) struct FrameLook {
+    last_frame: u64,
+    last_motion: u64,
+    dx: i32,
+    dy: i32,
+    sensitivity: f32,
+}
+
+impl FrameLook {
+    pub fn new(sensitivity: f32) -> Self {
+        Self {
+            last_frame: PAD_FRAME.load(Ordering::Relaxed),
+            last_motion: 0,
+            dx: 0,
+            dy: 0,
+            sensitivity,
+        }
+    }
+
+    pub fn set_sensitivity(&mut self, sensitivity: f32) {
+        self.sensitivity = sensitivity;
+    }
+
+    pub fn clear(&mut self) {
+        self.dx = 0;
+        self.dy = 0;
+        self.last_motion = 0;
+        self.last_frame = PAD_FRAME.load(Ordering::Relaxed);
+    }
+
+    /// Updates accumulated raw delta for the current title frame and returns
+    /// the resulting right-stick deflection (up positive).
+    pub fn step(&mut self, now_us: u64, frame: u64, dt_us: u64, moved: (i32, i32)) -> (f32, f32) {
+        if frame != self.last_frame {
+            self.last_frame = frame;
+            self.dx = 0;
+            self.dy = 0;
+        } else if (self.dx != 0 || self.dy != 0)
+            && now_us.saturating_sub(self.last_motion) > IDLE_RESET_US
+        {
+            self.dx = 0;
+            self.dy = 0;
+        }
+        if moved != (0, 0) {
+            self.dx = self.dx.saturating_add(moved.0);
+            self.dy = self.dy.saturating_add(moved.1);
+            self.last_motion = now_us;
+        }
+        let x = self.dx as f32;
+        let y = -(self.dy as f32);
+        let length = x.hypot(y);
+        if length == 0.0 {
+            return (0.0, 0.0);
+        }
+        let dt_s = (dt_us.clamp(MIN_DT_US, MAX_DT_US) as f32) * 1e-6;
+        let speed = (length / (dt_s * CAM_FULL_SPEED)) * self.sensitivity;
+        let curved = speed.min(1.0).powf(CAM_CURVE_EXP);
+        let push = CAM_DEAD_ZONE + (1.0 - CAM_DEAD_ZONE) * curved;
+        (x / length * push, y / length * push)
+    }
+}
+
+/// Converts raw mouse motion inside pause/settings menus (where the Xbox build
+/// draws no PC pointer) into crisp D-pad navigation steps.
+#[derive(Default)]
+pub(super) struct MenuStepper {
+    acc_x: i32,
+    acc_y: i32,
+    last_motion: u64,
+}
+
+impl MenuStepper {
+    const STEP_X: i32 = 56;
+    const STEP_Y: i32 = 42;
+    const IDLE_US: u64 = 250_000;
+
+    pub fn clear(&mut self) {
+        self.acc_x = 0;
+        self.acc_y = 0;
+        self.last_motion = 0;
+    }
+
+    /// Adds raw mouse delta (down positive) and returns D-pad button bits
+    /// (UP/DOWN/LEFT/RIGHT) for any steps crossed.
+    pub fn step(&mut self, now_us: u64, (dx, dy): (i32, i32)) -> u32 {
+        if now_us.saturating_sub(self.last_motion) > Self::IDLE_US {
+            self.acc_x = 0;
+            self.acc_y = 0;
+        }
+        if dx != 0 || dy != 0 {
+            self.acc_x = self.acc_x.saturating_add(dx);
+            self.acc_y = self.acc_y.saturating_add(dy);
+            self.last_motion = now_us;
+        }
+        let mut bits = 0u32;
+        if self.acc_y <= -Self::STEP_Y {
+            bits |= super::UP;
+            self.acc_y += Self::STEP_Y;
+            self.acc_x = 0;
+        } else if self.acc_y >= Self::STEP_Y {
+            bits |= super::DOWN;
+            self.acc_y -= Self::STEP_Y;
+            self.acc_x = 0;
+        } else if self.acc_x <= -Self::STEP_X {
+            bits |= super::LEFT;
+            self.acc_x += Self::STEP_X;
+            self.acc_y = 0;
+        } else if self.acc_x >= Self::STEP_X {
+            bits |= super::RIGHT;
+            self.acc_x -= Self::STEP_X;
+            self.acc_y = 0;
+        }
+        bits
+    }
+}
+
+/// Virtual radial stick for Weapon Wheel / Radio Wheel selection: accumulates
+/// raw mouse deltas into a 2D position clamped to the unit circle and holds
+/// that angle until the wheel closes (unlike camera look, which zeroes on stop).
+#[derive(Default)]
+pub(super) struct WheelStick {
+    x: f32,
+    y: f32,
+}
+
+impl WheelStick {
+    const RADIUS: f32 = 95.0;
+    const DEAD_ZONE: f32 = 0.14;
+
+    pub fn clear(&mut self) {
+        self.x = 0.0;
+        self.y = 0.0;
+    }
+
+    /// Adds raw mouse delta (down positive) and returns the held stick position (up positive).
+    pub fn step(&mut self, (dx, dy): (i32, i32), sensitivity: f32) -> (f32, f32) {
+        let scale = sensitivity.max(0.2) / Self::RADIUS;
+        self.x += (dx as f32) * scale;
+        self.y -= (dy as f32) * scale;
+        let len = self.x.hypot(self.y);
+        if len > 1.0 {
+            self.x /= len;
+            self.y /= len;
+        }
+        if len < Self::DEAD_ZONE {
+            (0.0, 0.0)
+        } else {
+            (self.x, self.y)
+        }
+    }
+}
 
 /// Mouse motion as a stick. A mouse reports distance and a stick speed, and
 /// the title looks only once per frame: the stick is the mean speed over the
 /// time between two looks, so a frame turns by all the motion made since the
 /// one before, however long it took.
+#[cfg(test)]
 pub(super) struct Look {
     /// When (microseconds), and how far.
     moves: VecDeque<(u64, i32, i32)>,
     sensitivity: f32,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 impl Look {
     pub fn new(sensitivity: f32) -> Look {
         Look {
@@ -240,11 +446,22 @@ pub(super) struct Grab {
 impl Grab {
     /// One look at the desktop; `wanted`: no pad is connected. The buttons
     /// that count, `None` while the mouse is not taken.
+    #[cfg(test)]
     pub fn tick(&mut self, desktop: &mut impl Desktop, wanted: bool) -> Option<Vec<u8>> {
+        self.tick_mode(desktop, wanted, true)
+    }
+
+    /// Like [`tick`], with `esc_releases` controlling whether Esc frees the cursor.
+    pub fn tick_mode(
+        &mut self,
+        desktop: &mut impl Desktop,
+        wanted: bool,
+        esc_releases: bool,
+    ) -> Option<Vec<u8>> {
         let area = if wanted { desktop.title_area() } else { None };
         let at = desktop.cursor();
         let inside = area.zip(at).is_some_and(|(area, at)| area.contains(at));
-        let release = letting_go(|vk| desktop.down(vk));
+        let release = letting_go_mode(|vk| desktop.down(vk), esc_releases);
         let held = BUTTONS.into_iter().filter(|&vk| desktop.down(vk)).collect();
         let buttons = self.capture.step(area.is_some(), inside, release, held);
         match (&buttons, area) {
@@ -306,16 +523,17 @@ mod host {
     /// How often the mouse thread looks at the desktop.
     pub(super) const TICK: Duration = Duration::from_millis(4);
 
-    /// Motion since the last poll.
+    /// Motion and scroll wheel notches since the last poll.
     static DX: AtomicI32 = AtomicI32::new(0);
     static DY: AtomicI32 = AtomicI32::new(0);
+    static WHEEL: AtomicI32 = AtomicI32::new(0);
     /// No pad is connected (the pad poll says so).
     static WANTED: AtomicBool = AtomicBool::new(false);
     /// The buttons that count, `None` while the mouse is not taken.
     static HELD: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
     pub(in super::super) struct Host {
-        look: Look,
+        look: FrameLook,
         taken: bool,
         /// VICTORY_MOUSE_SENSITIVITY is set: it wins over the keys file's.
         env_sensitivity: bool,
@@ -329,7 +547,7 @@ mod host {
                 .filter(|s: &f32| s.is_finite() && *s > 0.0)
                 .unwrap_or(1.0);
             Host {
-                look: Look::new(sensitivity),
+                look: FrameLook::new(sensitivity),
                 taken: false,
                 env_sensitivity: std::env::var_os("VICTORY_MOUSE_SENSITIVITY").is_some(),
             }
@@ -338,7 +556,7 @@ mod host {
 
     impl Host {
         /// `wanted`: no pad is connected.
-        pub fn poll(&mut self, now: u64, wanted: bool, window: Duration) -> Mouse {
+        pub fn poll(&mut self, now: u64, wanted: bool, _window: Duration) -> Mouse {
             WANTED.store(wanted, Ordering::Relaxed);
             start();
             let held = HELD.lock().unwrap_or_else(PoisonError::into_inner).clone();
@@ -346,8 +564,9 @@ mod host {
                 self.taken = held.is_some();
                 self.look.clear();
             }
-            // Motion while the mouse is not taken turns nothing.
+            // Motion and wheel while the mouse is not taken turn nothing.
             let mut moved = (DX.swap(0, Ordering::Relaxed), DY.swap(0, Ordering::Relaxed));
+            let wheel = WHEEL.swap(0, Ordering::Relaxed);
             // The keys file's [mouse] section (the Controls menu writes it).
             let options = super::super::binds::mouse_options();
             if !self.env_sensitivity {
@@ -359,9 +578,13 @@ mod host {
             let Some(buttons) = held else {
                 return Mouse::default();
             };
+            let frame = PAD_FRAME.load(Ordering::Relaxed);
+            let dt_us = PAD_DT_US.load(Ordering::Relaxed);
             Mouse {
                 buttons,
-                stick: self.look.stick(now, window, moved),
+                stick: self.look.step(now, frame, dt_us, moved),
+                raw: moved,
+                wheel,
             }
         }
     }
@@ -533,17 +756,22 @@ mod host {
             }
             last = Some(Instant::now());
             let was = grab.held();
-            let buttons = grab.tick(&mut Win32, WANTED.load(Ordering::Relaxed));
+            static ESC_RELEASES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                !std::env::var_os("VICTORY_NATIVE_INPUT").is_some_and(|v| v == "1")
+            });
+            let buttons = grab.tick_mode(&mut Win32, WANTED.load(Ordering::Relaxed), *ESC_RELEASES);
             if grab.held() != was {
                 tracing::info!(taken = !was, "mouse");
                 DX.store(0, Ordering::Relaxed);
                 DY.store(0, Ordering::Relaxed);
+                WHEEL.store(0, Ordering::Relaxed);
             }
             *HELD.lock().unwrap_or_else(PoisonError::into_inner) = buttons;
         }
     }
 
     fn moved(handle: isize) {
+        const RI_MOUSE_WHEEL: u16 = 0x0400;
         let mut input = RAWINPUT::default();
         let mut size = size_of::<RAWINPUT>() as u32;
         // SAFETY: room for one report and its size; the union is read as
@@ -565,6 +793,18 @@ mod host {
             if mouse.usFlags & MOUSE_MOVE_ABSOLUTE == 0 {
                 DX.fetch_add(mouse.lLastX, Ordering::Relaxed);
                 DY.fetch_add(mouse.lLastY, Ordering::Relaxed);
+            }
+            let flags = mouse.Anonymous.Anonymous.usButtonFlags;
+            if flags & RI_MOUSE_WHEEL != 0 {
+                let delta = mouse.Anonymous.Anonymous.usButtonData as i16;
+                let notches = if delta.abs() >= 120 {
+                    i32::from(delta / 120)
+                } else {
+                    i32::from(delta.signum())
+                };
+                if notches != 0 {
+                    WHEEL.fetch_add(notches, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -832,5 +1072,52 @@ mod tests {
         desktop.keys = vec![LEFT];
         assert_eq!(grab.tick(&mut desktop, false), None);
         assert!(free(&desktop));
+    }
+
+    #[test]
+    fn native_mode_keeps_mouse_on_esc_and_releases_on_alt() {
+        let (mut grab, mut desktop) = (Grab::default(), focused());
+        assert_eq!(click(&mut grab, &mut desktop), Some(vec![]));
+        desktop.keys = vec![ESC];
+        assert_eq!(grab.tick_mode(&mut desktop, true, false), Some(vec![]));
+        assert!(desktop.hidden && grab.held());
+        desktop.keys = vec![RELEASE];
+        assert_eq!(grab.tick_mode(&mut desktop, true, false), None);
+        assert!(free(&desktop) && !grab.held());
+    }
+
+    #[test]
+    fn frame_look_stops_instantly_on_new_frame_without_bleed() {
+        let mut look = FrameLook::new(1.0);
+        let (x, y) = look.step(10_000, 1, 33_333, (20, -10));
+        assert!(x > CAM_DEAD_ZONE && y > 0.0);
+        // Same frame: another poll with zero new delta still preserves the frame's motion.
+        assert_eq!(look.step(18_000, 1, 33_333, (0, 0)), (x, y));
+        // Title consumed frame 1 -> frame 2 starts with zero bleed.
+        assert_eq!(look.step(26_000, 2, 33_333, (0, 0)), (0.0, 0.0));
+    }
+
+    #[test]
+    fn menu_stepper_emits_crisp_dpad_steps() {
+        let mut stepper = MenuStepper::default();
+        assert_eq!(stepper.step(10_000, (0, 20)), 0);
+        assert_eq!(stepper.step(20_000, (0, 25)), super::super::DOWN);
+        assert_eq!(stepper.step(30_000, (0, 0)), 0);
+        assert_eq!(stepper.step(40_000, (0, -50)), super::super::UP);
+    }
+
+    #[test]
+    fn wheel_stick_holds_position_and_clamps_to_unit_circle() {
+        let mut wheel = WheelStick::default();
+        // Tiny jitter stays inside deadzone.
+        assert_eq!(wheel.step((5, 0), 1.0), (0.0, 0.0));
+        // Flick up-right selects a wedge and holds it even when mouse stops.
+        let (x, y) = wheel.step((120, -120), 1.0);
+        assert!(x > 0.65 && y > 0.65);
+        assert!((x.hypot(y) - 1.0).abs() < 1e-4);
+        assert_eq!(wheel.step((0, 0), 1.0), (x, y));
+        // Closing the wheel resets to center.
+        wheel.clear();
+        assert_eq!(wheel.step((0, 0), 1.0), (0.0, 0.0));
     }
 }

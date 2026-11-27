@@ -131,43 +131,328 @@ impl KeyMap {
 /// The action whose activity tells play from a menu: on foot and in vehicles it is active (+0x158
 /// bit 2); the pause menu and the like turn it off (seen 2026-11-27: 0x0a in play, 0x08 in a menu).
 const PLAY_ACTION: u32 = 0x8fd0_15d8; // INPUT_MOVE_UP_ONLY
+/// Actions active only on the Map screen (inactive on foot; bit 2 set when map is open).
+const MAP_MOVE_ACTION: u32 = 0x6140_af6c; // INPUT_FRONTEND_MAP_MOVE_LR
+const MAP_ACCEPT_ACTION: u32 = 0x8ddd_c16e; // INPUT_MAP_MENU_ACCEPT
+/// Action active only in vehicles (used to seamlessly re-translate held keys when entering/exiting).
+const VEH_ACCEL_ACTION: u32 = 0x5b9f_d4e2; // INPUT_VEH_ACCELERATE
+/// Actions active only while a radial wheel (Weapon / Item / Emote Wheel) is open.
+const RADIAL_SLOT_NEXT: u32 = 0xe71f_89b8; // INPUT_RADIAL_MENU_SLOT_NAV_NEXT
+const RADIAL_SLOT_PREV: u32 = 0x93d6_723f; // INPUT_RADIAL_MENU_SLOT_NAV_PREV
+const SELECT_NEXT_WHEEL: u32 = 0x77e5_6fb3; // INPUT_SELECT_NEXT_WHEEL
+/// Actions that open a radial wheel when held.
+const OPEN_WHEEL_ACTION: u32 = 0xac4b_d4f1; // INPUT_OPEN_WHEEL_MENU (Tab)
+const OPEN_EMOTE_WHEEL: u32 = 0xe2b5_57a3; // INPUT_OPEN_EMOTE_WHEEL
+const SELECT_ITEM_WHEEL: u32 = 0x1f6d_95e5; // INPUT_SELECT_ITEM_WHEEL
+const VEH_RADIO_ACTION: u32 = 0x22e0_f7e7; // INPUT_VEH_NEXT_RADIO (hold Q in car = Radio Wheel)
+/// Vertex meta-actions for on-foot walk speed (scales LX/LY to 0.42 while walking).
+const WALK_TOGGLE: u32 = joaat("VERTEX_WALK_TOGGLE");
+const WALK_HOLD: u32 = joaat("VERTEX_WALK_HOLD");
+const WALK_SCALE: f32 = 0.42;
 
-/// The title is in a menu (pause menu, map...): [`PLAY_ACTION`] inactive, looked at every 100 ms
-/// while native keys are on. The input layer then gives the mouse to the menus (left stick).
+/// The title is in a menu (pause menu, map...): [`PLAY_ACTION`] inactive, polled every 50 ms
+/// while native keys are on.
 pub static IN_MENU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Keeps [`IN_MENU`] current.
-fn watch_menus(base: usize) {
-    let read32 = |at: usize| {
-        // SAFETY: the title's action array and its objects, read only.
-        unsafe { std::ptr::read_volatile(at as *const u32) }
-    };
-    let read = |at: usize| {
-        // SAFETY: as above.
-        unsafe { std::ptr::read_volatile(at as *const usize) }
-    };
-    let mut cached = 0usize;
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let count = read32(base + ACTION_COUNT) as usize;
-        let array = read(base + ACTION_ARRAY);
-        if count == 0 || array == 0 {
-            continue;
+/// The title is on the Map screen inside menus: mouse motion smoothly pans the map cursor
+/// (left stick) and mouse wheel zooms (RT/LT).
+pub static IN_MAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A radial wheel (Weapon Wheel / Radio Wheel) is open in play: mouse motion drives a held
+/// radial right-stick angle instead of velocity-based camera look.
+pub static IN_WHEEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The player is in a vehicle (used for smooth steering ramp and context re-translation).
+pub static IN_VEHICLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// On-foot walk modifier (scales LX/LY to [`WALK_SCALE`]; auto-clears in menus/vehicles).
+static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Currently held wheel-open key `(vk, pressed_at, activation_delay)`.
+static WHEEL_HOLD: std::sync::Mutex<Option<(u32, std::time::Instant, std::time::Duration)>> =
+    std::sync::Mutex::new(None);
+
+/// Smooth analog steering ramp for A/D (`LX`, 0x3010) in vehicles so quick highway taps steer
+/// gently while holding hits full lock. Configured via `VICTORY_STEER_RAMP_MS` (default 110; 0 off).
+struct SteerRamp {
+    current: f32,
+    target: f32,
+    active: bool,
+    last: Option<std::time::Instant>,
+    ramp_ms: f32,
+}
+
+impl SteerRamp {
+    const INITIAL_BITE: f32 = 0.28;
+
+    const fn new(ramp_ms: f32) -> Self {
+        Self { current: 0.0, target: 0.0, active: false, last: None, ramp_ms }
+    }
+
+    fn configured_ms() -> f32 {
+        static MS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *MS.get_or_init(|| {
+            std::env::var("VICTORY_STEER_RAMP_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .unwrap_or(110.0)
+        })
+    }
+
+    /// Sets a new steering target (`-1.0..=1.0`). Returns the immediate value to emit now.
+    fn set_target(&mut self, target: f32, now: std::time::Instant, ramp_ms: f32) -> f32 {
+        self.ramp_ms = ramp_ms;
+        self.target = target.clamp(-1.0, 1.0);
+        if self.target.abs() < 1e-4 || ramp_ms <= 0.0 {
+            self.current = self.target;
+            self.active = false;
+            self.last = None;
+            return self.current;
         }
-        if cached == 0 || read32(cached + 0x128) != PLAY_ACTION {
-            cached = (0..count).map(|i| array + i * 0x160).find(|&a| read32(a + 0x128) == PLAY_ACTION).unwrap_or(0);
-            if cached == 0 {
-                continue;
+        if self.current * self.target <= 0.0 {
+            self.current = Self::INITIAL_BITE * self.target.signum();
+        }
+        self.active = (self.target - self.current).abs() > 1e-3;
+        self.last = self.active.then_some(now);
+        self.current
+    }
+
+    /// Advances an active ramp toward `target`, returning `Some(new_value)` if it changed.
+    fn tick(&mut self, now: std::time::Instant) -> Option<f32> {
+        if !self.active || self.ramp_ms <= 0.0 {
+            return None;
+        }
+        let dt_s = self.last.map_or(0.016, |t| now.saturating_duration_since(t).as_secs_f32().clamp(0.001, 0.1));
+        self.last = Some(now);
+        let rate = (1.0 - Self::INITIAL_BITE) / (self.ramp_ms * 0.001);
+        let diff = self.target - self.current;
+        let step = rate * dt_s;
+        if diff.abs() <= step {
+            self.current = self.target;
+            self.active = false;
+            self.last = None;
+        } else {
+            self.current += diff.signum() * step;
+        }
+        Some(self.current)
+    }
+
+    fn reset(&mut self) {
+        self.current = 0.0;
+        self.target = 0.0;
+        self.active = false;
+        self.last = None;
+    }
+}
+
+static STEER_RAMP: std::sync::Mutex<SteerRamp> = std::sync::Mutex::new(SteerRamp::new(110.0));
+
+/// Target `(object, handler)` once subscribed to the title's event buffer, for context transitions.
+static RELAY_TARGET: std::sync::Mutex<Option<(usize, Handler)>> = std::sync::Mutex::new(None);
+
+fn wheel_hold_active(now: std::time::Instant) -> bool {
+    let hold = WHEEL_HOLD.lock().unwrap_or_else(|p| p.into_inner());
+    hold.is_some_and(|(_, since, delay)| now.saturating_duration_since(since) >= delay)
+}
+
+/// Looks up an action pointer by id in the live action array (read-only).
+fn find_action(base: usize, id: u32, cached: &mut usize) -> usize {
+    let read32 = |at: usize| unsafe { std::ptr::read_volatile(at as *const u32) };
+    let read = |at: usize| unsafe { std::ptr::read_volatile(at as *const usize) };
+    let count = read32(base + ACTION_COUNT) as usize;
+    let array = read(base + ACTION_ARRAY);
+    if count == 0 || array == 0 {
+        return 0;
+    }
+    if *cached == 0 || read32(*cached + 0x128) != id {
+        *cached = (0..count).map(|i| array + i * 0x160).find(|&a| read32(a + 0x128) == id).unwrap_or(0);
+    }
+    *cached
+}
+
+fn action_active(action: usize) -> bool {
+    action != 0 && unsafe { std::ptr::read_volatile((action + 0x158) as *const u32) } & 2 != 0
+}
+
+/// Keeps [`IN_MENU`], [`IN_MAP`], [`IN_WHEEL`], and [`IN_VEHICLE`] current, drives smooth vehicle
+/// steering ramps, and cleanly updates held keys across context switches.
+fn watch_menus(base: usize) {
+    let mut play_ptr = 0usize;
+    let mut map_move_ptr = 0usize;
+    let mut map_acc_ptr = 0usize;
+    let mut veh_ptr = 0usize;
+    let mut rad_next_ptr = 0usize;
+    let mut rad_prev_ptr = 0usize;
+    let mut rad_tab_ptr = 0usize;
+    let mut was_veh = false;
+    loop {
+        let ramp_running = STEER_RAMP.lock().unwrap_or_else(|p| p.into_inner()).active;
+        std::thread::sleep(std::time::Duration::from_millis(if ramp_running { 16 } else { 50 }));
+        let now = std::time::Instant::now();
+        if ramp_running {
+            let next_lx = STEER_RAMP.lock().unwrap_or_else(|p| p.into_inner()).tick(now);
+            if let Some(val) = next_lx {
+                if let Some((object, handler)) = *RELAY_TARGET.lock().unwrap_or_else(|p| p.into_inner()) {
+                    send_pad_event(object, handler, 0x3010, 3, val);
+                }
             }
         }
-        let menu = read32(cached + 0x158) & 2 == 0;
-        if IN_MENU.swap(menu, Ordering::Relaxed) != menu {
-            tracing::info!(target: "keyboard_events", menu, "the game is in a menu: the mouse moves the menu's cursor (left stick)");
+        let play = find_action(base, PLAY_ACTION, &mut play_ptr);
+        if play == 0 {
+            continue;
+        }
+        let menu = !action_active(play);
+        let map_move = find_action(base, MAP_MOVE_ACTION, &mut map_move_ptr);
+        let map_acc = find_action(base, MAP_ACCEPT_ACTION, &mut map_acc_ptr);
+        let map = menu && (action_active(map_move) || action_active(map_acc));
+        let veh = !menu && action_active(find_action(base, VEH_ACCEL_ACTION, &mut veh_ptr));
+        let wheel = !menu
+            && (action_active(find_action(base, RADIAL_SLOT_NEXT, &mut rad_next_ptr))
+                || action_active(find_action(base, RADIAL_SLOT_PREV, &mut rad_prev_ptr))
+                || action_active(find_action(base, SELECT_NEXT_WHEEL, &mut rad_tab_ptr))
+                || wheel_hold_active(now));
+
+        let menu_changed = IN_MENU.swap(menu, Ordering::Relaxed) != menu;
+        let map_changed = IN_MAP.swap(map, Ordering::Relaxed) != map;
+        let wheel_changed = IN_WHEEL.swap(wheel, Ordering::Relaxed) != wheel;
+        IN_VEHICLE.store(veh, Ordering::Relaxed);
+        if menu_changed || map_changed || wheel_changed {
+            tracing::info!(target: "keyboard_events", menu, map, wheel, veh, "input context changed");
+        }
+        if menu_changed {
+            WALKING.store(false, Ordering::Relaxed);
+            *WHEEL_HOLD.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            STEER_RAMP.lock().unwrap_or_else(|p| p.into_inner()).reset();
+            release_all_held();
+        } else if veh != was_veh {
+            if veh {
+                WALKING.store(false, Ordering::Relaxed);
+            } else {
+                STEER_RAMP.lock().unwrap_or_else(|p| p.into_inner()).reset();
+            }
+            retranslate_held(base, menu);
+        }
+        was_veh = veh;
+    }
+}
+
+/// One held key and the pad source/value it contributes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HeldKey {
+    key: u32,
+    source: u32,
+    axis: bool,
+    value: f32,
+}
+
+/// Keys currently down and each key's translated pad source contribution.
+static HELD: std::sync::Mutex<Vec<HeldKey>> = std::sync::Mutex::new(Vec::new());
+
+fn is_trigger(source: u32) -> bool {
+    matches!(source, 0x3009 | 0x300c)
+}
+
+fn axis_value(held: &[HeldKey], source: u32) -> f32 {
+    let sum: f32 = held.iter().filter(|h| h.source == source).map(|h| h.value).sum();
+    if is_trigger(source) { sum.clamp(0.0, 1.0) } else { sum.clamp(-1.0, 1.0) }
+}
+
+fn button_down(held: &[HeldKey], source: u32) -> bool {
+    held.iter().any(|h| h.source == source)
+}
+
+fn apply_press(
+    held: &mut Vec<HeldKey>,
+    key: u32,
+    source: u32,
+    axis: bool,
+    value: f32,
+    mut emit: impl FnMut(u32, u32, f32),
+) {
+    if held.iter().any(|h| h.key == key) {
+        return;
+    }
+    if axis {
+        let before = axis_value(held, source);
+        held.push(HeldKey { key, source, axis, value });
+        let after = axis_value(held, source);
+        if (after - before).abs() > 1e-4 {
+            emit(source, 3, after);
+        }
+    } else {
+        let was_down = button_down(held, source);
+        held.push(HeldKey { key, source, axis, value });
+        if !was_down {
+            emit(source, 7, 1.0);
         }
     }
 }
-/// Keys down and the pad source each was sent as (axis or button), to release the same one.
-static HELD: std::sync::Mutex<Vec<(u32, u32, bool)>> = std::sync::Mutex::new(Vec::new());
+
+fn apply_release(held: &mut Vec<HeldKey>, key: u32, mut emit: impl FnMut(u32, u32, f32)) {
+    let mut touched: Vec<(u32, bool, f32, bool)> = Vec::new();
+    for h in held.iter().filter(|h| h.key == key) {
+        if !touched.iter().any(|t| t.0 == h.source) {
+            let before_val = if h.axis { axis_value(held, h.source) } else { 0.0 };
+            let was_down = if !h.axis { button_down(held, h.source) } else { false };
+            touched.push((h.source, h.axis, before_val, was_down));
+        }
+    }
+    if touched.is_empty() {
+        return;
+    }
+    held.retain(|h| h.key != key);
+    for (source, axis, before_val, was_down) in touched {
+        if axis {
+            let after = axis_value(held, source);
+            if (after - before_val).abs() > 1e-4 {
+                emit(source, 3, after);
+            }
+        } else if was_down && !button_down(held, source) {
+            emit(source, 11, 0.0);
+        }
+    }
+}
+
+fn send_pad_event(object: usize, handler: Handler, source: u32, kind: u32, value: f32) {
+    let ev = Event { source: source << 8 | PAD_INDEX, kind, extra: 0, value };
+    // SAFETY: the title's event buffer handler locks object+8 internally before appending.
+    unsafe { handler(object as *mut c_void, &ev) };
+}
+
+/// Releases all held translated pad sources (e.g. when entering/exiting a menu so movement doesn't stick).
+fn release_all_held() {
+    let target = *RELAY_TARGET.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((object, handler)) = target else { return };
+    let mut held = HELD.lock().unwrap_or_else(|p| p.into_inner());
+    let keys: Vec<u32> = held.iter().map(|h| h.key).collect();
+    for k in keys {
+        apply_release(&mut held, k, |src, kind, val| send_pad_event(object, handler, src, kind, val));
+    }
+}
+
+/// Re-evaluates held keys when play context changes (e.g. holding W while getting into a car).
+fn retranslate_held(base: usize, in_menu: bool) {
+    let target = *RELAY_TARGET.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((object, handler)) = target else { return };
+    let mut held = HELD.lock().unwrap_or_else(|p| p.into_inner());
+    if held.is_empty() {
+        return;
+    }
+    let snapshot: Vec<HeldKey> = held.clone();
+    let map = KEY_MAP.lock().unwrap_or_else(|p| p.into_inner());
+    for old in snapshot {
+        let Some((_, play, menu)) = map.entries.iter().find(|(k, _, _)| *k == old.key) else { continue };
+        let actions: Vec<u32> = if in_menu { menu.iter().chain(play.iter()).copied().collect() } else { play.clone() };
+        let Some((_, source, axis, value)) = resolve_active_source(base, &actions) else { continue };
+        if source != old.source || axis != old.axis || (value - old.value).abs() > 1e-4 {
+            apply_release(&mut held, old.key, |src, kind, val| send_pad_event(object, handler, src, kind, val));
+            apply_press(&mut held, old.key, source, axis, value, |src, kind, val| {
+                send_pad_event(object, handler, src, kind, val)
+            });
+        }
+    }
+}
 
 fn parse_key_actions(spec: &str) -> Vec<KeyEntry> {
     let hex = |x: &str| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
@@ -180,12 +465,16 @@ fn parse_key_actions(spec: &str) -> Vec<KeyEntry> {
 }
 
 /// RAGE's name hash (Jenkins one-at-a-time, lower case): the actions' ids.
-fn joaat(name: &str) -> u32 {
+const fn joaat(name: &str) -> u32 {
+    let bytes = name.as_bytes();
     let mut h: u32 = 0;
-    for c in name.bytes().map(|c| c.to_ascii_lowercase()) {
-        h = h.wrapping_add(u32::from(c));
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i].to_ascii_lowercase();
+        h = h.wrapping_add(c as u32);
         h = h.wrapping_add(h << 10);
         h ^= h >> 6;
+        i += 1;
     }
     h = h.wrapping_add(h << 3);
     h ^= h >> 11;
@@ -205,6 +494,7 @@ fn key_code(name: &str) -> Option<u32> {
         "leftbracket" => 0xdb, "rightbracket" => 0xdd, "semicolon" => 0xba, "quote" => 0xde, "slash" => 0xbf,
         "backslash" => 0xdc, "backquote" => 0xc0, "leftclick" => 0x7c, "rightclick" => 0x7d,
         "middleclick" => 0x7e, "mouse4" => 0x7f, "mouse5" => 0x80,
+        "wheelup" => 0x81, "wheeldown" => 0x82,
         _ => 0,
     };
     if named != 0 {
@@ -244,10 +534,48 @@ fn is_axis(source: u32) -> bool {
     matches!(source, 0x3009 | 0x300c | 0x3010..=0x3013)
 }
 
+/// Finds the first active action in `actions` that has a pad binding record (`0x3000..=0x3013`),
+/// returning `(action_id, pad_source, is_axis, value)`.
+fn resolve_active_source(base: usize, actions: &[u32]) -> Option<(u32, u32, bool, f32)> {
+    // SAFETY (both): the title's action array and its objects, read only.
+    let read32 = |at: usize| unsafe { std::ptr::read_volatile(at as *const u32) };
+    let read = |at: usize| unsafe { std::ptr::read_volatile(at as *const usize) };
+    let count = read32(base + ACTION_COUNT) as usize;
+    let array = read(base + ACTION_ARRAY);
+    if count == 0 || array == 0 {
+        return None;
+    }
+    for &id in actions {
+        let Some(action) = (0..count).map(|i| array + i * 0x160).find(|&a| read32(a + 0x128) == id) else {
+            continue;
+        };
+        if read32(action + 0x158) & 2 == 0 || read32(action + 4) == 0 || read(action + 8) == 0 {
+            continue;
+        }
+        let entry = read(read(action + 8));
+        let desc = if entry == 0 { 0 } else { read(entry + 0x10) };
+        let rec_count = if desc == 0 { 0 } else { read32(desc + 4) as usize };
+        if rec_count == 0 {
+            continue;
+        }
+        let records = read(desc + 8);
+        for r in 0..rec_count {
+            let rec = records + r * 12;
+            let (source, flags) = (read32(rec), read32(rec + 8) & 0xff);
+            if !(0x3000..=0x3013).contains(&source) {
+                continue;
+            }
+            let axis = is_axis(source);
+            let value = if axis && flags == 1 { -1.0 } else { 1.0 };
+            return Some((id, source, axis, value));
+        }
+    }
+    None
+}
+
 /// A key event, as the action it stands for: of the key's actions, the first the title has active
-/// right now (+0x158 bit 2), sent as that action's own pad source (its first binding record) to
-/// the title's buffer, as the pad would send it. The title's contexts decide what the key does
-/// (on foot, in a car, in a menu); its action table is not changed.
+/// right now (+0x158 bit 2), sent as that action's own pad source to the title's buffer, combining
+/// simultaneous held keys cleanly (so W+S / A+D never cancel each other dead on release).
 ///
 /// # Safety
 /// On the title's thread, inside the keyboard's event broadcast.
@@ -268,58 +596,95 @@ unsafe fn translate(me: &Relay, e: &Event) {
     let in_menu = {
         let count = read32(base + ACTION_COUNT) as usize;
         let array = read(base + ACTION_ARRAY);
-        (0..count).map(|i| array + i * 0x160).find(|&a| read32(a + 0x128) == PLAY_ACTION).is_some_and(|a| read32(a + 0x158) & 2 == 0)
+        (0..count)
+            .map(|i| array + i * 0x160)
+            .find(|&a| read32(a + 0x128) == PLAY_ACTION)
+            .is_some_and(|a| read32(a + 0x158) & 2 == 0)
     };
     // In play only the play actions; in a menu the menu actions first.
     let actions: Vec<u32> = if in_menu { menu.iter().chain(play.iter()).copied().collect() } else { play };
+    let in_veh = !in_menu && IN_VEHICLE.load(Ordering::Relaxed);
     let send = |source: u32, kind: u32, value: f32| {
-        let ev = Event { source: source << 8 | PAD_INDEX, kind, extra: 0, value };
+        let final_val = if kind == 3 {
+            if in_veh && source == 0x3010 {
+                STEER_RAMP.lock().unwrap_or_else(|p| p.into_inner()).set_target(
+                    value,
+                    std::time::Instant::now(),
+                    SteerRamp::configured_ms(),
+                )
+            } else if !in_menu && !in_veh && WALKING.load(Ordering::Relaxed) && matches!(source, 0x3010 | 0x3011) {
+                value * WALK_SCALE
+            } else {
+                value
+            }
+        } else {
+            value
+        };
+        let ev = Event { source: source << 8 | PAD_INDEX, kind, extra: 0, value: final_val };
         // SAFETY: the title's handler with its own object and an event of the pad's form.
         unsafe { (me.handler)(me.object, &ev) };
     };
     let mut held = HELD.lock().unwrap_or_else(|p| p.into_inner());
+    // Handle Vertex Walk meta-actions (on-foot speed scaling for LX/LY).
+    if !in_menu && !in_veh {
+        if actions.first().copied() == Some(WALK_TOGGLE) {
+            if e.kind == 7 {
+                let walking = !WALKING.load(Ordering::Relaxed);
+                WALKING.store(walking, Ordering::Relaxed);
+                for src in [0x3010u32, 0x3011] {
+                    let v = axis_value(&held, src);
+                    if v.abs() > 1e-4 {
+                        send(src, 3, v);
+                    }
+                }
+            }
+            return;
+        }
+        if actions.first().copied() == Some(WALK_HOLD) {
+            if matches!(e.kind, 7 | 11) {
+                WALKING.store(e.kind == 7, Ordering::Relaxed);
+                for src in [0x3010u32, 0x3011] {
+                    let v = axis_value(&held, src);
+                    if v.abs() > 1e-4 {
+                        send(src, 3, v);
+                    }
+                }
+            }
+            return;
+        }
+    }
     match e.kind {
         7 => {
-            if held.iter().any(|h| h.0 == key) {
+            if held.iter().any(|h| h.key == key) {
                 return;
             }
-            let count = read32(base + ACTION_COUNT) as usize;
-            let array = read(base + ACTION_ARRAY);
-            for &id in &actions {
-                let Some(action) = (0..count).map(|i| array + i * 0x160).find(|&a| read32(a + 0x128) == id) else {
-                    continue;
-                };
-                if read32(action + 0x158) & 2 == 0 || read32(action + 4) == 0 || read(action + 8) == 0 {
-                    continue;
+            if let Some((id, source, axis, value)) = resolve_active_source(base, &actions) {
+                if !in_menu {
+                    if matches!(id, OPEN_WHEEL_ACTION | OPEN_EMOTE_WHEEL | SELECT_ITEM_WHEEL) {
+                        *WHEEL_HOLD.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some((key, std::time::Instant::now(), std::time::Duration::ZERO));
+                        IN_WHEEL.store(true, Ordering::Relaxed);
+                    } else if id == VEH_RADIO_ACTION && in_veh {
+                        *WHEEL_HOLD.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some((key, std::time::Instant::now(), std::time::Duration::from_millis(160)));
+                    }
                 }
-                let entry = read(read(action + 8));
-                let desc = if entry == 0 { 0 } else { read(entry + 0x10) };
-                if desc == 0 || read32(desc + 4) == 0 {
-                    continue;
-                }
-                let records = read(desc + 8);
-                let (source, flags) = (read32(records), read32(records + 8) & 0xff);
-                if !(0x3000..=0x3013).contains(&source) {
-                    continue;
-                }
-                let axis = is_axis(source);
-                let value = if axis && flags == 1 { -1.0 } else { 1.0 };
-                send(source, if axis { 3 } else { 7 }, value);
-                held.push((key, source, axis));
+                apply_press(&mut held, key, source, axis, value, send);
                 static SAID: AtomicU64 = AtomicU64::new(0);
                 if SAID.fetch_add(1, Ordering::Relaxed) < 200 {
                     tracing::info!(target: "keyboard_events", key = format_args!("{key:#x}"), action = format_args!("{id:#010x}"), source = format_args!("{source:#x}"), value, "key sent as its active action's pad source");
                 }
-                return;
             }
         }
         11 => {
-            held.retain(|&(k, source, axis)| {
-                if k == key {
-                    if axis { send(source, 3, 0.0) } else { send(source, 11, 0.0) }
+            {
+                let mut wh = WHEEL_HOLD.lock().unwrap_or_else(|p| p.into_inner());
+                if wh.is_some_and(|(k, _, _)| k == key) {
+                    *wh = None;
+                    IN_WHEEL.store(false, Ordering::Relaxed);
                 }
-                k != key
-            });
+            }
+            apply_release(&mut held, key, send);
         }
         _ => {}
     }
@@ -357,6 +722,14 @@ unsafe extern "system" fn activate(action: usize) {
     unsafe { std::mem::transmute::<usize, unsafe extern "system" fn(usize)>(original)(action) }
 }
 
+/// Standard 0x60-byte binding entry vtable (`0x1465B4C80`) and the title's own parallel-array
+/// resize helpers (from `0x141405630` / `0x141405790`). Growing `desc->records` without also
+/// growing `entry+0x28`, `entry+0x48`, and `action+0xD0` overwrote past the 0x60-byte entry object.
+const ENTRY_VTABLE: usize = 0x65b_4c80;
+const ENTRY_RESIZE_28: usize = 0x140_5720;
+const ENTRY_GROW_48: usize = 0x575_af60;
+const ACTION_GROW_D0: usize = 0x575_ae80;
+
 /// # Safety
 /// `action` is one of the title's input actions, being activated on this thread.
 unsafe fn add_to(action: usize) {
@@ -370,14 +743,14 @@ unsafe fn add_to(action: usize) {
         return;
     }
     let entry = read(read(action + 8));
-    if entry == 0 || read(entry + 0x10) == 0 {
+    let base = IMAGE.load(Ordering::Relaxed);
+    if entry == 0 || read(entry) != base + ENTRY_VTABLE || read(entry + 0x10) == 0 {
         return;
     }
     let desc = read(entry + 0x10);
     let n = read32(desc + 4) as usize;
     let old = read(desc + 8);
     let mut records: Vec<u32> = (0..n * 3).map(|i| read32(old + 4 * i)).collect();
-    let base = IMAGE.load(Ordering::Relaxed);
     let (absent, missing): (Vec<(u32, u32)>, Vec<(u32, u32)>) = wanted
         .into_iter()
         .filter(|&(key, _)| !records.chunks(3).any(|r| r[0] == key))
@@ -394,6 +767,7 @@ unsafe fn add_to(action: usize) {
     for &(key, flags) in &missing {
         records.extend([key, 0xf000, flags]);
     }
+    let new_n = records.len() / 3;
     // SAFETY: the title's allocator, called on the title's thread as its own code calls it.
     let block = unsafe {
         std::mem::transmute::<usize, unsafe extern "system" fn(usize, usize) -> *mut u32>(base + ALLOCATE)(
@@ -404,17 +778,51 @@ unsafe fn add_to(action: usize) {
     if block.is_null() {
         return;
     }
-    // SAFETY: a block of `records.len()` u32 just allocated; then the descriptor: records first,
-    // then count and capacity. The old block is left to the title.
+    // SAFETY: install the new records array, then resize the three parallel per-record arrays
+    // (`entry+0x28`, `entry+0x48`, and `action+0xD0`) using the title's own helpers so evaluator
+    // `0x140EE8C00` never writes past the 0x60-byte entry object.
     unsafe {
         std::ptr::copy_nonoverlapping(records.as_ptr(), block, records.len());
         std::ptr::write_volatile((desc + 8) as *mut usize, block as usize);
-        std::ptr::write_volatile((desc + 4) as *mut u32, (records.len() / 3) as u32);
-        std::ptr::write_volatile(desc as *mut u32, (records.len() / 3) as u32);
+        std::ptr::write_volatile((desc + 4) as *mut u32, new_n as u32);
+        std::ptr::write_volatile(desc as *mut u32, new_n as u32);
+
+        // 1. Parallel array entry+0x28 (8B per record, initialized to 0x000F000FF).
+        std::mem::transmute::<usize, unsafe extern "system" fn(usize, u32)>(base + ENTRY_RESIZE_28)(
+            entry,
+            new_n as u32,
+        );
+
+        // 2. Parallel array entry+0x48 (8B per record, initialized to *(owner + 0x10)).
+        let old_4c = read32(entry + 0x4c) as usize;
+        let cap_48 = read32(entry + 0x48) as usize;
+        if new_n > cap_48 {
+            std::mem::transmute::<usize, unsafe extern "system" fn(usize, u32)>(base + ENTRY_GROW_48)(
+                entry + 0x48,
+                new_n as u32,
+            );
+        }
+        let arr_50 = read(entry + 0x50);
+        if arr_50 != 0 {
+            let owner = read(entry + 8);
+            let fill = if owner != 0 { u64::from(read32(owner + 0x10)) } else { 0 };
+            for i in old_4c..new_n {
+                std::ptr::write_volatile((arr_50 + i * 8) as *mut u64, fill);
+            }
+            std::ptr::write_volatile((entry + 0x4c) as *mut u32, new_n as u32);
+        }
+
+        // 3. Action-level scratch array action+0xD0 sized to max(entry+0x2C).
+        if new_n > read32(action + 0xd4) as usize {
+            std::mem::transmute::<usize, unsafe extern "system" fn(usize, u32)>(base + ACTION_GROW_D0)(
+                action + 0xd0,
+                new_n as u32,
+            );
+        }
     }
     let times = ADDED.fetch_add(1, Ordering::Relaxed) + 1;
     if times <= 64 || times.is_power_of_two() {
-        tracing::info!(target: "keyboard_events", action = format_args!("{id:#010x}"), keys = ?missing, records = records.len() / 3, times, "keyboard bindings added at activation");
+        tracing::info!(target: "keyboard_events", action = format_args!("{id:#010x}"), keys = ?missing, records = new_n, times, "keyboard bindings added at activation (parallel arrays resized)");
     }
 }
 
@@ -561,10 +969,11 @@ pub fn start(base: usize) {
             tracing::warn!(target: "keyboard_events", "the keyboard already has a subscriber; left alone");
             return;
         }
+        let handler_fn: Handler = unsafe { std::mem::transmute::<usize, Handler>(handler) };
+        *RELAY_TARGET.lock().unwrap_or_else(|p| p.into_inner()) = Some((object, handler_fn));
         let me = Box::leak(Box::new(Relay {
             object: object as *mut c_void,
-            // SAFETY: the title's handler, checked above.
-            handler: unsafe { std::mem::transmute::<usize, Handler>(handler) },
+            handler: handler_fn,
             forward,
         }));
         // A node as the title makes them: object, handler, next (null ends the list), and room.
@@ -600,10 +1009,80 @@ mod tests {
 
     #[test]
     fn native_keys_lines_parse() {
-        let map = parse_native_keys("# c\nW = INPUT_VEH_ACCELERATE, INPUT_MOVE_UP_ONLY\nLeftClick = INPUT_ATTACK | INPUT_JUMP\nF5 = INPUT_X\nbad\n");
+        let map = parse_native_keys("# c\nW = INPUT_VEH_ACCELERATE, INPUT_MOVE_UP_ONLY\nLeftClick = INPUT_ATTACK | INPUT_JUMP\nWheelUp = INPUT_GAME_MENU_UP\nWheelDown = INPUT_GAME_MENU_DOWN\nF5 = INPUT_X\nbad\n");
         assert_eq!(map[0], (0x57, vec![0x5b9f_d4e2, 0x8fd0_15d8], vec![]));
         assert_eq!(map[1], (0x7c, vec![joaat("INPUT_ATTACK")], vec![0xd9d0_e1c0]));
-        assert_eq!(map[2].0, 0x74);
-        assert_eq!(map.len(), 3);
+        assert_eq!(map[2].0, 0x81);
+        assert_eq!(map[3].0, 0x82);
+        assert_eq!(map[4].0, 0x74);
+        assert_eq!(map.len(), 5);
+    }
+
+    #[test]
+    fn opposing_axis_keys_combine_and_restore_on_release() {
+        let mut held = Vec::new();
+        let mut events = Vec::new();
+        let mut emit = |s, k, v| events.push((s, k, v));
+        // Hold W (LY = -1.0)
+        apply_press(&mut held, b'W' as u32, 0x3011, true, -1.0, &mut emit);
+        // Tap S (LY = +1.0) while W stays held -> net 0.0
+        apply_press(&mut held, b'S' as u32, 0x3011, true, 1.0, &mut emit);
+        // Release S while W stays held -> immediately restores -1.0!
+        apply_release(&mut held, b'S' as u32, &mut emit);
+        // Release W -> 0.0
+        apply_release(&mut held, b'W' as u32, &mut emit);
+        assert_eq!(
+            events,
+            vec![
+                (0x3011, 3, -1.0),
+                (0x3011, 3, 0.0),
+                (0x3011, 3, -1.0),
+                (0x3011, 3, 0.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_button_stays_pressed_until_last_key_releases() {
+        let mut held = Vec::new();
+        let mut events = Vec::new();
+        let mut emit = |s, k, v| events.push((s, k, v));
+        apply_press(&mut held, 0x20, 0x3006, false, 1.0, &mut emit);
+        apply_press(&mut held, 0x0d, 0x3006, false, 1.0, &mut emit);
+        apply_release(&mut held, 0x20, &mut emit);
+        apply_release(&mut held, 0x0d, &mut emit);
+        assert_eq!(events, vec![(0x3006, 7, 1.0), (0x3006, 11, 0.0)]);
+    }
+
+    #[test]
+    fn steer_ramp_starts_with_bite_ramps_smoothly_and_snaps_back_on_release() {
+        let mut ramp = SteerRamp::new(100.0);
+        let t0 = std::time::Instant::now();
+        // Press D (+1.0) -> starts at INITIAL_BITE (0.28)
+        let v0 = ramp.set_target(1.0, t0, 100.0);
+        assert!((v0 - SteerRamp::INITIAL_BITE).abs() < 1e-4);
+        assert!(ramp.active);
+        // Halfway through ramp (~50ms) -> midway between 0.28 and 1.0
+        let v1 = ramp.tick(t0 + std::time::Duration::from_millis(50)).unwrap();
+        assert!(v1 > 0.6 && v1 < 0.7);
+        // After full ramp -> reaches 1.0 and deactivates
+        let v2 = ramp.tick(t0 + std::time::Duration::from_millis(120)).unwrap();
+        assert!((v2 - 1.0).abs() < 1e-4);
+        assert!(!ramp.active);
+        // Release D (0.0) -> snaps immediately to 0.0 with no lag
+        let v3 = ramp.set_target(0.0, t0 + std::time::Duration::from_millis(140), 100.0);
+        assert_eq!(v3, 0.0);
+        assert!(!ramp.active);
+        // ramp_ms = 0 disables ramping (instant full lock)
+        let v4 = ramp.set_target(-1.0, t0 + std::time::Duration::from_millis(150), 0.0);
+        assert_eq!(v4, -1.0);
+        assert!(!ramp.active);
+    }
+
+    #[test]
+    fn walk_meta_actions_hash_consistently() {
+        let map = parse_native_keys("N = VERTEX_WALK_TOGGLE\nRightAlt = VERTEX_WALK_HOLD\n");
+        assert_eq!(map[0], (0x4e, vec![WALK_TOGGLE], vec![]));
+        assert_eq!(map[1], (0xa5, vec![WALK_HOLD], vec![]));
     }
 }

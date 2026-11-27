@@ -2042,7 +2042,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
     let mode = title_used_mode();
     let physical = if mode == TitleUsed::Title {
-        physical().pages.len() * PAGE
+        page_table().pages.len() * PAGE
     } else {
         0
     };
