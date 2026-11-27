@@ -1,0 +1,18 @@
+[package]
+name = "victory-glyphs"
+description = "Keyboard key caps in place of the title's pad button glyphs: a plugin the engine loads (VICTORY_GLYPHS_PLUGIN)."
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Not part of the main workspace: the engine only loads the DLL by its path.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# MIT as well (crates/victory-bc): BC1-BC5 and BC7 decoding, BC1-BC4 and BC7
+# encoding.
+victory-bc = { path = "../../crates/victory-bc" }
