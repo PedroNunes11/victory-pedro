@@ -1732,6 +1732,51 @@ impl Staging {
                 return;
             }
         }
+        if crate::glyphs::on() {
+            self.glyphs(tiled);
+        }
+    }
+
+    /// Offers the levels just detiled to the glyphs plugin and dump
+    /// (`crate::glyphs`, off unless asked for): a small 2D texture of one
+    /// slice, whose largest level held is hashed; levels the plugin changed
+    /// are written over the staging buffer's.
+    fn glyphs(&self, tiled: &[u8]) {
+        let desc = &self.layout.desc;
+        if self.on_demand
+            || self.layout.slices != 1
+            || desc.dimension != victory_formats::texture::Dimension::Tex2d
+            || desc.samples > 1
+            || self.footprints.is_empty()
+        {
+            return;
+        }
+        let dxgi = self.footprints[0].Footprint.Format.0 as u32;
+        let (mip, _) = self.part(0);
+        let size = [(desc.width >> mip).max(1), (desc.height >> mip).max(1)];
+        let Some(format) = crate::glyphs::candidate(dxgi, size[0], size[1], desc.element_bytes) else {
+            return;
+        };
+        let mut read = |i: u32, out: &mut [u8], pitch: usize| {
+            let (mip, slice) = self.part(i as usize);
+            let len = out.len();
+            self.layout.detile(tiled, mip, slice, out, pitch, len).is_ok()
+        };
+        let mut write = |i: u32, bytes: &[u8], pitch: usize| {
+            let Some(footprint) = self.footprints.get(i as usize) else { return };
+            let to_pitch = footprint.Footprint.RowPitch as usize;
+            let row = pitch.min(to_pitch);
+            for r in 0..(self.rows[i as usize] as usize).min(bytes.len() / pitch.max(1)) {
+                let at = footprint.Offset as usize + r * to_pitch;
+                if at + row > self.bytes as usize {
+                    break;
+                }
+                // SAFETY: inside the mapped staging buffer (its `bytes`), the
+                // subresource's own rows.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().add(r * pitch), self.data.add(at), row) };
+            }
+        };
+        crate::glyphs::detiled(format, dxgi, size, self.footprints.len() as u32, &mut read, &mut write);
     }
 }
 

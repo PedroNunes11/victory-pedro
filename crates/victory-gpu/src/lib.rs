@@ -40,6 +40,8 @@ pub mod device;
 pub mod dlss;
 #[cfg(windows)]
 mod draw;
+#[cfg(windows)]
+mod glyphs;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;

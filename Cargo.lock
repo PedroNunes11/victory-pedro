@@ -649,6 +649,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-bc"
+version = "0.1.0"
+
+[[package]]
 name = "victory-core"
 version = "0.1.0"
 dependencies = [
@@ -680,6 +684,7 @@ dependencies = [
  "blake3",
  "tempfile",
  "tracing",
+ "victory-bc",
  "victory-core",
  "victory-formats",
  "victory-pipeline",

@@ -1,0 +1,15 @@
+[package]
+name = "victory-bc"
+description = "Block-compressed (BC1-BC5, BC7) and 8-bit texel codecs: decoding to RGBA and encoding back, for texture dumps and the glyphs plugin."
+version = "0.1.0"
+edition = "2024"
+# MIT, not the workspace's licence: the glyphs plugin (plugins/glyphs, MIT)
+# links it too. Version, edition and licence are its own (not inherited), so
+# that crate can depend on this one from its own workspace.
+license = "MIT"
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
