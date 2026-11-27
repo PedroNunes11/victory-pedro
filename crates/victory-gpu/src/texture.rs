@@ -98,45 +98,8 @@ const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
 /// Staging buffers taken from the spare ones, and made, since the start;
 /// then those freed because the spare ones already held the most bytes, and
 /// their bytes; then those made too big to be pooled, and their bytes; then
-/// the bytes of those made (pooled sizes); then those evicted to make room
-/// ([`spare_evict`]), and their bytes.
-pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
-
-/// Whether a staging buffer let go while the spare ones are full takes the
-/// place of spare ones of the size holding the most bytes, instead of being
-/// freed. With the pool full, the buffers let go in a streaming burst were
-/// freed (10.2 GB in 55 s at 1024 MB, item2-spare2, 76% of them of pooled
-/// sizes) while the pool held sizes nobody asked for again.
-/// `VICTORY_STAGING_SPARE_EVICT=1`: evict (default off: freed, as before).
-pub(crate) fn spare_evict() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_SPARE_EVICT").is_some_and(|v| v == "1"))
-}
-
-/// Takes spare entries out of `map` (whose bytes are `bytes`) until `need`
-/// more bytes fit under `most`, each time from the size holding the most
-/// bytes, oldest entry first; returns them with their sizes. Takes nothing
-/// when `need` alone is more than `most`.
-fn make_room<T>(map: &mut std::collections::BTreeMap<u64, Vec<T>>, bytes: &mut u64, need: u64, most: u64) -> Vec<(u64, T)> {
-    let mut out = Vec::new();
-    if need > most {
-        return out;
-    }
-    while *bytes + need > most {
-        let Some(size) = map
-            .iter()
-            .filter(|(_, v)| !v.is_empty())
-            .max_by_key(|(size, v)| **size * v.len() as u64)
-            .map(|(size, _)| *size)
-        else {
-            break;
-        };
-        let v = map.get_mut(&size).expect("the size just found");
-        out.push((size, v.remove(0)));
-        *bytes -= size;
-    }
-    out
-}
+/// the bytes of those made (pooled sizes).
+pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// The most bytes of staging buffers kept spare. In a streaming burst the
 /// title's textures let go of 0.5 to 1.2 GB of staging at once, more than
@@ -318,6 +281,14 @@ struct Through {
     )>,
 }
 
+/// Whether [`alias`] owes its copy once per list and source rather than on
+/// the view's first use in the list (`VICTORY_ALIAS_PER_SOURCE=1`, live, off
+/// by default; see [`alias`]).
+fn alias_per_source() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("ALIAS_PER_SOURCE", 0);
+    ON.on()
+}
+
 /// The most levels times layers [`alias`] copies (a cube of nine levels).
 const ALIAS_PARTS: u32 = 54;
 
@@ -440,7 +411,15 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    // Whether the copy from `source` is owed in this list. Not the view's
+    // first use: an upload of the same view from title memory earlier in
+    // the list takes that, and the copy was then skipped, leaving the view
+    // with the title memory's bytes instead of what the host wrote (fxceless
+    // fork commit 19a45d1, written anew here; see THIRD_PARTY.md). The view
+    // is still noted as used, as before, so a later upload of it in the list
+    // stays out.
+    let used_first = list.first_use(placed as usize);
+    let first = if alias_per_source() { list.alias_owed(placed as usize, source as usize) } else { used_first };
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -665,23 +644,12 @@ impl Drop for Staging {
         if self.pooled != 0 {
             let mut evicted = Vec::new();
             let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-            if all.1 + self.pooled > spare_most() && spare_evict() {
-                let (map, bytes) = &mut *all;
-                evicted = make_room(map, bytes, self.pooled, spare_most());
-            }
             if all.1 + self.pooled <= spare_most() {
                 all.1 += self.pooled;
                 all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
             } else {
                 SPARE_STATS[2].fetch_add(1, Relaxed);
                 SPARE_STATS[3].fetch_add(self.pooled, Relaxed);
-            }
-            drop(all);
-            // The evicted buffers are freed outside the pool's lock.
-            for (size, spare) in evicted {
-                SPARE_STATS[7].fetch_add(1, Relaxed);
-                SPARE_STATS[8].fetch_add(size, Relaxed);
-                drop(spare);
             }
         }
     }
@@ -1542,12 +1510,34 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     Some((at as u64, len as u64))
 }
 
+/// The bytes [`fingerprint`] reads of a texture over 48 KiB: this many at
+/// its start, its middle and its end.
+const PRINT_WINDOW: u64 = 16 << 10;
+
+/// Whether [`fingerprint`] of `[at, at + len)` reads any byte of
+/// `[start, end)`. A write that lands wholly where it reads nothing cannot
+/// change it: a texture uploaded before such a write and looked at against
+/// its fingerprint after it keeps the bytes from before (run 432: a face's
+/// middle levels, filled by DirectStorage after the upload, showed what the
+/// pages held before until `VICTORY_PAGE_WRITES=1` uploaded it again).
+pub(crate) fn fingerprint_sees(at: u64, len: u64, start: u64, end: u64) -> bool {
+    let (start, end) = (start.max(at), end.min(at.saturating_add(len)));
+    if start >= end {
+        return false;
+    }
+    if len <= 3 * PRINT_WINDOW {
+        return true;
+    }
+    [0, (len / 2) & !0xfff, len - PRINT_WINDOW].iter().any(|&w| start < at + w + PRINT_WINDOW && at + w < end)
+}
+
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
 /// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
 /// (a texture streams in whole mips; the small ones lie first). Read
-/// through the kernel, so pages not there count as zeros.
+/// through the kernel, so pages not there count as zeros. A write
+/// elsewhere goes unseen ([`fingerprint_sees`]).
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
-    const WINDOW: usize = 16 << 10;
+    const WINDOW: usize = PRINT_WINDOW as usize;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
@@ -2206,9 +2196,35 @@ mod title_memory_tests {
         }
     }
 
-    /// A title-written texture (e.g. a ring-buffered movie frame) that is
-    /// updated by the CPU after a clean submission must upload on that same
-    /// submission, not a use late.
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::fingerprint_sees;
+
+    /// A texture of 48 KiB or less is read whole; a larger one at 16 KiB at
+    /// its start, its middle (rounded down to a page) and its end, and a
+    /// write between them goes unseen.
+    #[test]
+    fn the_fingerprint_sees_only_its_windows() {
+        let at = 0x10_0000;
+        assert!(fingerprint_sees(at, 48 << 10, at + (20 << 10), at + (21 << 10)));
+        let len = 16 << 20;
+        assert!(fingerprint_sees(at, len, at, at + 1), "the start");
+        assert!(fingerprint_sees(at, len, at + (16 << 10) - 1, at + (16 << 10)));
+        assert!(!fingerprint_sees(at, len, at + (16 << 10), at + (4 << 20)), "the levels after the small ones");
+        assert!(fingerprint_sees(at, len, at + (8 << 20), at + (8 << 20) + 1), "the middle");
+        assert!(!fingerprint_sees(at, len, at + (8 << 20) + (16 << 10), at + (12 << 20)));
+        assert!(fingerprint_sees(at, len, at + len - 1, at + len + (1 << 20)), "the end, the write past it");
+        assert!(!fingerprint_sees(at, len, at + len, at + len + 4096), "a write wholly past the texture");
+        assert!(!fingerprint_sees(at, len, at - 4096, at), "or wholly before it");
+    }
+}
+
+#[cfg(test)]
+mod hash_tests {
+    /// Every hash a staging texture keeps comes from `crate::texhash::content_hash`, which
+    /// `VICTORY_TEXTURE_FAST_HASH` switches, so that the next refresh compares like with like.
+    /// `refresh_ahead` kept a BLAKE3 of its own: with the fast hash on it never matched, and
+    /// the first refresh after an upload ahead detiled the texture again.
     #[test]
     fn a_changed_texture_uploads_on_the_same_submission() {
         let Some(host) = crate::host::host() else {

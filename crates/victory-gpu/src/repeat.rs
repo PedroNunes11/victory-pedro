@@ -74,6 +74,20 @@ impl Frames {
 
 static FRAMES: Mutex<Option<Frames>> = Mutex::new(None);
 
+/// Since the last line: indirect calls, and of them those right after a
+/// draw or dispatch of the same state in their list.
+static INDIRECT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// An indirect call is about to run; `same`: the list's last draw or
+/// dispatch had its state.
+pub(crate) fn indirect(same: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    INDIRECT[0].fetch_add(1, Relaxed);
+    if same {
+        INDIRECT[1].fetch_add(1, Relaxed);
+    }
+}
+
 fn frames() -> std::sync::MutexGuard<'static, Option<Frames>> {
     FRAMES.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -97,6 +111,12 @@ pub(crate) fn line(frames: f64) {
         return;
     }
     let share = |n: u64| 100.0 * n as f64 / c[0] as f64;
+    let [calls, same] = [0, 1].map(|i| INDIRECT[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "indirect calls per frame (VICTORY_REPEAT_CENSUS): {:.0}, of them {:.0} right after one of the same state in          their list",
+        calls as f64 / frames,
+        same as f64 / frames
+    );
     tracing::info!(
         "draws and dispatches per frame (VICTORY_REPEAT_CENSUS): {:.0}; found in one of the last {BACK} frames: \
          the whole {:.1}%, the shape {:.1}%; with the shape, the same tables {:.1}%, constants {:.1}%, root views \

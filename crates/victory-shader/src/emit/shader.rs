@@ -26,6 +26,35 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// The [`SLOT_STRIDES`] dword of a slot that holds a constant buffer view,
+/// with [`constant_marks`] (a stride no buffer has). A program reads a slot
+/// it picks from the heap as a constant buffer only where this mark is; a
+/// slot whose dword is 0 holds neither a buffer nor a constant buffer, and
+/// the read gives zeros. Without it a texture's descriptor read as a
+/// constant buffer is taken as a buffer's: the meshlet culling `_Prev`
+/// passes then read whatever lies at a made-up address. Port of
+/// fxceless/victory-fork pull request 1216 (GamingRipperDoc) by way of
+/// rorodev6/victory-nvidia-megafork 77e13a9 (GPL-3.0, THIRD_PARTY.md).
+pub const SLOT_STRIDE_CONSTANT: u32 = u32::MAX;
+
+/// Whether [`SLOT_STRIDE_CONSTANT`] is in use (`VICTORY_CONSTANT_MARKS=1`,
+/// off by default: not yet run in the game). Read once, by the host and
+/// the translator alike; part of the shader cache key (the build script
+/// lists every `VICTORY_` switch the crate reads).
+pub fn constant_marks() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_CONSTANT_MARKS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CONSTANT_MARKS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`constant_marks`], for its thread only.
+    pub(super) static TEST_CONSTANT_MARKS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
 
 /// The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`] of a shader
 /// that reads the address out of a buffer descriptor it picks from the view
@@ -97,26 +126,20 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
-/// `RootType::Other` code of a user-data dword the host sets: the number of
-/// the first thread group in x. The console dispatches any number of groups
-/// in one dimension; the host at most 65,535, so a larger dispatch runs in
-/// parts, each with the groups before it here (0 in a dispatch that is not
-/// in parts). Asked for by compute programs that are told the x number
-/// alone (the one-dimensional ones).
-pub const USER_GROUP_BASE: u32 = 0x104;
-/// `RootType::Other` code of a user-data dword the host computes: the
-/// raw thread count along axis `dword` (0 = X, 1 = Y, 2 = Z) of a
-/// `DispatchX` call with `USE_THREAD_DIMENSIONS` (`flags & 0x20`), or 0
-/// for a normal thread-group dispatch (all threads in every group active).
-pub const USER_DISPATCH_THREADS: u32 = 0x105;
-/// `RootType::Other` code of a user-data dword the host computes, read by
-/// a program with a ray-tracing node test (`image_bvh_intersect_ray`,
-/// `image_bvh64_intersect_ray`): while 0, every node test answers no hit
-/// without reading the node (a box node enters no child, any other node
-/// is a triangle missed). The title's passes run whether or not anything
-/// built the structures, and would otherwise walk whatever bytes lie where
-/// they would be. After victory-fork pull request 994 (PiloteCode).
-pub const USER_STRUCTURES: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host computes, with
+/// [`super::Options::cbv_row_shift`]: the rows (0 to 15) by which the
+/// constant buffer view the host binds for the root CBV of root parameter
+/// `slot` begins before the title's address (the host places it on the
+/// 256 bytes below; the title's views begin on any 16). The shader adds
+/// it to every row read through that view.
+pub const USER_CBV_SHIFT: u32 = 0x104;
+/// The root SRV `t<SLOT_CBV_SHIFTS>` in [`ROOT_CBV_SPACE`] of a shader made
+/// with [`super::Options::cbv_row_shift`] that reads constant buffer views
+/// of the view heap: a raw buffer the host keeps per view heap, one dword
+/// per heap slot, the rows (0 to 15) by which the view there begins before
+/// the title's constants (0 for every slot that is not such a view). The
+/// shader adds it to every row read through the view.
+pub const SLOT_CBV_SHIFTS: u8 = 250;
 
 /// The root SRV `t<SLOT_VIEW_MARKS>` in [`ROOT_CBV_SPACE`] of a shader that
 /// marks the pages it writes through unordered buffer views (`emit`,
@@ -134,10 +157,11 @@ pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
-    pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
+    pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -216,22 +240,16 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
-    /// The root UAV slots an emitted operation other than a read uses (a
-    /// store, an atomic, anything not known to leave the buffer as it was).
-    pub written_root_uavs: Vec<u8>,
-    /// A store or atomic is emitted through title memory by address
-    /// (`SLOT_MEMORY`).
-    pub writes_guest_memory: bool,
+    /// The heap index of each handle of an unordered buffer view (writes
+    /// through it are marked by the index's view-mark entry).
+    pub view_index: std::collections::HashMap<V, V>,
+    /// Constant buffer views of the view heap: the heap index each handle was
+    /// made from (`Lower::cbv_row`).
+    pub cbv_index: std::collections::HashMap<V, V>,
     pub flags: u64,
-    /// Unordered buffer views taken from the view heap (write marks): each
-    /// handle's heap index, kind (10 typed, 11 raw, 12 structured) and
-    /// second property (a structured view's stride).
-    pub heap_uavs: std::collections::HashMap<V, (V, u32, u32)>,
-    /// Stores and atomics emitted through those handles, and the marks
-    /// emitted for them: a translation with write marks is whole only
-    /// where the two agree.
-    pub view_stores: u32,
-    pub view_marks: u32,
+    /// A pixel shader whose writes to views the console orders by primitive (POPS): its
+    /// heap views written or read as UAVs are rasterizer-ordered views.
+    pub ordered: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// `discard` calls emitted (what the tests count).
@@ -290,12 +308,10 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
-            written_root_uavs: Vec::new(),
-            writes_guest_memory: false,
+            view_index: std::collections::HashMap::new(),
+            cbv_index: std::collections::HashMap::new(),
             flags: 0,
-            heap_uavs: std::collections::HashMap::new(),
-            view_stores: 0,
-            view_marks: 0,
+            ordered: false,
             nonuniform_handles: 0,
             discards: 0,
             threads: None,
@@ -553,7 +569,14 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
-        self.nonuniform_handles += u32::from(count_nonuniform);
+        // (bit 12 of the kind field: a UAV; bit 13: rasterizer-ordered)
+        let props = if self.ordered && !sampler && props.0 & 0x1000 != 0 {
+            self.flags |= flags::ROVS;
+            (props.0 | 0x2000, props.1)
+        } else {
+            props
+        };
+        self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -568,6 +591,9 @@ impl Shader {
         let kind = props.0 & 0xFF;
         if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&kind) {
             self.heap_uavs.insert(h, (index, kind, props.1));
+        }
+        if !sampler && props.0 & 0xFF == 13 {
+            self.cbv_index.insert(h, index);
         }
         h
     }
@@ -617,7 +643,9 @@ impl Shader {
                 (flags::WAVE_OPS, used.wave_ops),
                 (flags::BARYCENTRICS, used.barycentrics || has_bary_input),
                 (flags::INT64, used.int64),
+                (flags::DOUBLES, used.doubles),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
+                (flags::ROVS, used.rovs),
                 (flags::RESOURCE_HEAP, used.heap_views),
                 (flags::SAMPLER_HEAP, used.heap_samplers),
                 (flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64, used.atomic64),
@@ -950,6 +978,9 @@ impl Shader {
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
+        }
+        if self.flags & flags::ROVS != 0 {
+            features |= 0x1000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;

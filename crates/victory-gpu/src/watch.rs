@@ -1399,6 +1399,15 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     if g.protected.contains(&block) {
         return true;
     }
+    if g.rests(block, guard_rest()) {
+        return false;
+    }
+    // A page kept in the books (`VICTORY_SOFT_VIEWS=copies`) cannot be
+    // written through that address without a fault that maps it (and tells
+    // us as a remap): as good as read-only, and there is nothing to protect.
+    if crate::softview::is_kept(block * BLOCK) {
+        return true;
+    }
     let mut old = 0;
     #[cfg(feature = "diagnostics")]
     PROTECT_PARTS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1742,136 +1751,16 @@ fn open_here(g: &mut Guards, start: usize, end: usize, before: bool) -> Vec<usiz
     blocks
 }
 
-// Blocks the bake probe made read-only, each with the bake whose sources
-/// it guards ([`probe_guard`]).
-#[cfg(feature = "diagnostics")]
-static PROBED: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
-
-/// Takes the probe's blocks of `[start, end)` off its list (their
-/// protection is the caller's to give back).
-#[cfg(feature = "diagnostics")]
-fn probe_take(start: usize, end: usize) -> Vec<usize> {
-    let mut probed = PROBED.lock().unwrap_or_else(|e| e.into_inner());
-    if probed.is_empty() {
-        return Vec::new();
-    }
-    let taken: Vec<usize> = probed.range(start / BLOCK..end.div_ceil(BLOCK)).map(|(&b, _)| b).collect();
-    for b in &taken {
-        probed.remove(b);
-    }
-    taken
-}
-
-/// The bake probe: makes the blocks of `ranges` that are read-write view
-/// memory read-only, for bake `bake`, so that the first store to each
-/// faults once and is noted ([`open_as`]); the runtime's own writes there
-/// open them as they open the copies' guards. Blocks a kernel write is
-/// under way into, and blocks the copies guard already (their faults are
-/// noted too), are left alone. Returns the blocks made read-only.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn probe_guard(ranges: &[(usize, usize)], bake: u64) -> usize {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
-    install();
-    let mut g = guards();
-    let mut probed = PROBED.lock().unwrap_or_else(|e| e.into_inner());
-    let mut made = 0;
-    for &(start, end) in ranges {
-        for block in start / BLOCK..end.div_ceil(BLOCK) {
-            if probed.contains_key(&block)
-                || g.protected.contains(&block)
-                || g.writing_into(block)
-            {
-                continue;
-            }
-            let mut old = 0;
-            // SAFETY: title view memory; only its protection changes.
-            if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } == 0 {
-                continue;
-            }
-            if old != PAGE_READWRITE {
-                // Not plain read-write memory: left as it was.
-                let mut back = 0;
-                // SAFETY: as above, back to the protection it had.
-                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut back) };
-                continue;
-            }
-            probed.insert(block, bake);
-            made += 1;
-        }
-    }
-    made
-}
-
-/// The bake probe watched bake `bake`'s sources long enough: the blocks it
-/// still guards for it get write access back (unless the copies guard
-/// them now).
-#[cfg(feature = "diagnostics")]
-pub(crate) fn probe_release(bake: u64) {
-    let g = guards();
-    let mut probed = PROBED.lock().unwrap_or_else(|e| e.into_inner());
-    let mine: Vec<usize> = probed.iter().filter(|&(_, &b)| b == bake).map(|(&block, _)| block).collect();
-    for block in mine {
-        probed.remove(&block);
-        if !g.protected.contains(&block) {
-            make_writable(block);
-        }
-    }
-}
-
-/// Gives write access back to `block`, one we made read-only; nothing
-/// changes where it is not mapped.
-fn make_writable(block: usize) {
-    make_writable_span(block, block + 1);
-}
-
-/// Gives write access back to blocks `[from, to)` in one call; false if
-/// Windows refused (the blocks are not all of one view, or not mapped).
-fn make_writable_span(from: usize, to: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let mut old = 0;
-    // SAFETY: title view memory; only its protection changes.
-    unsafe {
-        VirtualProtect(
-            (from * BLOCK) as *const _,
-            (to - from) * BLOCK,
-            PAGE_READWRITE,
-            &mut old,
-        ) != 0
-    }
-}
-
-/// [`make_writable`] for `blocks` (in order): a run of neighbours is one
-/// call, block by block only where Windows refuses the run (it spans two
-/// views; it never changes part of a range). A remapping or a write the
-/// runtime announces opens hundreds of neighbouring blocks, each a call
-/// into the kernel and a flush of the other cores' address caches.
-/// `VICTORY_GUARD_RUNS=0` opens block by block, as before.
-fn make_writable_runs(blocks: &[usize]) {
-    static RUNS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let runs = *RUNS.get_or_init(|| std::env::var_os("VICTORY_GUARD_RUNS").is_none_or(|v| v != "0"));
-    let mut i = 0;
-    while i < blocks.len() {
-        let mut k = i + 1;
-        while runs && k < blocks.len() && blocks[k] == blocks[k - 1] + 1 {
-            k += 1;
-        }
-        if k - i == 1 || !make_writable_span(blocks[i], blocks[k - 1] + 1) {
-            for &block in &blocks[i..k] {
-                make_writable(block);
-            }
-        }
-        i = k;
-    }
-}
-
-/// Our own write into title memory `[at, at + len)` that the handler does
-/// not see: opens its guarded blocks, and the same pages at their other
-/// views. For a write already done when it is told; a kernel write that
-/// is still to come takes [`writing_held`] (the runtime's
-/// `kernel_will_write`), as a guard taken before it ends would fail it.
-#[cfg(test)]
-pub(crate) fn writing(at: usize, len: usize) {
-    open(&mut guards(), at, at.saturating_add(len), false);
+/// Before our own write into title memory `[at, at + len)` through the
+/// kernel (which does not fault into our handler): opens its guarded blocks.
+/// The runtime calls it (as `kernel_will_write`) before the title's kernel
+/// reads into its own memory.
+pub fn writing(at: usize, len: usize) {
+    // A kernel write does not fault: pages kept in the books
+    // (`VICTORY_SOFT_VIEWS=copies`) are made real first, or it would fail.
+    crate::softview::make_real_range(at, len);
+    // The length is the title's (`fread`'s size times count, saturated).
+    open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -2036,6 +1925,9 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     } else {
         WRITTEN[3].fetch_add(1, Relaxed);
         if mode & 4 == 0 {
+            // Not told to the textures; counted where they lie
+            // (`VICTORY_PLAIN_WRITES_COUNT=1`).
+            crate::descriptor::host::plain_written(at, len);
             return;
         }
     }
@@ -2229,13 +2121,8 @@ fn mapping_writer_pending_for_test(at: usize, len: usize) -> bool {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
-    // The bake probe: the mapping is new (read-write); its blocks are no
-    // longer guarded by the probe.
-    #[cfg(feature = "diagnostics")]
-    {
-        crate::bake_probe::note(crate::bake_probe::Writer::Remap, at, len, 0);
-        probe_take(at, at.saturating_add(len));
-    }
+    // Read-backs of textures on their way there are stale.
+    crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -2378,7 +2265,18 @@ fn install() {
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
-        if handle_write_fault(at, r.ExceptionAddress as usize) {
+        let mut g = guards();
+        if open(&mut g, at, at + 1) {
+            drop(g);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                note_fault(entered.ns_to(crate::tick::Tick::now()));
+            }
+            crate::framelog::add(crate::framelog::T::GuardFaults, 1);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if writable(at) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             EXCEPTION_CONTINUE_SEARCH
@@ -2542,6 +2440,12 @@ mod tests {
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
+        // The journal is shared by every test and keeps pages by address,
+        // whatever was freed since: allocations other tests freed leave
+        // entries over the addresses this one may get (in a full parallel
+        // run, every one of 17 fresh allocations had some). Memory just
+        // allocated has no history, so the journal is told to forget this
+        // range before the test asks; nothing else writes it.
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(
@@ -2552,6 +2456,13 @@ mod tests {
             )
         } as usize;
         assert_ne!(p, 0);
+        {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            let pages: Vec<usize> = j.written.range(p / PAGE..(p + 4 * PAGE) / PAGE).map(|(&page, _)| page).collect();
+            for page in pages {
+                j.written.remove(&page);
+            }
+        }
         let (start, end) = (p, p + 4 * PAGE);
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());

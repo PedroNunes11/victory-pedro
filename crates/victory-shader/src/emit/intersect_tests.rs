@@ -184,6 +184,7 @@ pub(super) fn build_compute_shader(
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        cbv_row_shift: false,
     })?;
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -736,6 +737,7 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        cbv_row_shift: false,
     });
     match r {
         Err(ShaderError::Unsupported { what, .. }) => {

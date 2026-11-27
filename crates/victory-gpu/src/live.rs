@@ -21,7 +21,7 @@ use std::sync::{Mutex, OnceLock};
 /// Switches that are safe to flip at a frame boundary once flights are
 /// settled (names without the `VICTORY_` prefix): each only changes how
 /// work of ours is scheduled from then on.
-pub(crate) const LIVE: &[&str] = &["TEXTURE_WIDE", "WIDE_REFRESH", "COPY_PLAIN_ALL", "CLAMP_NO_WAIT", "SKIP_GROUP_BARRIERS", "NO_CARD_METER", "CLAMP_BATCH", "INDIRECT_NO_COUNT", "BUFFER_PASS_QUIET", "DESCRIPTOR_DELTA", "SUBPAGE_PARTS", "GUARD_BITS", "GUARD_REST", "OPEN_ONE_VIEW", "SLOT_FLAGS", "PLACED_TEXTURES", "HEAP_PRESYNC", "SYNC_LIGHT", "GUARD_OUTSIDE", "REFRESH_PARTS", "CHEAP_TIMERS", "SYNC_KEYS", "REPEAT_CENSUS"];
+pub(crate) const LIVE: &[&str] = &["TEXTURE_WIDE", "WIDE_REFRESH", "COPY_PLAIN_ALL", "CLAMP_NO_WAIT", "SKIP_GROUP_BARRIERS", "NO_CARD_METER", "CLAMP_BATCH", "INDIRECT_NO_COUNT", "BUFFER_PASS_QUIET", "DESCRIPTOR_DELTA", "SUBPAGE_PARTS", "GUARD_BITS", "GUARD_REST", "OPEN_ONE_VIEW", "SLOT_FLAGS", "PLACED_TEXTURES", "HEAP_PRESYNC", "SYNC_LIGHT", "GUARD_OUTSIDE", "REFRESH_PARTS", "CHEAP_TIMERS", "SYNC_KEYS", "REPEAT_CENSUS", "FILL_ONCE", "LIBRARY_DEFER", "TABLE_MEMO", "PIPELINE_WAIT_ONCE", "SLOT_REASONS", "ALIAS_PER_SOURCE", "PARTLY_LESS", "RETRY_TURNS", "WC_NO_BACK"];
 
 /// Switches known and NOT settable live: state built from them at boot, or
 /// threads and lines that exist or not for the whole run.
@@ -37,6 +37,7 @@ pub(crate) const BOOT_ONLY: &[&str] = &[
     "GUARD_PARK",
     "HEAP_SYNC_WIDE",
     "HEAP_SYNC_BESIDE",
+    "CBV_ALIGN_DOWN",
 ];
 
 /// `VICTORY_TEXTURE_WIDE` -> `TEXTURE_WIDE`.

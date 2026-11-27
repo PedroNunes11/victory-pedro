@@ -1596,23 +1596,10 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
-    // The bake probe: whether this queue still holds submissions behind a
-    // fence (on the console they would run before the mapping).
     #[cfg(feature = "diagnostics")]
-    let held = u64::from(!this.is_null() && !lock(&queue(this).held).is_empty());
-    // The console maps the pages behind the work sent before: what that
-    // work's shaders write must land in the pages mapped now, not in those
-    // mapped next (the relay lands flights after their submission returns).
-    #[cfg(windows)]
-    for b in batches.into_iter().flatten() {
-        if b.ranges.is_null() {
-            continue;
-        }
-        // SAFETY: each batch holds `count` ranges.
-        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
-        let len: u64 = ranges.iter().map(|r| u64::from(r.count) * PAGE).sum();
-        crate::host::land_before_remap(b.destination, len);
-    }
+    let started = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let mut pages = 0u64;
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
@@ -1627,7 +1614,7 @@ extern "system" fn copy_page_mappings(
             let source = pool + u64::from(r.start) * PAGE;
             #[cfg(feature = "diagnostics")]
             if r.kind != 3 {
-                crate::bake_probe::note(crate::bake_probe::Writer::PageBatch, at as usize, len as usize, held);
+                pages += u64::from(r.count);
             }
             ok &= match r.kind {
                 0 if inside(r.count) => map(at, source, len),

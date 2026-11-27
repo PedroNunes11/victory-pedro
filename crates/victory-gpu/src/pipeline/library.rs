@@ -401,7 +401,77 @@ struct Library {
     /// Stores share it and a save takes it alone: the size the library
     /// asks for must still be its size when it is written out.
     saving: RwLock<()>,
+    /// Pipelines made while a save held [`Library::saving`]
+    /// ([`defer_stores`]): stored by the next save, before it asks the
+    /// size.
+    deferred: Mutex<Vec<(HSTRING, ID3D12PipelineState)>>,
 }
+
+impl Library {
+    /// Stores `pso` as `name`, or with [`defer_stores`] keeps it for the
+    /// next save if a save is writing the library now: the pipeline goes
+    /// back to its caller either way, without waiting for the save.
+    fn store(&self, name: HSTRING, pso: &ID3D12PipelineState, defer: bool) {
+        // With `VICTORY_LIBRARY_LOCK=1` this waits for a whole save, which
+        // `save` holds too: that debug mode undoes `defer`, as before.
+        let _all = one_call();
+        let _stores = if defer {
+            match self.saving.try_read() {
+                Ok(held) => held,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    self.deferred.lock().unwrap_or_else(|e| e.into_inner()).push((name, pso.clone()));
+                    DEFERRED.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        } else {
+            self.saving.read().unwrap_or_else(|e| e.into_inner())
+        };
+        let _call = call("store", &name.to_string());
+        // SAFETY: a live pipeline; a name already stored (a description that
+        // differs) is refused, which leaves the library as it was.
+        if unsafe { self.library.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok() {
+            self.added.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Stores the pipelines kept while a save wrote the library; by a save,
+    /// holding [`Library::saving`] alone.
+    fn store_deferred(&self) {
+        let kept = std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|e| e.into_inner()));
+        for (name, pso) in kept {
+            // SAFETY: as in `store`; the caller holds the save's lock.
+            if unsafe { self.library.StorePipeline(PCWSTR(name.as_ptr()), &pso) }.is_ok() {
+                self.added.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Whether a pipeline made while a save writes the library goes back to
+/// its caller at once, stored by the next save, and saves come at most
+/// every [`SAFE_SAVE_EVERY`] (`VICTORY_LIBRARY_DEFER=1`, live, off by
+/// default). Before, a made pipeline waited for the save to end: every
+/// save writes the whole library (1,021 to 1,036 MB in the play session of
+/// 26/11 20:18, 18 saves, every 20 s that a pipeline came in, one of them
+/// for 2), and the frame waiting for that pipeline spent its 500 ms budget
+/// (`crate::pipeline::make`): 54 of the session's 81 frames that waited
+/// 100 ms or more lay within 6 s of a save, where chance gives some 19.
+fn defer_stores() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("LIBRARY_DEFER", 0);
+    ON.on()
+}
+
+/// Pipelines kept for a save to store ([`defer_stores`]), since the start.
+pub(crate) static DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// How often the library is saved with [`defer_stores`]: a save no longer
+/// holds back pipelines, but it still writes the whole library; this one
+/// keeps a crash from losing a whole session's pipelines. A crash loses the
+/// pipelines made since the last save (up to 150 s of them): only the cache,
+/// which the next run makes again, at the cost of those compiles.
+const SAFE_SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(150);
 
 // SAFETY: D3D12 objects are free-threaded, and the library synchronises
 // its own calls (see the module's notes); what it does not, two loads of
@@ -477,6 +547,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     _blob: blob,
                     added: AtomicU64::new(0),
                     saving: RwLock::new(()),
+                    deferred: Mutex::new(Vec::new()),
                 });
             }
             Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
@@ -493,6 +564,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         _blob: Blob::None,
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
+        deferred: Mutex::new(Vec::new()),
     })
 }
 
@@ -553,14 +625,7 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
-    let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
-    // SAFETY: a live pipeline; a name already stored (a description that
-    // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        library.added.fetch_add(1, Ordering::Relaxed);
-    }
+    library.store(wide, &pso, defer_stores());
     Ok(pso)
 }
 
@@ -572,7 +637,8 @@ pub(crate) fn save(now: bool) {
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        let every = if defer_stores() { SAFE_SAVE_EVERY } else { SAVE_EVERY };
+        if !now && last.is_some_and(|t| t.elapsed() < every) {
             return;
         }
         *last = Some(std::time::Instant::now());
@@ -594,6 +660,7 @@ pub(crate) fn save(now: bool) {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
+        library.store_deferred();
         let added = library.added.load(Ordering::Relaxed);
         if !used_changed && added == 0 {
             return;
@@ -787,6 +854,61 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    /// With stores deferred ([`defer_stores`]), a pipeline made while a save
+    /// holds the library goes back at once, and the next save stores it:
+    /// loadable by its name afterwards.
+    #[test]
+    fn a_pipeline_made_during_a_save_is_stored_by_the_next_save() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let library = open(&device, Blob::None).expect("an empty library");
+        const CS: &str = "[RootSignature(\"RootFlags(0)\")] [numthreads(1, 1, 1)] void main() {}";
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names outlive the calls; the description
+        // points at the compiled code, alive until the end.
+        let (pso, desc_code) = unsafe {
+            D3DCompile(CS.as_ptr().cast(), CS.len(), s!("deferred"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, None)
+                .unwrap();
+            let code = code.unwrap();
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()).to_vec();
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &bytes).unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                ..Default::default()
+            };
+            let pso: ID3D12PipelineState = device.CreateComputePipelineState(&desc).unwrap();
+            (pso, (bytes, root))
+        };
+        let name = HSTRING::from("made during a save");
+        let save = library.saving.write().unwrap();
+        // Without deferring, this store would wait for the save: the thread
+        // would never end and the test would hang.
+        std::thread::scope(|s| s.spawn(|| library.store(name.clone(), &pso, true)).join().unwrap());
+        assert_eq!(library.deferred.lock().unwrap().len(), 1, "kept for the next save");
+        assert_eq!(library.added.load(Ordering::Relaxed), 0, "not stored during the save");
+        // The next save, as `save` does under its lock.
+        library.store_deferred();
+        drop(save);
+        assert_eq!(library.added.load(Ordering::Relaxed), 1);
+        assert!(library.deferred.lock().unwrap().is_empty());
+        let (bytes, root) = &desc_code;
+        // SAFETY: as above.
+        let loaded = unsafe {
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                ..Default::default()
+            };
+            library.library.LoadComputePipeline::<_, ID3D12PipelineState>(PCWSTR(name.as_ptr()), &desc)
+        };
+        assert!(loaded.is_ok(), "the deferred pipeline is in the library: {loaded:?}");
     }
 
     #[test]

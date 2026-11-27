@@ -65,11 +65,22 @@ const WORLD_FRAMES: u32 = 60;
 
 fn world_by_draws() -> bool {
     use std::sync::atomic::{AtomicU32, AtomicU64};
+    // `VICTORY_AB_WORLD_DRAWS=<n>`: the draws a frame that mean the world
+    // ([`WORLD_DRAWS`] by default); 0 starts the windows at once, counted
+    // by the clock from launch, for what happens while the world loads
+    // (run 417c: the texture queue filled and emptied before 1,500 draws).
+    static DRAWS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let draws = *DRAWS.get_or_init(|| {
+        std::env::var("VICTORY_AB_WORLD_DRAWS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(WORLD_DRAWS)
+    });
+    if draws == 0 {
+        return true;
+    }
     static LAST: AtomicU64 = AtomicU64::new(0);
     static RUN: AtomicU32 = AtomicU32::new(0);
     let now = crate::draw::drawn();
     let d = now.saturating_sub(LAST.swap(now, Ordering::Relaxed));
-    let run = if d >= WORLD_DRAWS { RUN.load(Ordering::Relaxed) + 1 } else { 0 };
+    let run = if d >= draws { RUN.load(Ordering::Relaxed) + 1 } else { 0 };
     RUN.store(run, Ordering::Relaxed);
     run >= WORLD_FRAMES
 }

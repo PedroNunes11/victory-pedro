@@ -94,6 +94,12 @@ fn all_wc_in(reservations: &BTreeMap<usize, Reservation>, ranges: &[(usize, usiz
         })
 }
 
+/// Whether all of `[from, to)` lies in one reservation the title asked
+/// write-combining (recorded only with [`skip_wc_back`]; false otherwise).
+pub(crate) fn wholly_write_combining(from: usize, to: usize) -> bool {
+    skip_wc_back() && all_wc_in(&RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()), &[(from, to)])
+}
+
 /// Since the start, pieces left on the card by [`skip_back`]: count and bytes.
 pub(crate) static SKIPPED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 

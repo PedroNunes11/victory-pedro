@@ -2730,6 +2730,34 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     (r.desc.dimension == BUFFER).then(|| (r.data(), r.desc.width))
 }
 
+/// Width, height and console format of texture `this` (`None` for a
+/// buffer): `crate::texback`'s kinds.
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    (r.desc.dimension != BUFFER).then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+/// Texture `this`'s console layout (one plane), where it lies in title
+/// memory and the bytes that layout takes: `crate::texback`; `None` for a
+/// buffer or a texture with planes.
+pub(crate) fn title_texture(this: This) -> Option<(texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), r.data() as usize, usize::try_from(t.size).ok()?))
+}
+
 impl Resource {
     fn data(&self) -> *mut u8 {
         match self.backing {
@@ -2805,16 +2833,30 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
     }
+    // Memory a resource shares with others (placed in a heap, or at a title
+    // address): `crate::texback` writes a texture's memory only while no
+    // other resource lies in it.
+    #[cfg(windows)]
+    if !matches!(resource.backing, Backing::Committed(_)) {
+        let size = if desc.dimension == BUFFER { Some(desc.width) } else { footprint(&desc).map(|f| f.size) };
+        if let Some(size) = size {
+            crate::texback::resource_made(std::ptr::from_ref::<Resource>(&resource) as usize, resource.data() as usize, size as usize);
+        }
+    }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
 
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        crate::texback::resource_gone(std::ptr::from_ref::<Resource>(self) as usize);
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
             textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            // A read-back on its way to this texture's memory is stale.
+            #[cfg(windows)]
+            crate::texback::released(self.data() as usize);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;

@@ -46,11 +46,17 @@ pub(crate) struct Shadow {
     /// Whether the memory is write-watched: unknown, yes, no, or view
     /// memory, which the guards answer for ([`GUARDED`]).
     watched: AtomicU8,
-    /// Ranges of view memory found all clean by their last refresh, with
-    /// the guards' count of changes in their regions then
-    /// (`crate::watch::guard_changes`): while the count is the same, a
-    /// refresh of the range has nothing to copy ([`clean_spans`]).
-    clean: Mutex<std::collections::HashMap<(usize, usize), u64>>,
+    /// Whether all of its title memory was reserved write-combining
+    /// ([`Shadow::write_combined`]): unknown, no, yes.
+    wc: AtomicU8,
+    /// The frame of the last refresh that found bytes changed (0: none
+    /// yet). A native PC port would not keep a copy like this at all: it
+    /// would write what changes every frame into an upload heap and put
+    /// what does not into the card's memory once. The layer cannot know
+    /// which a range is, but it can watch: this is what says how long a
+    /// window has been still, so that the still ones can stop costing the
+    /// PC's memory ([`window_ages`]).
+    written_at: AtomicU64,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -91,16 +97,38 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
-    /// Its first bit in the bitmap of pages shaders write through views
-    /// (`crate::marks`), one per 64 KiB title page it touches.
-    marks: Option<u32>,
-    /// The submission being prepared writes it through marked views only
-    /// (`crate::marks::begin`): its declared ranges are armed, not kept.
-    marked_now: std::sync::atomic::AtomicBool,
-    /// Of that submission's declared ranges, those armed, and those that
-    /// kept a snapshot all the same (not all guarded and clean).
-    marked: Mutex<Vec<(usize, usize)>>,
-    fallback: Mutex<Vec<(usize, usize)>>,
+    /// Its first bit in the buffer views' written-pages bitmap, one per
+    /// 64 KiB title page it touches, once a view of it is made that
+    /// shaders mark their writes through ([`Shadow::mark_entry`]); none for
+    /// copies that are not compared on the CPU.
+    marks: std::sync::OnceLock<Option<u32>>,
+    /// Ranges declared by shaders whose writes are not marked (root
+    /// descriptors, title memory by address) and not yet done: compared
+    /// whole, marked or not.
+    unmarked: Mutex<Vec<(usize, usize)>>,
+    /// In place through a view of ours (`crate::unified` over physical
+    /// pages): the view, unmapped after `place`'s heap goes (fields drop in
+    /// order).
+    own_view: Option<crate::inplace::OwnView>,
+    /// Made in place by `crate::unified` (bit 0: over physical pages, bit
+    /// 1: over private memory, bit 2: it reaches the end of its title
+    /// memory, so a root view with no length may be given it).
+    unified: u8,
+    /// The title rewrote constants in this copy that a flight still read
+    /// (`crate::host::flight_check`): step 3 reads none of it in place
+    /// from then on ([`Shadow::in_place_ok`]).
+    diverged: AtomicBool,
+    /// A window whose pages take tiles of [`window_pool`] only once they
+    /// are copied ([`windows_paged`]): `buffer` is its reserved buffer, and
+    /// `data` is null (each page's bytes are in its tile).
+    paged: Option<crate::paged::PagedBuffer>,
+    /// For the census of copies (diagnostics, [`census_tick`]): since the
+    /// last census, bytes refreshes looked at, bytes they copied, bytes
+    /// shaders were declared to write (once a submission), refreshes, and
+    /// indirect argument records read from it; and bytes shaders were ever
+    /// declared to write.
+    #[cfg(feature = "diagnostics")]
+    census: [AtomicU64; 6],
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2803,8 +2831,56 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Whether what shaders write into a copy in the card's memory of title
+/// memory reserved write-combining stays on the card: no snapshot before the
+/// submission, no hash or compare pass, nothing fetched or merged into title
+/// memory (`VICTORY_WC_NO_BACK=1`, live; off by default). Needs
+/// `VICTORY_SKIP_WC_BACK=1` (the launcher's default), which records the
+/// reservations ([`crate::census`]); without it no copy counts as
+/// write-combining and nothing changes.
+///
+/// Ported from readmet3xt-lab's base of trustno1-coder/VIctory-NVIDIA
+/// (commits 50c15a145 and 2f81d0c85, 2026-11-26; GPL-3.0-or-later, its
+/// authors), rewritten on this fork's registry of reservations. There,
+/// without `VICTORY_SKIP_WC_BACK`, gameplay went 38.3 -> 33.3 ms on a 4070
+/// SUPER; here `VICTORY_SKIP_WC_BACK` already leaves the fetch and merge out,
+/// so only the snapshots, hashes and compares of these copies are saved.
+///
+/// Risks, as its author states them: the title's CPU reading what shaders
+/// wrote there reads older bytes; a page the title writes goes up whole and
+/// takes back what shaders wrote in the same 4 KiB; another host copy of the
+/// same bytes does not see shader writes. Only copies of at least
+/// [`wc_no_back_min`] bytes: with all of them the author's cutscenes went
+/// near black (small results the title reads back came back stale).
+fn wc_no_back() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("WC_NO_BACK", 0);
+    ON.on()
+}
+
+/// The smallest copy [`wc_no_back`] leaves on the card, in bytes
+/// (`VICTORY_WC_NO_BACK_MIN_KB`; 1,024 KiB by default, the author's choice
+/// after the near-black cutscenes; 0: every copy).
+fn wc_no_back_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_WC_NO_BACK_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) * 1024
+    })
+}
+
+/// Whether a copy's shader writes stay on the card ([`wc_no_back`]): a copy
+/// in the card's memory (`carded`), the switch `on`, at least `min` bytes,
+/// and wholly write-combining (`wc`, asked last: it takes a lock once).
+fn wc_leaves_on_card(carded: bool, on: bool, len: u64, min: u64, wc: impl FnOnce() -> bool) -> bool {
+    carded && on && len >= min && wc()
+}
+
+/// Bytes shaders were declared to write in copies [`wc_no_back`] left on
+/// the card, since the last frame-rate line.
+pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
+
 impl Drop for Shadow {
     fn drop(&mut self) {
+        COPIES_EPOCH.fetch_add(1, Ordering::Relaxed);
         // A paged window's tiles go back to the pool: nothing names it any
         // more and no submission that did is running (`let_go_idle` retires
         // it), so no tile mapping need be undone before a tile is reused.
@@ -3345,6 +3421,35 @@ impl Shadow {
         address.checked_sub(self.start).filter(|&at| at < self.len)
     }
 
+    /// Whether step 3 may read constants in place from this copy now: a
+    /// copy in the card's memory (or any, with
+    /// `crate::descriptor::host::in_place_upload`) in which the title has
+    /// not been seen rewriting constants in flight. Asked per draw: a copy
+    /// can go from the card to upload memory when the card's budget is
+    /// short, or be let go and made again as the other kind.
+    pub(crate) fn in_place_ok(&self) -> bool {
+        (self.card.is_some() || crate::descriptor::host::in_place_upload()) && !self.diverged.load(Ordering::Relaxed)
+    }
+
+    /// The title rewrote constants a flight still read here: no more
+    /// reads in place ([`Shadow::in_place_ok`]); whether this is the first.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pub(crate) fn mark_diverged(&self) -> bool {
+        !self.diverged.swap(true, Ordering::Relaxed)
+    }
+
+    /// What kind of copy it is, for diagnostics: 0 upload memory the CPU
+    /// writes, 1 a copy on the card, 2 placed over title memory.
+    pub(crate) fn kind(&self) -> usize {
+        if self.place.is_some() {
+            2
+        } else if self.card.is_some() {
+            1
+        } else {
+            0
+        }
+    }
+
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)
@@ -3406,6 +3511,7 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+        COPIES_EPOCH.fetch_add(1, Ordering::Relaxed);
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
@@ -3418,7 +3524,8 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             parts: Mutex::new(HashMap::new()),
             watched: AtomicU8::new(0),
-            clean: Mutex::default(),
+            wc: AtomicU8::new(0),
+            written_at: AtomicU64::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -3433,10 +3540,14 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
-            marks: None,
-            marked_now: std::sync::atomic::AtomicBool::new(false),
-            marked: Mutex::default(),
-            fallback: Mutex::default(),
+            marks: std::sync::OnceLock::new(),
+            unmarked: Mutex::default(),
+            own_view: None,
+            unified: 0,
+            diverged: AtomicBool::new(false),
+            paged: None,
+            #[cfg(feature = "diagnostics")]
+            census: [const { AtomicU64::new(0) }; 6],
         }
     }
 
@@ -3656,7 +3767,36 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
-        list.defer_gpu_write(self, address as usize, len as usize, marked && self.marks.is_some());
+        // Write-combining title memory, which the title's CPU does not read
+        // back (`VICTORY_WC_NO_BACK`): what shaders write stays on the card,
+        // with no snapshot, hash, compare or fetch.
+        if wc_leaves_on_card(self.card.is_some(), wc_no_back(), self.len, wc_no_back_min(), || self.write_combined()) {
+            WC_LEFT.fetch_add(len, Ordering::Relaxed);
+            return;
+        }
+        list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
+    }
+
+    /// Whether all of the copy's title memory lies in one reservation the
+    /// title asked write-combining ([`crate::census::wholly_write_combining`]);
+    /// found once per copy.
+    fn write_combined(&self) -> bool {
+        match self.wc.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let wc = crate::census::wholly_write_combining(self.start as usize, (self.start + self.len) as usize);
+                self.wc.store(if wc { 2 } else { 1 }, Ordering::Relaxed);
+                if wc {
+                    tracing::info!(
+                        start = format_args!("{:#x}", self.start),
+                        len = format_args!("{:#x}", self.len),
+                        "write-combining title memory: what shaders write in its copy on the card is not copied back (VICTORY_WC_NO_BACK)"
+                    );
+                }
+                wc
+            }
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -5404,6 +5544,64 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
+/// Title memory in which the title was seen rewriting constants a flight
+/// still read (`crate::host::flight_check`), by 64 KiB page: step 3 reads
+/// none of it in place, whatever copy holds it later (a copy let go and
+/// made again keeps no mark of its own). At most [`REWRITTEN_MOST`] pages,
+/// the oldest forgotten first; a page the title later uses for other data
+/// stays marked (its tables are made afresh, as without step 3).
+type Rewritten = (std::collections::HashSet<u64>, std::collections::VecDeque<u64>);
+static REWRITTEN: std::sync::Mutex<Option<Rewritten>> = std::sync::Mutex::new(None);
+
+/// Bumped whenever a host copy is made or let go, or title pages are marked
+/// rewritten in flight ([`mark_rewritten`]): what step 3 decided of a
+/// constant buffer view's copy holds while this has not moved
+/// (`crate::draw::State::cbv_in_place`).
+pub(crate) static COPIES_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Whether [`REWRITTEN`] holds any page (asked per draw before its lock).
+static ANY_REWRITTEN: AtomicBool = AtomicBool::new(false);
+
+/// [`REWRITTEN`]'s cap.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+const REWRITTEN_MOST: usize = 4096;
+
+/// Since the start: pages marked in [`REWRITTEN`], and pages forgotten at
+/// its cap.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) static REWRITTEN_COUNT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Marks `[address, address + len)` as rewritten in flight ([`REWRITTEN`]).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn mark_rewritten(address: u64, len: u64) {
+    let mut set = REWRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let set = set.get_or_insert_with(Rewritten::default);
+    for page in address >> 16..=(address + len.max(1) - 1) >> 16 {
+        if set.0.insert(page) {
+            set.1.push_back(page);
+            REWRITTEN_COUNT[0].fetch_add(1, Ordering::Relaxed);
+            if set.1.len() > REWRITTEN_MOST
+                && let Some(old) = set.1.pop_front()
+            {
+                set.0.remove(&old);
+                REWRITTEN_COUNT[1].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    ANY_REWRITTEN.store(true, Ordering::Relaxed);
+    COPIES_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Whether any of `[address, address + len)` was marked rewritten in flight.
+pub(crate) fn rewritten(address: u64, len: u64) -> bool {
+    if !ANY_REWRITTEN.load(Ordering::Relaxed) {
+        return false;
+    }
+    let set = REWRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(set) = set.as_ref() else { return false };
+    (address >> 16..=(address + len.max(1) - 1) >> 16).any(|page| set.0.contains(&page))
+}
+
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
@@ -6056,144 +6254,23 @@ pub(crate) fn exact_line(frames: f64) {
 }
 
 #[cfg(test)]
-mod marked_tests {
-    use super::{PAGE, exact};
+mod wc_no_back_tests {
+    use super::wc_leaves_on_card;
 
-    /// A marked page goes back by the bytes the card changed against the
-    /// page's bytes from before: the card's byte and the title's own write
-    /// meanwhile both stay in title memory; outside the armed range nothing
-    /// is written.
+    /// Only a copy on the card, with the switch on, of at least the least
+    /// size and wholly write-combining keeps its shader writes there; the
+    /// reservations are not looked at when another test already says no.
     #[test]
-    fn a_marked_page_goes_back_by_the_bytes_the_card_changed() {
-        if crate::host::host().is_none() {
-            return; // no host device to make buffers on
-        }
-        // Two title pages of our own, on a page boundary.
-        let memory = vec![0u8; 3 * PAGE];
-        let page = (memory.as_ptr() as usize).next_multiple_of(PAGE);
-        let title = |at: usize| (page + at) as *mut u8;
-        let copy = exact(page as u64, 2 * PAGE as u64).unwrap();
-        assert!(copy.update(page, 2 * PAGE) > 0);
-        let before: Vec<u8> = (0..PAGE).map(|k| {
-            // SAFETY: bytes of our memory.
-            unsafe { title(k).read() }
-        }).collect();
-        // Armed: the first 4 KiB of the first page.
-        copy.marked.lock().unwrap().push((page, page + 4096));
-        // The card writes bytes 10 and 5000 (the second outside the armed
-        // range); the title writes byte 20 meanwhile.
-        // SAFETY: the copy's mapping, 2 pages; our memory.
-        unsafe {
-            copy.data.add(10).write(0xaa);
-            copy.data.add(5000).write(0xbb);
-            title(20).write(0x55);
-        }
-        // Its bytes from before are what the title's first write kept.
-        let written = copy.copy_back_marked(page, &before);
-        assert!(written > 0);
-        // SAFETY: bytes of our memory.
-        let read = |at: usize| unsafe { title(at).read() };
-        assert_eq!((read(10), read(20), read(5000)), (0xaa, 0x55, 0), "the card's, the title's, nothing outside");
-        // The title's own write reaches the copy by its next refresh (the
-        // write tracking saw it), as after any copy-back.
-        copy.marked.lock().unwrap().clear();
-        drop(copy);
-        super::EXACT.lock().unwrap().map.remove(&(page as u64, 2 * PAGE as u64));
-        drop(memory);
-    }
-
-    /// A marked copy-back takes the title's bytes into the copy; the
-    /// snapshot of a declared range over the same page takes them too, so
-    /// that range's copy-back, which runs next, finds nothing new there and
-    /// leaves a title write made since alone (after upstream VIctory #2437).
-    #[test]
-    fn a_declared_copy_back_after_a_marked_one_keeps_newer_title_writes() {
-        if crate::host::host().is_none() {
-            return; // no host device to make buffers on
-        }
-        let memory = vec![0u8; 2 * PAGE];
-        let page = (memory.as_ptr() as usize).next_multiple_of(PAGE);
-        let title = |at: usize| (page + at) as *mut u8;
-        let copy = exact(page as u64, PAGE as u64).unwrap();
-        assert!(copy.update(page, PAGE) > 0);
-        // Declared (with a snapshot) and armed over the same page.
-        copy.writing(page, PAGE);
-        // With the wide copy-back the snapshot is taken with the
-        // submission's others, after its refreshes.
-        super::take_snapshots();
-        assert!(
-            copy.before.lock().unwrap().as_ref().is_some_and(|b| b.capacity() >= PAGE),
-            "a snapshot of the page"
-        );
-        copy.marked.lock().unwrap().push((page, page + PAGE));
-        let before = vec![0u8; PAGE];
-        // A shader writes byte 10; the title writes byte 40 meanwhile.
-        // SAFETY: the copy's mapping, one page; our memory.
-        unsafe {
-            copy.data.add(10).write(0xaa);
-            title(40).write(0x11);
-        }
-        assert!(copy.copy_back_marked(page, &before) > 0);
-        // The title puts both bytes back as they were before the
-        // submission (as the snapshot holds them: the declared copy-back
-        // keeps a title byte that differs from the snapshot anyway).
-        // SAFETY: bytes of our memory.
-        unsafe {
-            title(10).write(0);
-            title(40).write(0);
-        }
-        assert_eq!(copy.copy_back(page, PAGE), 0, "nothing new for the declared copy-back");
-        // SAFETY: bytes of our memory.
-        let read = |at: usize| unsafe { title(at).read() };
-        assert_eq!((read(10), read(40)), (0, 0));
-        copy.marked.lock().unwrap().clear();
-        drop(copy);
-        super::EXACT.lock().unwrap().map.remove(&(page as u64, PAGE as u64));
-        drop(memory);
-    }
-}
-
-#[cfg(test)]
-mod exact_tests {
-    use super::{EXACT, exact};
-
-    /// A view's own copy holds exactly its bytes once brought up to date,
-    /// and the same range asked for again is the same copy.
-    #[test]
-    fn a_views_own_copy_holds_exactly_its_bytes() {
-        if crate::host::host().is_none() {
-            return; // no host device to make buffers on
-        }
-        let title: Vec<u8> = (0..4096u32).map(|i| (i * 7 + 3) as u8).collect();
-        // 3 elements of 12 bytes, 4 bytes into the memory: what a typed
-        // R32G32B32 view off its copy's elements reads.
-        let start = title.as_ptr() as u64 + 4;
-        let copy = exact(start, 36).unwrap();
-        assert_eq!(copy.span(), (start, 36));
-        assert_eq!(copy.offset(start), 0, "the view begins at the copy's first byte");
-        assert!(copy.update(start as usize, 36) > 0);
-        // SAFETY: the copy's mapped bytes, 36 of them.
-        let bytes = unsafe { std::slice::from_raw_parts(copy.data, 36) };
-        assert_eq!(bytes, &title[4..40]);
-        let again = exact(start, 36).unwrap();
-        assert!(std::sync::Arc::ptr_eq(&copy, &again));
-        assert!(exact(start, 0).is_none());
-        drop((copy, again));
-        EXACT.lock().unwrap().map.remove(&(start, 36));
-    }
-
-    /// With the pool, a copy's buffer is of a size class the next copies of
-    /// about that size share; without it, or past the largest class, it is
-    /// the bytes rounded to 256 as before.
-    #[test]
-    fn a_views_own_copy_takes_a_buffer_of_its_size_class() {
-        use super::{EXACT_POOLED_MOST, exact_size};
-        assert_eq!(exact_size(36, false), 256);
-        assert_eq!(exact_size(36, true), 64 << 10);
-        assert_eq!(exact_size(64 << 10, true), 64 << 10);
-        assert_eq!(exact_size((64 << 10) + 1, true), 128 << 10);
-        assert_eq!(exact_size(EXACT_POOLED_MOST, true), EXACT_POOLED_MOST);
-        assert_eq!(exact_size(EXACT_POOLED_MOST + 1, true), EXACT_POOLED_MOST + 256);
+    fn only_big_write_combining_copies_on_the_card_keep_shader_writes_there() {
+        const MIB: u64 = 1 << 20;
+        assert!(wc_leaves_on_card(true, true, 4 * MIB, MIB, || true));
+        assert!(wc_leaves_on_card(true, true, MIB, MIB, || true), "exactly the least size");
+        assert!(!wc_leaves_on_card(true, true, MIB - 4096, MIB, || true), "a small result the title may read back");
+        assert!(!wc_leaves_on_card(true, true, 4 * MIB, MIB, || false), "not write-combining");
+        assert!(!wc_leaves_on_card(true, false, 4 * MIB, MIB, || panic!("asked with the switch off")));
+        assert!(!wc_leaves_on_card(false, true, 4 * MIB, MIB, || panic!("asked for a copy not on the card")));
+        assert!(!wc_leaves_on_card(true, true, 4096, MIB, || panic!("asked for a small copy")));
+        assert!(wc_leaves_on_card(true, true, 4096, 0, || true), "VICTORY_WC_NO_BACK_MIN_KB=0: every copy");
     }
 }
 

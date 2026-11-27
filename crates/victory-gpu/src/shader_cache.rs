@@ -97,9 +97,12 @@ fn build() -> [u8; 32] {
     if let Some(exe) = exe {
         key.update(exe);
     }
-    key.update(&victory_shader::emit::translation_fingerprint());
-    key.update(include_bytes!("shader_cache.rs"));
-    *key.finalize().as_bytes()
+    h.update(&victory_shader::emit::translation_fingerprint());
+    // The run's options are part of the translation too.
+    let options = run_options();
+    h.update(&[u8::from(options.view_marks), u8::from(options.cbv_row_shift)]);
+    h.update(include_bytes!("shader_cache.rs"));
+    *h.finalize().as_bytes()
 }
 
 /// `victory translate --warm <file>`: `container` is translated into the
@@ -108,27 +111,53 @@ fn build() -> [u8; 32] {
 /// facts the run will have ([`prepare_host`], or `VICTORY_HOST_WAVE` and
 /// `VICTORY_VIEW_LIMIT`).
 pub fn warm(container: &[u8]) -> Result<bool, String> {
-    match precompile_shader(container)? {
-        PrecompileOutcome::Translated => Ok(true),
-        PrecompileOutcome::Cached => Ok(false),
-        PrecompileOutcome::CachedRefusal | PrecompileOutcome::Refused => {
-            Err("does not translate".into())
-        }
-    }
+    let cache = CACHE.get().ok_or("no shader cache")?;
+    let ran = AtomicBool::new(false);
+    // As a run translates ([`run_options`]): the key does not tell the two
+    // apart, so a warm-up that left the write marks out filed translations
+    // a run then took (and its copy-backs, which compare only marked
+    // pages, missed what those shaders wrote).
+    let translate = |c: &[u8]| {
+        ran.store(true, Ordering::Relaxed);
+        translate_run(c)
+    };
+    cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
-/// Uses an in-memory translation when the disk cache cannot be written.
+/// [`victory_shader::emit::translate_with`] as a run translates
+/// ([`run_options`]); with `VICTORY_WAVE_PAIRS` a list of hashes, a program
+/// it names by its hash (as the log does: the first 16 hex digits of its
+/// BLAKE3) may take the paired form, and no other.
+fn translate_run(c: &[u8]) -> Result<HostShader, String> {
+    let listed = victory_shader::emit::pairs_listed(&blake3::hash(c).to_hex()[..16]);
+    victory_shader::emit::with_pairs_for(listed, || victory_shader::emit::translate_with(c, run_options()))
+        .map_err(|e| e.to_string())
+}
+
+/// How a run translates, and so how the warm-up must: writes through views
+/// mark their pages, and copy-backs compare only those (`crate::shadow`);
+/// rows of constant buffer views are shifted (`VICTORY_CBV_ROW_SHIFT=1`,
+/// off by default; the host must place the views as the option says).
+fn run_options() -> victory_shader::emit::Options {
+    victory_shader::emit::Options { view_marks: crate::shadow::view_marks_on(), cbv_row_shift: cbv_row_shift() }
+}
+
+/// Whether constant buffer views begin on the 256 bytes below the title's
+/// constants and shaders shift their rows (`VICTORY_CBV_ROW_SHIFT=1`, off
+/// by default; contract 3 of the sessions: the host side places the views
+/// and fills the table, the translation shifts every row).
+pub(crate) fn cbv_row_shift() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_ROW_SHIFT").is_some_and(|v| v == "1"))
+}
+
+/// The translation of a console shader container, from the cache when
+/// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let (result, status) = match CACHE.get() {
-        Some(cache) => lookup(cache, container),
-        None => (
-            victory_shader::emit::translate(container).map_err(|e| e.to_string()),
-            CacheStatus::Unstored,
-        ),
-    };
-    if let CacheStatus::Failed(error) = &status {
-        static WARNED: OnceLock<()> = OnceLock::new();
-        WARNED.get_or_init(|| tracing::warn!(%error, "shader cache unavailable for an entry"));
+    let translate = translate_run;
+    match CACHE.get() {
+        Some(cache) => cached(cache, &build(), container, translate),
+        None => translate(container),
     }
     if result.is_ok() {
         let counter = if status == CacheStatus::Hit {
