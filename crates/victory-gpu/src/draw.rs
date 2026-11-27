@@ -2602,7 +2602,7 @@ impl State {
         n[0] = 1;
         for index in self.bake_sources(p, heap) {
             let Some(handle) = heap.handle(index) else { continue };
-            let Some((view, key)) = host.prepare_bake_slot(index, handle) else { continue };
+            let Some((view, key)) = host.prepare_texture_slot(index, handle) else { continue };
             n[1] += 1;
             let placed = crate::descriptor::host::placed_texture(&view);
             let resource = match placed.as_ref().or(Some(&view)) {
