@@ -11,8 +11,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use super::copied::{self, COPIED_FRAMES, TABLED_FRAMES, tabled_grace};
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+
+#[cfg(test)]
+mod copied_tests;
 
 /// Distinguishes host heaps even when a title heap address is reused.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -159,9 +163,9 @@ pub(crate) struct HostHeap {
     /// as bytes last saw them ([`Copied::changes`]). Made on first
     /// use.
     copied: Mutex<Vec<u8>>,
-    /// New ones of them that wait for a draw ([`HostHeap::copied_wait`]),
-    /// by the frame they were found in.
-    waiting: Mutex<std::collections::VecDeque<(u64, Vec<u32>)>>,
+    /// Copied records that wait for a draw, and those left to a recent table.
+    pub(super) waiting: copied::Deferred,
+    pub(super) orphans: copied::Deferred,
     /// The slots made from a texture whose memory was found away, with what
     /// they were made from and when that was
     /// ([`HostHeap::texture_slot_gone`]).
@@ -219,7 +223,7 @@ pub(crate) struct HostHeap {
     /// [`TABLED_READ`] set if the draw read it). The draw that
     /// reads such a slot brings its texture up to date itself and the slot
     /// then leaves `textures`; a write of a slot that was a table's within
-    /// the last [`TABLED_FRAMES`] frames is due only [`TABLED_GRACE`]
+    /// the last [`TABLED_FRAMES`] frames is due only [`tabled_grace`]
     /// frames later, by when its draw has read it. A title that builds a
     /// table per draw writes thousands of texture views a frame into slots
     /// only tables read (the title: some 2,500 a frame in its
@@ -982,27 +986,22 @@ fn join(ranges: &mut Vec<(u64, u64)>) {
     });
 }
 
-/// Frames for which a slot a draw read through a table counts as a table's
-/// slot ([`HostHeap::tabled`]).
-const TABLED_FRAMES: u64 = 240;
-
-/// Frames a write of a table's slot waits in the queue for the draw that
-/// reads it, before the slot is taken for one shaders pick by index.
-/// Frames as `crate::frame::current` counts them: in its opening cutscene
-/// The title begins two or three of them per frame it presents
-/// (435 begun in the 353 s of run 52's, for some 140 presented).
-const TABLED_GRACE: u64 = 8;
-
-/// Frames for which a record copied into a slot a draw read through a
-/// table is left to such a draw ([`HostHeap::copied_tabled`]).
-const COPIED_FRAMES: u32 = 8;
-
-/// Frames a record copied into any other slot waits for one, before it is
-/// taken for one shaders pick by index ([`HostHeap::copied_wait`]).
-const COPIED_GRACE: u64 = 4;
+/// How a slot reached the mirror and the texture queue.
+#[derive(Clone, Copy)]
+enum Origin {
+    Write,
+    Draw,
+    Copied { frame: u64, found_ms: u64, due_now: bool },
+}
 
 /// In [`HostHeap::tabled`]: a draw read the slot in that frame.
 const TABLED_READ: u32 = 1 << 31;
+
+fn table_age(stamp: u32, frame: u64) -> Option<u64> {
+    let visited = stamp & !TABLED_READ;
+    let now = (frame as u32).wrapping_add(1);
+    (visited != 0).then(|| u64::from(now.wrapping_sub(visited) & !TABLED_READ))
+}
 
 /// Since the start: writes of texture views into slots that count as a
 /// table's (due later), and slots that left the queue because a draw read
@@ -1116,24 +1115,28 @@ impl TextureQueue {
     }
 
     /// A texture view was written into slot `index` in `frame`, due from
-    /// frame `due`. `seen`: it was not written, a draw or the pass made
+    /// frame `due`. For a draw or the pass, it was not written: they made
     /// the host slot from a view the queue may hold already, which then
     /// stays as it is.
-    fn written(&mut self, index: u32, frame: u64, due: u64, seen: bool) {
-        if seen && self.slots.contains_key(&index) {
+    fn written(&mut self, index: u32, frame: u64, due: u64, origin: Origin) {
+        if matches!(origin, Origin::Draw) && self.slots.contains_key(&index) {
             return;
         }
         self.writes += 1;
         let write = self.writes;
-        let (since, waited, away) = self.kept(index);
+        let found = match origin {
+            Origin::Copied { found_ms, .. } => Some(found_ms),
+            _ => None,
+        };
+        let (since, waited, away) = self.kept(index, found);
         self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
     }
 
     /// What a slot written again keeps of its wait.
-    fn kept(&self, index: u32) -> (u64, bool, u64) {
+    fn kept(&self, index: u32, found: Option<u64>) -> (u64, bool, u64) {
         self.slots.get(&index).map_or_else(
-            || (crate::host::now_ms(), false, 0),
-            |w| (w.since, w.waited || w.looks > 0 || w.mapped > 0, w.away),
+            || (found.unwrap_or_else(crate::host::now_ms), false, 0),
+            |w| (found.map_or(w.since, |ms| ms.min(w.since)), w.waited || w.looks > 0 || w.mapped > 0, w.away),
         )
     }
 
@@ -1287,7 +1290,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        let (since, waited, away) = self.kept(index);
+        let (since, waited, away) = self.kept(index, None);
         self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
     }
 
@@ -1943,7 +1946,8 @@ impl HostHeap {
             made: Made::new(count as usize),
             quick: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
-            waiting: Mutex::default(),
+            waiting: Default::default(),
+            orphans: Default::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
             next: Mutex::new((0, vec![false; extra as usize])),
@@ -2597,7 +2601,7 @@ impl HostHeap {
                 return false;
             }
             // (As `mirror`.)
-            let stale = self.note_buffer(index, Some(&view), true);
+            let stale = self.note_buffer(index, Some(&view), Origin::Draw);
             let old = view_at(shown as u32, (shown >> 32) as u32);
             let kept = old.is_some_and(|old| match kin(&old, &view) {
                 Kin::Same => true,
@@ -2778,7 +2782,7 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 return false;
             };
-            let stale = self.note_buffer(index, Some(&view), true);
+            let stale = self.note_buffer(index, Some(&view), Origin::Draw);
             if let Some(kept) = make(&view, self.at(index)) {
                 self.put(index);
                 self.quick_is(index, 0);
@@ -2972,9 +2976,11 @@ impl HostHeap {
     /// [`TABLED_FRAMES`] frames before `frame` (never, if such slots are
     /// to be queued as any other).
     fn tabled_lately(&self, index: u32, frame: u64) -> bool {
-        let stamp = self.tabled_stamp(index) & !TABLED_READ;
-        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
-        tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
+        tabled_out() && self.table_age(index, frame).is_some_and(|age| age <= TABLED_FRAMES)
+    }
+
+    pub(super) fn table_age(&self, index: u32, frame: u64) -> Option<u64> {
+        table_age(self.tabled_stamp(index), frame)
     }
 
     /// What `tabled` holds for title slot `index`; 0: never a table's.
@@ -2986,13 +2992,14 @@ impl HostHeap {
 
     /// The queue's part of a write of title slot `index` in `frame`:
     /// `texture`, whether it now holds a view of a texture the title may
-    /// fill; `seen` as for [`HostHeap::note_buffer`].
-    fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
+    /// fill; `origin` tells whether a draw already brought it up to date.
+    fn queue_texture(&self, index: u32, texture: bool, origin: Origin, frame: u64) {
+        let seen = matches!(origin, Origin::Draw);
         let stamp = if tabled_out() { self.tabled_stamp(index) } else { 0 };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         // A table's slot lately: the draw that reads it uploads its
         // texture, so its write waits for that draw.
-        let lately = stamp != 0 && u64::from(now.wrapping_sub(stamp & !TABLED_READ)) <= TABLED_FRAMES;
+        let lately = table_age(stamp, frame).is_some_and(|age| age <= TABLED_FRAMES);
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
@@ -3002,13 +3009,13 @@ impl HostHeap {
         }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
-            let due = if lately && !seen {
+            let due = if lately && !seen && !matches!(origin, Origin::Copied { due_now: true, .. }) {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                frame + TABLED_GRACE
+                frame.saturating_add(tabled_grace())
             } else {
                 0
             };
-            textures.written(index, frame, due, seen);
+            textures.written(index, frame, due, origin);
         } else {
             textures.remove(index);
         }
@@ -3040,14 +3047,13 @@ impl HostHeap {
     /// Records what title slot `index` now holds for shaders that pick
     /// buffers from the heap: its element stride in the table, and whether
     /// it is a buffer view at all.
-    /// `seen`: the slot was not written now, a draw or a pass made its
-    /// host slot from what it held.
+    /// A draw or pass can also make the slot from a record seen earlier.
     /// Returns the title slots whose placed texture view the write made
     /// stale ([`Spans`]), each with the record its host slot is made from:
     /// out of the queue of textures already, their host slots are the
     /// caller's to make null when it has let go of its own slot's lock
     /// ([`HostHeap::unmake_stale`]).
-    fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<(u32, u64)> {
+    fn note_buffer(&self, index: u32, view: Option<&View>, origin: Origin) -> Vec<(u32, u64)> {
         if self.sampler {
             return Vec::new();
         }
@@ -3066,14 +3072,18 @@ impl HostHeap {
             }
             _ => false,
         };
-        self.queue_texture(index, texture, seen, crate::frame::current());
+        let frame = match origin {
+            Origin::Copied { frame, .. } => frame,
+            _ => crate::frame::current(),
+        };
+        self.queue_texture(index, texture, origin, frame);
         // The memory a placed texture view describes. Not for a slot
         // tables read (thousands of writes a frame, each read by its
         // draw): no pass looks at it, and the same texture's view in a
         // slot shaders pick by index says what it says.
         let placed_view = match view {
             Some(View::Placed(false, resource, desc))
-                if resource[0] != 1 && !self.tabled_lately(index, crate::frame::current()) =>
+                if resource[0] != 1 && !self.tabled_lately(index, frame) =>
             {
                 // (And the level the view starts at: word 4 of a texture
                 // view's description, after format, dimension, mapping
@@ -3106,7 +3116,7 @@ impl HostHeap {
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
                     self.spanned.put(index);
-                    let stale = placed.note(index, start, end, !seen);
+                    let stale = placed.note(index, start, end, !matches!(origin, Origin::Draw));
                     placed.shows(index, first, held);
                     // (Under the lock of `placed`: a later write of one of
                     // them comes by here before it makes the slot.)
@@ -3656,32 +3666,13 @@ impl HostHeap {
     /// last few frames before `frame` ([`HostHeap::tabled`]): what it holds
     /// is such a draw's to make.
     pub(crate) fn copied_tabled(&self, index: u32, frame: u64) -> bool {
-        if !self.copied_waits() {
-            return false;
-        }
-        let stamp = self.tabled_stamp(index) & !TABLED_READ;
-        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
-        stamp != 0 && now.wrapping_sub(stamp) & !TABLED_READ <= COPIED_FRAMES
+        self.copied_waits() && self.table_age(index, frame).is_some_and(|age| age <= COPIED_FRAMES)
     }
 
-    /// New records the title copied into slots `slots` in `frame` wait for
-    /// the draw that may read them through a table.
-    pub(crate) fn copied_wait(&self, frame: u64, slots: Vec<u32>) {
-        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).push_back((frame, slots));
-    }
-
-    /// The slots that have waited long enough at `frame`
-    /// ([`HostHeap::copied_wait`]), each once.
-    pub(crate) fn copied_before(&self, frame: u64) -> Vec<u32> {
-        let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out = Vec::new();
-        while waiting.front().is_some_and(|(written, _)| written + COPIED_GRACE <= frame) {
-            out.extend(waiting.pop_front().into_iter().flat_map(|(_, slots)| slots));
-        }
-        drop(waiting);
-        out.sort_unstable();
-        out.dedup();
-        out
+    /// Mirror a newly discovered or deferred record. Only a deferred copy has
+    /// an expected key: a rewrite while it waited invalidates that request.
+    pub(super) fn mirror_copied(&self, index: u32, handle: u64, expected: Option<u64>, frame: u64, found_ms: u64, due_now: bool) -> Option<View> {
+        self.mirror_record(index, handle, Origin::Copied { frame, found_ms, due_now }, expected)
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -3689,6 +3680,11 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_record(index, handle, if for_draw { Origin::Draw } else { Origin::Write }, None)
+    }
+
+    fn mirror_record(&self, index: u32, handle: u64, origin: Origin, expected: Option<u64>) -> Option<View> {
+        let for_draw = matches!(origin, Origin::Draw);
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -3707,6 +3703,9 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        if expected.is_some_and(|expected| tag != VIEW_TAG || key != expected) {
+            return None;
+        }
         // Made from this record, and nothing has changed it: most of the
         // asks, from five recording threads, behind one lock while another
         // held it to make a descriptor (15 % of a recording thread's time in
@@ -3728,10 +3727,10 @@ impl HostHeap {
                 self.quick_is(index, 0);
                 self.made.set(index, 0);
                 self.make_null(index);
-                let _ = self.note_buffer(index, None, false);
+                let _ = self.note_buffer(index, None, Origin::Write);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
-                let _ = self.note_buffer(index, None, false);
+                let _ = self.note_buffer(index, None, Origin::Write);
             }
             return None;
         };
@@ -3740,7 +3739,7 @@ impl HostHeap {
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
             // (When this slot's lock is let go: a lock at a time.)
-            let stale = self.note_buffer(index, Some(&view), for_draw);
+            let stale = self.note_buffer(index, Some(&view), origin);
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
@@ -6171,9 +6170,9 @@ mod tests {
         let mut q = TextureQueue::default();
         // Slots 10..18 written in frames 1..9, slot 5 last.
         for i in 0..8u32 {
-            q.written(10 + i, u64::from(i) + 1, 0, false);
+            q.written(10 + i, u64::from(i) + 1, 0, Origin::Write);
         }
-        q.written(5, 9, 0, false);
+        q.written(5, 9, 0, Origin::Write);
         let order: Vec<u32> = q.due(9, 100).into_iter().map(|d| d.0).collect();
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
@@ -6200,7 +6199,7 @@ mod tests {
         assert_eq!(q.due(12, 100)[0].0, 16);
         // The title writes slot 16 again while the pass works on it: what
         // the pass then says about the old write changes nothing.
-        q.written(16, 13, 0, false);
+        q.written(16, 13, 0, Origin::Write);
         q.done(16, w16);
         q.later(16, w16, 13, 4);
         assert_eq!(q.mapped(16), 0);
@@ -6208,13 +6207,13 @@ mod tests {
         // A draw that makes the host slot (`seen`) keeps what the queue knows,
         let w15 = write(&q, 15);
         q.partly(15, w15, 20, 8192);
-        q.written(15, 14, 0, true);
+        q.written(15, 14, 0, Origin::Draw);
         assert_eq!(q.mapped(15), 8192);
         // and queues a slot the queue did not hold.
-        q.written(99, 14, 0, true);
+        q.written(99, 14, 0, Origin::Draw);
         assert!(q.due(14, 100).iter().any(|d| d.0 == 99));
         // A write due later (a table's slot) is not handed out before.
-        q.written(98, 14, 16, false);
+        q.written(98, 14, 16, Origin::Write);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
     }
@@ -6227,7 +6226,7 @@ mod tests {
     fn slots_held_for_lack_of_room_come_back_when_there_is_room() {
         let mut q = TextureQueue::default();
         for i in 0..4u32 {
-            q.written(20 + i, 1, 0, false);
+            q.written(20 + i, 1, 0, Origin::Write);
         }
         let due = q.due(1, 100);
         assert_eq!(due.len(), 4);
@@ -6242,7 +6241,7 @@ mod tests {
         // Due again at their frame, in the order they had.
         assert_eq!(q.due(101, 100), due);
         // Slot 21 is written again while held: due as written.
-        q.written(21, 3, 0, false);
+        q.written(21, 3, 0, Origin::Write);
         assert!(q.due(3, 100).iter().any(|d| d.0 == 21));
         // Room again at frame 5: slot 20 is due at once, and only it was
         // still held as it was.
@@ -6412,7 +6411,7 @@ mod tests {
         let mut desc = [0u32; 16];
         (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
         let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
-        assert!(heap.note_buffer(1, Some(&view), false).is_empty());
+        assert!(heap.note_buffer(1, Some(&view), Origin::Write).is_empty());
         let written = [(at, at + 0x1000)];
         // Waiting for its first upload: held, not uploaded, nothing done.
         assert_eq!(heap.slots_written_under(&written, 50, true), [1, 0, 0]);
@@ -6495,7 +6494,7 @@ mod tests {
             View::Placed(false, [3, 0, 0, 0, width, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
         };
         let len = crate::resource::placed_bytes(&[3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0]).unwrap();
-        assert!(heap.note_buffer(1, Some(&view(at, 64)), false).is_empty());
+        assert!(heap.note_buffer(1, Some(&view(at, 64)), Origin::Write).is_empty());
         let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
@@ -6507,7 +6506,7 @@ mod tests {
         assert_eq!(slots(50), []);
         assert_eq!(slots(51), [1]);
         // A wider texture written at the same address: slot 1 is stale.
-        assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [(1, 0)]);
+        assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), Origin::Write), [(1, 0)]);
         assert_eq!(slots(u64::MAX), [2]);
     }
 
@@ -6526,18 +6525,18 @@ mod tests {
             (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
             View::Placed(false, [3, 0, 0, 0, width, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
         };
-        assert!(heap.note_buffer(1, Some(&view(at, 64)), false).is_empty());
+        assert!(heap.note_buffer(1, Some(&view(at, 64)), Origin::Write).is_empty());
         assert!(marked(1) && !marked(2));
         // Slot 1 made stale by slot 2: out of `by_slot`, still in `first`.
-        assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [(1, 0)]);
+        assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), Origin::Write), [(1, 0)]);
         assert!(marked(1) && marked(2));
         assert!(heap.placed.lock().unwrap().first.contains_key(&1));
         // Written with no view: forgotten, under the lock, and unmarked.
-        assert!(heap.note_buffer(1, None, false).is_empty());
+        assert!(heap.note_buffer(1, None, Origin::Write).is_empty());
         assert!(!marked(1) && !heap.placed.lock().unwrap().first.contains_key(&1));
         // A slot never in the spans: nothing there to change.
-        assert!(heap.note_buffer(3, None, false).is_empty());
-        assert!(heap.note_buffer(2, None, false).is_empty());
+        assert!(heap.note_buffer(3, None, Origin::Write).is_empty());
+        assert!(heap.note_buffer(2, None, Origin::Write).is_empty());
         let spans = heap.placed.lock().unwrap();
         assert!(spans.by_slot.is_empty() && spans.by_start.is_empty() && spans.first.is_empty());
         assert!(heap.spanned.all(u64::MAX).is_empty());
@@ -6583,29 +6582,29 @@ mod tests {
         let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
         let texture = View::Placed(false, [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0], [0; 16]);
         assert!(is_texture_view(&texture));
-        heap.queue_texture(2, true, false, frame);
-        heap.queue_texture(3, true, false, frame);
+        heap.queue_texture(2, true, Origin::Write, frame);
+        heap.queue_texture(3, true, Origin::Write, frame);
         assert_eq!(slots(frame), [3, 2]);
         heap.tabled_in(3, true, frame);
         assert_eq!(slots(frame), [2]);
         // Made in place by the draw that read it: still out.
-        heap.queue_texture(3, true, true, frame);
+        heap.queue_texture(3, true, Origin::Draw, frame);
         assert_eq!(slots(frame), [2]);
         // Written again in the next frame: due once the grace frames have
         // passed without a draw that reads it.
-        heap.queue_texture(3, true, false, frame + 1);
-        assert_eq!(slots(frame + TABLED_GRACE), [2]);
-        assert_eq!(slots(frame + 1 + TABLED_GRACE), [3, 2]);
+        heap.queue_texture(3, true, Origin::Write, frame + 1);
+        assert_eq!(slots(frame.saturating_add(tabled_grace())), [2]);
+        assert_eq!(slots(frame + 1 + tabled_grace()), [3, 2]);
         // The draw comes after all: out again.
         heap.tabled_in(3, true, frame + 1);
         assert_eq!(slots(u64::MAX), [2]);
         // A slot of a table no draw read stays queued; its next write waits.
         heap.tabled_in(2, false, frame + 1);
         assert_eq!(slots(frame + 1), [2]);
-        heap.queue_texture(2, true, false, frame + 2);
+        heap.queue_texture(2, true, Origin::Write, frame + 2);
         assert_eq!(slots(frame + 2), []);
         // Long after the last table, a write is due at once.
-        heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
+        heap.queue_texture(2, true, Origin::Write, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
     }
 

@@ -11,6 +11,8 @@ use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, T
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
+mod copied;
+#[cfg(windows)]
 pub(crate) mod host;
 
 const HEAP_IIDS: [Iid; 4] = [
@@ -373,11 +375,23 @@ impl Drop for SyncedHeaps {
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    use std::sync::atomic::Ordering::Relaxed;
     if !sync_on() {
         return;
     }
     let started = std::time::Instant::now();
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let registered = heaps.iter().map(|&(start, end, at)| {
+        // SAFETY: the read lock keeps every registered heap live.
+        (start, end, unsafe { &*(at as *const Heap) })
+    });
+    sync_records(registered, crate::frame::current(), copied::Options::current());
+    drop(heaps);
+    SYNCED[3].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(windows)]
+fn sync_records<'a>(heaps: impl Iterator<Item = (u64, u64, &'a Heap)>, frame: u64, options: copied::Options) {
+    use std::sync::atomic::Ordering::Relaxed;
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);
     let mut spent = [0u64; 3];
@@ -385,12 +399,8 @@ pub(crate) fn sync_heaps() {
     let mut kinds = [0u64; 5];
     let mut job_ns = [0u64; 3];
     let mut short = 0u64;
-    let mut wait: Vec<u32> = Vec::new();
-    let frame = crate::frame::current();
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    for &(start, end, at) in heaps.iter() {
-        // SAFETY: registered heaps are live (removed when dropped).
-        let heap = unsafe { &*(at as *const Heap) };
+    let (mut early, mut recovered) = (0u64, 0u64);
+    for (start, end, heap) in heaps {
         let (Some(Some(host)), Some(written), Some(step)) =
             (heap.host.get(), &heap.written, increment(heap.desc.kind))
         else {
@@ -402,24 +412,51 @@ pub(crate) fn sync_heaps() {
         let mirrored_count = heap.desc.count.min(host.count());
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
-        let before = host.copied_before(frame);
+        let before = host.waiting.ready(frame, copied::copied_grace(), |_, _| true);
+        let mirror = |record: copied::Record, found_ms, due_now| {
+            let handle = start + u64::from(record.index) * step;
+            host.mirror_copied(record.index, handle, Some(record.key), frame, found_ms, due_now).is_some()
+        };
         let of_tables = std::sync::atomic::AtomicU64::new(0);
+        let replaced = std::sync::atomic::AtomicU64::new(0);
         let (pages_a_job, records_a_job) = sync_jobs();
         let phase = crate::timeline::span("the heaps' records: those that waited");
         crate::land::each_view(true, before.len().div_ceil(records_a_job), &|n| {
-            for &index in before.chunks(records_a_job).nth(n).unwrap_or_default() {
+            for &(record, found_ms) in before.chunks(records_a_job).nth(n).unwrap_or_default() {
+                let index = record.index;
                 if host.copied_tabled(index, frame) {
                     of_tables.fetch_add(1, Relaxed);
-                } else {
-                    host.mirror(index, start + u64::from(index) * step, false);
+                } else if !mirror(record, found_ms, options.at_once) {
+                    replaced.fetch_add(1, Relaxed);
                 }
             }
         });
         phase.end();
         let of_tables = of_tables.into_inner();
         tabled += of_tables;
-        mirrored += before.len() as u64 - of_tables;
-        kinds[4] += before.len() as u64 - of_tables;
+        let made = before.len() as u64 - of_tables - replaced.into_inner();
+        mirrored += made;
+        kinds[4] += made;
+        // A draw may have claimed a record since the write. Drain even in an
+        // off phase when the diagnostics A/B switches are cycling.
+        if options.orphans || cfg!(feature = "diagnostics") {
+            let orphans = host.orphans.ready(frame, copied::COPIED_FRAMES, |index, written| {
+                options.orphans && host.table_age(index, frame).is_none_or(|age| age > frame - written)
+            });
+            let replaced = std::sync::atomic::AtomicU64::new(0);
+            crate::land::each_view(true, orphans.len().div_ceil(records_a_job), &|n| {
+                for &(record, found_ms) in orphans.chunks(records_a_job).nth(n).unwrap_or_default() {
+                    if !mirror(record, found_ms, true) {
+                        replaced.fetch_add(1, Relaxed);
+                    }
+                }
+            });
+            let made = orphans.len() as u64 - replaced.into_inner();
+            mirrored += made;
+            recovered += made;
+        }
+        let mut wait = Vec::new();
+        let mut left = Vec::new();
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
         // Ranges of the heap to look at, and whether a range is one the
@@ -468,6 +505,7 @@ pub(crate) fn sync_heaps() {
         // thread at 160 pages, run faults-6).
         let began = std::time::Instant::now();
         let copied = host.copied_begin(step as usize);
+        let found_ms = crate::host::now_ms();
         let samplers = heap.samplers();
         let in_place = sync_in_place() && step == 32 && crate::safecopy::on();
         let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(pages_a_job).map(|_| Default::default()).collect();
@@ -548,20 +586,22 @@ pub(crate) fn sync_heaps() {
                         // Renderer port #2's fallback: what no mark told of.
                         crate::port_descriptors::missed(index, start + u64::from(index) * step, !samplers && word(0) == VIEW_TAG, host.copied_tabled(index, frame));
                     }
-                    if !samplers && word(0) == VIEW_TAG {
-                        // A draw's own table: the draw makes what it
-                        // reads of it (`draw.rs` `tables`).
-                        if host.copied_tabled(index, frame) {
-                            out.tabled += 1;
-                            continue;
-                        }
-                        // Buffer views and placed textures get no host
-                        // slot from this anyway, they wait for a draw
-                        // or a pass: noted some frames on, unless a
-                        // draw's table turns out to hold them.
-                        if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
-                            out.wait.push(index);
-                            continue;
+                    if !samplers && word(0) == VIEW_TAG && host.copied_waits() {
+                        let generation = word(2);
+                        let record = || copied::Record { index, key: u64::from(generation) << 32 | u64::from(word(1)) };
+                        match options.schedule(generation >> KIND_SHIFT, host.table_age(index, frame)) {
+                            copied::Schedule::Table => {
+                                out.tabled += 1;
+                                if options.orphans {
+                                    out.left.push(record());
+                                }
+                                continue;
+                            }
+                            copied::Schedule::Wait => {
+                                out.wait.push(record());
+                                continue;
+                            }
+                            copied::Schedule::Now => out.early += u64::from(generation >> KIND_SHIFT == PLACED),
                         }
                     }
                     // No view, in a slot that shows none: nothing to make or
@@ -599,10 +639,12 @@ pub(crate) fn sync_heaps() {
             looked += part.looked;
             short += part.short;
             tabled += part.tabled;
+            early += part.early;
             kinds[0] += part.nothing;
             later += part.wait.len() as u64;
             mirrored += part.make.len() as u64;
             wait.append(&mut part.wait);
+            left.append(&mut part.left);
             make.append(&mut part.make);
             for (kind, n) in kinds.iter_mut().zip(part.kinds) {
                 *kind += n;
@@ -616,18 +658,15 @@ pub(crate) fn sync_heaps() {
         let phase = crate::timeline::span("the heaps' records: made");
         crate::land::each_view(true, make.len().div_ceil(records_a_job), &|n| {
             for &index in make.chunks(records_a_job).nth(n).unwrap_or_default() {
-                host.mirror(index, start + u64::from(index) * step, false);
+                host.mirror_copied(index, start + u64::from(index) * step, None, frame, found_ms, false);
             }
         });
         phase.end();
         spent[2] += since(began);
-        if !wait.is_empty() {
-            host.copied_wait(frame, std::mem::take(&mut wait));
-        }
+        host.waiting.push(frame, found_ms, wait);
+        host.orphans.push(frame, found_ms, left);
     }
-    drop(heaps);
-    let micros = started.elapsed().as_micros() as u64;
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, micros, tabled, later]) {
+    for (count, n) in [0, 1, 2, 4, 5].map(|i| &SYNCED[i]).into_iter().zip([pages, looked, mirrored, tabled, later]) {
         count.fetch_add(n, Relaxed);
     }
     let [taking, reading, making] = spent;
@@ -641,7 +680,15 @@ pub(crate) fn sync_heaps() {
         count.fetch_add(n, Relaxed);
     }
     SYNC_SHORT.fetch_add(short, Relaxed);
+    for (count, n) in COPIED_EARLY.iter().zip([early, recovered]) {
+        if n != 0 {
+            count.fetch_add(n, Relaxed);
+        }
+    }
 }
+
+#[cfg(windows)]
+static COPIED_EARLY: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Pages [`sync_heaps`] read in place of which a part could not be read
 /// ([`sync_in_place`]), since the last frame line.
@@ -716,9 +763,11 @@ struct SyncPart {
     bytes: u64,
     looked: u64,
     tabled: u64,
+    early: u64,
     nothing: u64,
     make: Vec<u32>,
-    wait: Vec<u32>,
+    wait: Vec<copied::Record>,
+    left: Vec<copied::Record>,
     kinds: [u64; 5],
     /// Nanoseconds reading, comparing, sorting out ([`SYNC_JOBS_NS`]).
     ns: [u64; 3],
@@ -738,7 +787,7 @@ const SYNC_AT_A_TIME: usize = 256;
 /// shader-visible heaps looked at, slots on them, slots whose record was
 /// not the one last seen and was mirrored, the microseconds it took; then
 /// new records left to the draws that read them through a table, and new
-/// records that waited for one ([`host::HostHeap::copied_wait`]); and the
+/// records that waited for one ([`copied::copied_grace`]); and the
 /// microseconds submissions waited for it ([`sync_aside`]).
 #[cfg(windows)]
 pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
@@ -770,6 +819,13 @@ pub(crate) fn sync_line(frames: f64) {
     let jobs = [0, 1, 2].map(|i| SYNC_JOBS_NS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / frames);
     let quick = [0, 1].map(|i| host::SPANS_QUICK[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     let short = SYNC_SHORT.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let [early, recovered] = COPIED_EARLY.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed));
+    if early + recovered != 0 {
+        tracing::info!(
+            "copied records per frame: {:.1} placed records scheduled immediately, {:.1} unclaimed table records recovered",
+            early as f64 / frames, recovered as f64 / frames,
+        );
+    }
     if pages == 0 {
         return;
     }

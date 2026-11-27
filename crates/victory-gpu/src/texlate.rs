@@ -1,7 +1,8 @@
 //! How long textures take to be shown as the title asks (always counted; a
 //! line every few seconds with the memory lines): from the moment a title
-//! slot of a texture picked by index is written (or its memory is mapped or
-//! written) to the moment the pass brought it up to date, apart for slots
+//! slot of a texture picked by index is written (for a byte copy, when heap
+//! sync first observes it, including its grace frames) or its memory is
+//! mapped or written, to the moment the pass brought it up to date, apart for slots
 //! whose memory was there at the first look and those that waited for it
 //! (the title's streaming, or ours of its files); and from an upload's
 //! recording to the slot that shows it being made from it, for a slot that
