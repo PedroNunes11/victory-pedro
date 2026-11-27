@@ -26,6 +26,17 @@
 //! right after. Objects named (pipelines, resources) must live until the list
 //! has run; a recording the title resets or releases without submitting it is
 //! not run any further.
+//!
+//! With VICTORY_THIN_SPLIT=1, workers decode root bindings of already queued
+//! chunks in parallel. Only the recording's owner applies them, in order.
+//! With VICTORY_THIN_STATS=1, every five seconds the log reports each submitted
+//! frame's list sizes, translation times and repeated stream fingerprints.
+//! Both switches are off by default. See the split and stats modules below.
+
+mod split;
+#[cfg(test)]
+mod split_tests;
+pub(crate) mod stats;
 
 use super::*;
 use std::collections::VecDeque;
@@ -39,6 +50,8 @@ use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 
 /// Words after which a stream is handed to the translating threads.
 const CHUNK: usize = 1024;
+/// Poll before translating each Nth call, including inside a split chunk.
+const ABANDON_POLL: u64 = 64;
 
 /// Whether list calls are only written down (`VICTORY_THIN=1`; needs the line
 /// of submissions, which it turns on).
@@ -185,6 +198,7 @@ pub(crate) struct Recording {
     done: AtomicBool,
     moved: Condvar,
     abandoned: AtomicBool,
+    sample: Option<stats::Ticket>,
 }
 
 #[derive(Default)]
@@ -198,6 +212,7 @@ struct Inner {
     back: usize,
     /// That list was closed by the stream.
     closed: bool,
+    timing: stats::Timing,
 }
 
 impl Recording {
@@ -208,6 +223,7 @@ impl Recording {
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
+            sample: stats::ticket(),
         }
     }
 
@@ -230,8 +246,12 @@ impl Recording {
 
     /// Translates what there is.
     fn run(&self) {
+        self.run_with_split(split::on());
+    }
+
+    fn run_with_split(&self, split: bool) {
         loop {
-            let (chunk, back) = {
+            let (chunk, more, back) = {
                 let mut inner = held(&self.inner);
                 let Some(chunk) = inner.chunks.pop_front() else {
                     inner.scheduled = false;
@@ -240,24 +260,59 @@ impl Recording {
                 if inner.back == 0 {
                     inner.back = back_list(self.kind) as usize;
                 }
-                (chunk, inner.back as This)
+                let more = if split && !inner.chunks.is_empty() && !self.abandoned.load(Acquire) {
+                    let n = inner.chunks.len().min(split::MAX_CHUNKS - 1);
+                    inner.chunks.drain(..n).collect()
+                } else {
+                    Vec::new()
+                };
+                (chunk, more, inner.back as This)
             };
             let began = std::time::Instant::now();
-            let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
-            STATS[0].fetch_add(calls, Relaxed);
-            STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
-            let mut inner = held(&self.inner);
-            inner.kept.push(chunk);
-            if closed {
-                inner.closed = true;
-                let kept = std::mem::take(&mut inner.kept);
-                self.done.store(true, Release);
-                self.moved.notify_all();
-                drop(inner);
-                give_back(kept);
-                STATS[2].fetch_add(1, Relaxed);
-                crate::queue::line_moved();
+            if more.is_empty() {
+                let result = translate::<false>(back, &chunk, &split::Plan::default(), || {
+                    self.abandoned.load(Acquire)
+                });
+                self.finish_chunk(chunk, result, began.elapsed(), None);
+            } else {
+                let pieces = split::prepare(std::iter::once(chunk).chain(more));
+                let mut since = began;
+                for (chunk, plan) in pieces {
+                    let result = translate::<true>(back, &chunk, &plan, || self.abandoned.load(Acquire));
+                    self.finish_chunk(chunk, result, since.elapsed(), Some(plan.bindings()));
+                    since = std::time::Instant::now();
+                }
             }
+        }
+    }
+
+    fn finish_chunk(
+        &self,
+        chunk: Vec<u64>,
+        (calls, closed): (u64, bool),
+        elapsed: std::time::Duration,
+        bindings: Option<usize>,
+    ) {
+        STATS[0].fetch_add(calls, Relaxed);
+        STATS[1].fetch_add(elapsed.as_micros() as u64, Relaxed);
+        let mut inner = held(&self.inner);
+        if self.sample.is_some() {
+            inner.timing.add(elapsed, bindings);
+        }
+        inner.kept.push(chunk);
+        if closed {
+            inner.closed = true;
+            let kept = std::mem::take(&mut inner.kept);
+            let timing = inner.timing;
+            self.done.store(true, Release);
+            self.moved.notify_all();
+            drop(inner);
+            if let Some(ticket) = &self.sample {
+                stats::complete(ticket, self.kind, &kept, timing);
+            }
+            give_back(kept);
+            STATS[2].fetch_add(1, Relaxed);
+            crate::queue::line_moved();
         }
     }
 }
@@ -683,15 +738,33 @@ extern "system" fn copy_texture_region_x(
 
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
-fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
+fn translate<const SPLIT: bool>(
+    list: This,
+    stream: &[u64],
+    plan: &split::Plan,
+    left: impl Fn() -> bool,
+) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
+    let mut runs = plan.runs.iter().peekable();
     let mut skip = left();
     while i < stream.len() {
+        if SPLIT && let Some(run) = runs.next_if(|r| r.start == i) {
+            // Runs also break immediately before each abandonment check.
+            if (calls + 1) % ABANDON_POLL == 0 {
+                skip = left();
+            }
+            if !skip {
+                with_state(list, |_, state| plan.apply(run, state));
+            }
+            calls += run.len() as u64;
+            i = run.end;
+            continue;
+        }
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
         i += 1 + len;
         calls += 1;
-        if calls % 64 == 0 {
+        if calls % ABANDON_POLL == 0 {
             skip = left();
         }
         if op == UPLOAD {
@@ -810,6 +883,7 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     TOLD.call_once(|| tracing::warn!("an upscale written down was neither DLSS nor stretched"));
                 }
             }
+            _ if SPLIT => crate::host::fail(format_args!("unknown THIN opcode {op:#x}")),
             _ => {}
         }
     }

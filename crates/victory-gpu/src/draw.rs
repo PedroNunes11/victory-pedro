@@ -644,6 +644,32 @@ impl Drop for State {
 }
 
 impl State {
+    /// Canonical bytes of the two root argument banks for translation parity tests.
+    #[cfg(test)]
+    pub(crate) fn root_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for bank in [&self.graphics, &self.compute] {
+            out.extend_from_slice(&(bank.len() as u64).to_le_bytes());
+            for root in bank {
+                match root {
+                    Root::None => out.push(0),
+                    Root::Table(handle) | Root::View(handle) => {
+                        out.push(if matches!(root, Root::Table(_)) { 1 } else { 2 });
+                        out.extend_from_slice(&handle.to_le_bytes());
+                    }
+                    Root::Constants(values) => {
+                        out.push(3);
+                        out.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                        for v in values {
+                            out.extend_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene

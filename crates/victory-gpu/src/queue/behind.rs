@@ -56,6 +56,8 @@ use crate::fence::FenceRef;
 pub(super) trait Work: Send {
     /// What has to be met before it goes.
     type Ask;
+    /// Observe the same enqueue order as the queues, including across threads.
+    fn enqueued(&self) {}
     fn ask(&self) -> Option<Self::Ask>;
     fn met(ask: &Self::Ask) -> bool;
     /// Whether it is a present: everything before it goes first, met or not.
@@ -183,6 +185,7 @@ impl<W: Work> Lane<W> {
     }
 
     fn put(state: &mut State<W>, queue: usize, what: W, mark: u64) {
+        what.enqueued();
         state.presents += usize::from(what.shows());
         state.runs += usize::from(what.runs());
         let number = state.next;
@@ -477,6 +480,15 @@ enum Ask {
 
 impl Work for Job {
     type Ask = Ask;
+
+    fn enqueued(&self) {
+        use crate::list::thin::stats;
+        match self {
+            Job::Lists(_, recordings) => stats::submitted(recordings),
+            Job::Present(_, _, shown) => stats::present(shown.frame),
+            _ => {}
+        }
+    }
 
     fn ask(&self) -> Option<Ask> {
         match self {
