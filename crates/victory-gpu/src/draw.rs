@@ -5201,15 +5201,14 @@ impl State {
             );
         }
         // The stand-in for reflections after the program that gives rays
-        // that found nothing the sky (`crate::ambient`, `Role::Miss`): the
-        // execution held back is recorded first. (Not after one joined to
-        // the run before: the tables noted are another program's.)
+        // that found nothing the sky (`crate::ambient`, `Role::Miss`). (On
+        // this base the execution was recorded above, not held back, and no
+        // run is joined: VNV's `joined` / `unsettle_indirect` have nothing to
+        // do here.)
         if kind == DISPATCH
-            && !joined
             && let Some(role @ crate::ambient::Role::Miss) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
         {
-            unsettle_indirect(list);
             if self.ambient(list, p, role) {
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
