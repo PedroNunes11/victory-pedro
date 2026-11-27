@@ -83,6 +83,108 @@ pub fn asked_upscaler() -> Option<u32> {
     kind
 }
 
+/// `VICTORY_RT_HEAP_SCALE=<x>` (1 to 4), else worked out from the render size asked: the
+/// pixels rendered over 2560x1440's (the console's own 4K render size), 2.25 for 3840x2160 at
+/// 1.0. `None`: the console's sizes will do.
+pub fn asked_heap_scale() -> Option<f64> {
+    if let Ok(spec) = std::env::var("VICTORY_RT_HEAP_SCALE") {
+        let x = spec.trim().parse::<f64>().ok().filter(|x| (1.0..=4.0).contains(x));
+        if x.is_none() {
+            eprintln!("VIctory: VICTORY_RT_HEAP_SCALE={spec}: expected 1 to 4");
+        }
+        return x;
+    }
+    let (w, h) = asked_output()?;
+    // Series X: the title's own upscaler renders at 2/3, FidelityFX (and DLSS in its place) at 1.0.
+    let scale = if asked_upscaler() == Some(7) {
+        asked_ffx_scale().unwrap_or(1.0)
+    } else {
+        asked_render_scale().unwrap_or(2.0 / 3.0)
+    };
+    heap_scale_for(w, h, scale)
+}
+
+/// The pixels of `w` x `h` rendered at `scale` over 2560x1440's, `None` if not more.
+pub fn heap_scale_for(w: u32, h: u32, scale: f32) -> Option<f64> {
+    let pixels = f64::from(w) * f64::from(h) * f64::from(scale) * f64::from(scale);
+    let ratio = pixels / (2560.0 * 1440.0);
+    (ratio > 1.01).then_some(ratio)
+}
+
+/// The most a heap may hold: its allocator keeps its free blocks' sizes in 32 bits (+0x14554f6d3
+/// writes the first one's), so a heap of 4 GiB or more is cut to what lies past 4 GiB (4992 MiB
+/// held 896 and a 500 MiB target failed). 2 MiB short of 4 GiB, in whole 2 MiB pages.
+pub const HEAP_MAX_MB: u64 = 4094;
+
+/// `mb` grown by `scale`, in whole 64 MiB, at most [`HEAP_MAX_MB`].
+pub fn grown(mb: u64, scale: f64) -> u64 {
+    (((mb as f64 * scale).ceil() as u64).div_ceil(64) * 64).min(HEAP_MAX_MB)
+}
+
+/// The title's heap table (+0x6186250): a row per console, Series S's then Series X's (+0x50),
+/// a total and nine heap sizes; at startup (+0x1e1ced0) the title copies its console's row and
+/// commits each heap. Two hold the render targets. At 3840x2160 rendered at 1.0 the first
+/// full-screen target (0x1fe0000 bytes) was more than the third heap held (its allocator
+/// +0x71c2808, made at +0x1e1d418): out of memory (`int3` at +0x2219650) before the first frame.
+/// Each with its size in MiB.
+pub const GPU_HEAPS: [(Site, u64); 4] = [
+    (Site { at: 0x618_6258, what: "heap 1 (Series S)", bytes: &[0x00, 0x00, 0xa0, 0x48, 0x00, 0x00, 0x00, 0x00] }, 1162),
+    (Site { at: 0x618_6268, what: "heap 3, render targets (Series S)", bytes: &[0x00, 0x00, 0xd0, 0x4f, 0x00, 0x00, 0x00, 0x00] }, 1277),
+    (Site { at: 0x618_62a8, what: "heap 1 (Series X)", bytes: &[0x00, 0x00, 0x40, 0x49, 0x00, 0x00, 0x00, 0x00] }, 1172),
+    (Site { at: 0x618_62b8, what: "heap 3, render targets (Series X)", bytes: &[0x00, 0x00, 0x70, 0x89, 0x00, 0x00, 0x00, 0x00] }, 2199),
+];
+
+/// The render targets' placed pool, in 64 KiB pages (+0x1d488a0: `mov eax, 1290h` for Series S,
+/// `mov esi, 2C60h` for Series X, 296 and 710 MiB; kept at +0x75eaeb8 and handed on as a 32-bit
+/// byte count). A layout of the targets larger than the pool stops the title (`int3` at
+/// +0x2473e88): 1293 MiB at 3840x2160 rendered at 1.0. Each with its pages.
+pub const RT_POOLS: [(Site, u32); 2] = [
+    (Site { at: 0x1d4_88ac, what: "render target pool (Series S)", bytes: &[0xb8, 0x90, 0x12, 0x00, 0x00] }, 0x1290),
+    (Site { at: 0x1d4_88b1, what: "render target pool (Series X)", bytes: &[0xbe, 0x60, 0x2c, 0x00, 0x00] }, 0x2c60),
+];
+
+/// The pool's physical pages are asked for with a static array (+0x75eaee0) for their numbers, a
+/// u64 each, room for the console's 0x2c60: more pages overwrote what follows it (a table's count
+/// at +0x760b030; the title then read past its image in System Init). These four `lea reg,
+/// [rip+d]` name the array (the asking at +0x5eb278d, the layout's at +0x2473fa1, +0x2474079,
+/// +0x24740ec); the sites are their displacements, pointed at room of ours for a larger pool.
+pub const PAGE_ARRAY: usize = 0x75e_aee0;
+pub const PAGE_ARRAY_USES: [Site; 4] = [
+    Site { at: 0x5eb_2790, what: "pool page array (asked for)", bytes: &[0x4c, 0x87, 0x73, 0x01] },
+    Site { at: 0x247_3fa4, what: "pool page array (layout 1)", bytes: &[0x38, 0x6f, 0x17, 0x05] },
+    Site { at: 0x247_407c, what: "pool page array (layout 2)", bytes: &[0x60, 0x6e, 0x17, 0x05] },
+    Site { at: 0x247_40ef, what: "pool page array (layout 3)", bytes: &[0xed, 0x6d, 0x17, 0x05] },
+];
+
+/// `bytes` of zeroed read-write memory within reach of a 32-bit displacement from all of the
+/// image (`size` bytes at `base`): tried at 64 KiB steps from the image's end. Kept for the
+/// process's life.
+///
+/// # Safety
+/// `base` and `size` are the mapped image's.
+#[cfg(windows)]
+pub unsafe fn room_near(base: usize, size: usize, bytes: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    let bytes = bytes.div_ceil(0x1_0000) * 0x1_0000;
+    let mut at = (base + size).div_ceil(0x1_0000) * 0x1_0000;
+    // The farthest place still reached from the image's start.
+    let last = base + 0x7000_0000 - bytes;
+    while at <= last {
+        // SAFETY: asks for fresh memory at a free place, or gets nothing.
+        let got = unsafe { VirtualAlloc(at as *const _, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        if got != 0 {
+            return Some(got);
+        }
+        at += 0x1_0000;
+    }
+    None
+}
+
+/// `pages` grown by `scale`, in whole 2 MiB, under 4 GiB.
+pub fn pool_grown(pages: u32, scale: f64) -> u32 {
+    (((f64::from(pages) * scale).ceil() as u32).div_ceil(32) * 32).min(0xffe0)
+}
+
 /// A place to change: its offset in the image and the bytes there
 /// (compared first; the replacement is at most as long).
 pub struct Site {
@@ -304,6 +406,36 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
         asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
         asked.push((&PICKER_COPY, picker_code(kind), format!("returns {kind}")));
     }
+    if let Some(x) = asked_heap_scale() {
+        for (site, mb) in &GPU_HEAPS {
+            let to = grown(*mb, x);
+            asked.push((site, (to << 20).to_le_bytes().to_vec(), format!("{mb} to {to} MiB")));
+        }
+        // The pool grows only with its page array moved to room of ours, all four places that
+        // name the array changed together.
+        let most = RT_POOLS.iter().map(|(_, p)| pool_grown(*p, x)).max().unwrap_or(0);
+        // SAFETY: the caller's promise.
+        let names_match = PAGE_ARRAY_USES.iter().all(|s| unsafe { matches(base, size, s) } == Patched::Done);
+        // SAFETY: as above.
+        match names_match.then(|| unsafe { room_near(base, size, most as usize * 8) }).flatten() {
+            Some(room) => {
+                for site in &PAGE_ARRAY_USES {
+                    let disp = rel(room - base, site.at + 4);
+                    asked.push((site, disp.to_vec(), format!("{:#x}", room)));
+                }
+                for (site, pages) in &RT_POOLS {
+                    let to = pool_grown(*pages, x);
+                    let mut code = site.bytes[..1].to_vec();
+                    code.extend(to.to_le_bytes());
+                    asked.push((site, code, format!("{} to {} MiB", pages >> 4, to >> 4)));
+                }
+            }
+            None => {
+                tracing::warn!(names_match, "resolution: the render target pool is left at the console's size (its page array could not be moved)");
+                println!("resolution: render target pool left at the console's size (page array not moved; names match: {names_match})");
+            }
+        }
+    }
     for (site, code, value) in asked {
         // SAFETY: the caller's promise.
         let done = unsafe { write(base, size, site, &code) };
@@ -332,6 +464,28 @@ mod tests {
         assert_eq!(parse_render_scale("1"), Some(1.0));
         assert_eq!(parse_render_scale("0.4"), None);
         assert_eq!(parse_render_scale("1.5"), None);
+    }
+
+    #[test]
+    fn the_render_target_heaps_follow_the_render_size() {
+        assert_eq!(heap_scale_for(3840, 2160, 2.0 / 3.0), None, "the console's own 4K");
+        assert_eq!(heap_scale_for(2560, 1440, 1.0), None);
+        assert_eq!(heap_scale_for(2560, 1440, 0.58), None);
+        assert_eq!(heap_scale_for(3840, 2160, 1.0), Some(2.25));
+        assert_eq!(grown(2199, 2.25), HEAP_MAX_MB, "under 4 GiB");
+        assert!((HEAP_MAX_MB << 20) < 1 << 32 && (HEAP_MAX_MB << 20) % (2 << 20) == 0);
+        assert_eq!(grown(1172, 2.25), 2688);
+        for (site, mb) in &GPU_HEAPS {
+            assert_eq!(site.bytes, (mb << 20).to_le_bytes(), "{}", site.what);
+        }
+        for (site, pages) in &RT_POOLS {
+            assert_eq!(site.bytes[1..], pages.to_le_bytes(), "{}", site.what);
+        }
+        assert_eq!(pool_grown(0x2c60, 2.25), 0x63e0, "1598 MiB, over the 1293 asked at 4K native");
+        assert_eq!(pool_grown(0x2c60, 100.0), 0xffe0);
+        for site in &PAGE_ARRAY_USES {
+            assert_eq!(site.bytes, rel(PAGE_ARRAY, site.at + 4), "{}", site.what);
+        }
     }
 
     /// The calls and loads in the bytes compared are the ones the
