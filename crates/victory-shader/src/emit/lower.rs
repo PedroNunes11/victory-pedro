@@ -5113,14 +5113,45 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Combines a lane guard with [`Self::partial_active`], masking out
+    /// unlaunched tail threads that a split wave64 group keeps alive for barriers.
+    fn active_guard(&mut self, guard: Option<V>) -> Option<V> {
+        match (guard, self.partial_active) {
+            (Some(g), Some(a)) => Some(self.s.m.bin(self.cur, Bin::And, g, a)),
+            (g, a) => g.or(a),
+        }
+    }
+
+    /// Whether host lane `src` (in `0..wave_size`) satisfies `cond`, via `waveActiveBallot`.
+    fn lane_active(&mut self, cond: V, src: V) -> V {
+        self.s.flags |= flags::WAVE_OPS;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let mask = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[cond]);
+        let lo = self.s.m.extract(c, mask, 0);
+        let hi = self.s.m.extract(c, mask, 1);
+        let (k31, k32, one, zero) = (
+            self.s.m.i32(31),
+            self.s.m.i32(32),
+            self.s.m.i32(1),
+            self.s.m.i32(0),
+        );
+        let lower = self.s.m.cmp(c, pred::IULT, src, k32);
+        let word = self.s.m.select(c, lower, lo, hi);
+        let bit = self.s.m.bin(c, Bin::And, src, k31);
+        let bit = self.s.m.bin(c, Bin::LShr, word, bit);
+        let bit = self.s.m.bin(c, Bin::And, bit, one);
+        self.s.m.cmp(c, pred::NE, bit, zero)
+    }
+
     /// [`Self::guard`] of a memory access: not by the threads a partial final group only
     /// keeps for its barriers ([`Self::partial_active`]).
     fn memory_guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
         let g = self.guard(b, i)?;
-        Ok(match (g, self.partial_active) {
-            (Some(g), Some(a)) => Some(self.s.m.bin(self.cur, Bin::And, g, a)),
-            (g, a) => g.or(a),
-        })
+        Ok(self.active_guard(g))
     }
 
     /// `on` (the lanes of a mask, at `at`) without the threads a partial final group keeps
@@ -5476,8 +5507,9 @@ impl<'a> Lower<'a> {
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
-    /// lane must be a constant.
+    /// lane must be a constant. Only used in mesh shaders (no `partial_active`).
     fn quad_pick(&mut self, x: V, src: V) -> V {
+        debug_assert!(self.partial_active.is_none());
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
         let three = self.s.m.i32(3);
@@ -5509,8 +5541,10 @@ impl<'a> Lower<'a> {
     }
 
     /// `x` of the lane of this lane's quad that `lanes` names for each of
-    /// the quad's four, by the host's quad operations.
+    /// the quad's four, by the host's quad operations. Only used in pixel
+    /// shaders (no `partial_active`).
     fn quad_read(&mut self, x: V, lanes: [u8; 4]) -> V {
+        debug_assert!(self.partial_active.is_none());
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -5595,7 +5629,7 @@ impl<'a> Lower<'a> {
         let i32t = self.s.t.i32;
         self.s.flags |= flags::WAVE_OPS;
         let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
-        let Some(g) = guard else {
+        let Some(g) = self.active_guard(guard) else {
             return (first, self.s.m.bool(true));
         };
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
@@ -5722,6 +5756,13 @@ impl<'a> Lower<'a> {
                 };
                 self.quad_read(x, lanes)
             } else {
+                let x = match self.active_guard(guard) {
+                    Some(g) => {
+                        let z = self.s.m.i32(0);
+                        self.s.m.select(c, g, x, z)
+                    }
+                    None => x,
+                };
                 self.read_lane(x, src)
             };
             let reg = dst_reg.ok_or("a swizzle result")?;
@@ -5759,7 +5800,7 @@ impl<'a> Lower<'a> {
             } else {
                 src
             };
-            let x = match guard {
+            let x = match self.active_guard(guard) {
                 Some(g) => {
                     let z = self.s.m.i32(0);
                     self.s.m.select(c, g, x, z)
@@ -8684,8 +8725,8 @@ impl<'a> Lower<'a> {
         let row = self.s.m.bin(c, Bin::And, lane, sixteen_mask);
         let pos = self.s.m.bin(c, Bin::And, lane, low);
         // Source lane, and whether it lies in the row.
-        let (src, inside, masks, zero) = match dpp {
-            Dpp::Lanes { sel, .. } => {
+        let (src, mut inside, masks, zero, fi) = match dpp {
+            Dpp::Lanes { sel, fi } => {
                 let (seven, not7, three) = (k(self, 7), k(self, !7), k(self, 3));
                 let p = self.s.m.bin(c, Bin::And, lane, seven);
                 let sh = self.s.m.bin(c, Bin::Mul, p, three);
@@ -8693,14 +8734,14 @@ impl<'a> Lower<'a> {
                 let pick = self.s.m.bin(c, Bin::LShr, sel, sh);
                 let pick = self.s.m.bin(c, Bin::And, pick, seven);
                 let base = self.s.m.bin(c, Bin::And, lane, not7);
-                (self.s.m.bin(c, Bin::Or, base, pick), None, None, false)
+                (self.s.m.bin(c, Bin::Or, base, pick), None, None, false, fi)
             }
             Dpp::Row {
                 ctrl,
                 row_mask,
                 bank_mask,
                 bound_ctrl,
-                ..
+                fi,
             } => {
                 let n = u32::from(ctrl & 15);
                 let (src, inside) = match ctrl {
@@ -8749,8 +8790,12 @@ impl<'a> Lower<'a> {
                     _ => return Err("a DPP lane pattern"),
                 };
                 let masks = (row_mask != 0xF || bank_mask != 0xF).then_some((row_mask, bank_mask));
-                (src, inside, masks, bound_ctrl)
+                (src, inside, masks, bound_ctrl, fi)
             }
+        };
+        let safe_src = match inside {
+            Some(ok) => self.s.m.select(c, ok, src, lane),
+            None => src,
         };
         let mut r = if mesh_quad {
             self.quad_pick(x, src)
@@ -8759,8 +8804,17 @@ impl<'a> Lower<'a> {
         {
             self.quad_read(x, [0, 1, 2, 3].map(|i| (ctrl >> (2 * i) & 3) as u8))
         } else {
-            self.read_lane(x, src)
+            self.read_lane(x, safe_src)
         };
+        if !fi && let Some(a) = self.partial_active {
+            // Unlaunched tail lanes are EXEC-off on RDNA 2; with FI=0, reading
+            // one acts like an out-of-bounds read (0 if bound_ctrl, else skip).
+            let launched = self.lane_active(a, safe_src);
+            inside = Some(match inside {
+                Some(ok) => self.s.m.bin(c, Bin::And, ok, launched),
+                None => launched,
+            });
+        }
         let mut enable = None;
         if let Some(inside) = inside {
             if zero {
@@ -9577,15 +9631,12 @@ impl<'a> Lower<'a> {
                 }
                 let (x, lo, hi) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 let lane = self.lane_index();
-                let (k7, k8, k15, k16, k31, k32, k4, one, zero) = (
+                let (k7, k8, k15, k16, k4, zero) = (
                     self.s.m.i32(7),
                     self.s.m.i32(8),
                     self.s.m.i32(15),
                     self.s.m.i32(16),
-                    self.s.m.i32(31),
-                    self.s.m.i32(32),
                     self.s.m.i32(4),
-                    self.s.m.i32(1),
                     self.s.m.i32(0),
                 );
                 let pos = self.s.m.bin(c, Bin::And, lane, k15);
@@ -9606,20 +9657,10 @@ impl<'a> Lower<'a> {
                 } else {
                     // Ballot the console EXEC guard as well as the host's active
                     // invocations. Never shuffle from an inactive host lane.
-                    let enabled = guard.unwrap_or_else(|| self.s.m.bool(true));
-                    let i32t = self.s.t.i32;
-                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                    let mask = self.s.op(
-                        c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[enabled],
-                    );
-                    let lo = self.s.m.extract(c, mask, 0);
-                    let hi = self.s.m.extract(c, mask, 1);
-                    let lower = self.s.m.cmp(c, pred::IULT, src, k32);
-                    let word = self.s.m.select(c, lower, lo, hi);
-                    let bit = self.s.m.bin(c, Bin::And, src, k31);
-                    let bit = self.s.m.bin(c, Bin::LShr, word, bit);
-                    let bit = self.s.m.bin(c, Bin::And, bit, one);
-                    let active = self.s.m.cmp(c, pred::NE, bit, zero);
+                    let enabled = self
+                        .active_guard(guard)
+                        .unwrap_or_else(|| self.s.m.bool(true));
+                    let active = self.lane_active(enabled, src);
                     let safe = self.s.m.select(c, active, src, lane);
                     let read = self.read_lane(x, safe);
                     let fallback = if v.opsel & 2 != 0 {
@@ -9760,7 +9801,9 @@ impl<'a> Lower<'a> {
                         return Err("a first-lane read where not every lane runs");
                     }
                     let c = self.cur;
-                    if guard.is_none() && super::shader_opt() & super::bitcode::opt::FIRST != 0 {
+                    if self.active_guard(guard).is_none()
+                        && super::shader_opt() & super::bitcode::opt::FIRST != 0
+                    {
                         // Every lane is in EXEC: the console's first lane is
                         // lane 0, which the lower half of every console wave
                         // has. No half needs to ask the other whether it has
