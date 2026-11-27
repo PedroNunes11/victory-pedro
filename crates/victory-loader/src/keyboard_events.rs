@@ -104,6 +104,63 @@ fn parse_key_actions(spec: &str) -> Vec<(u32, Vec<u32>)> {
         .collect()
 }
 
+/// RAGE's name hash (Jenkins one-at-a-time, lower case): the actions' ids.
+fn joaat(name: &str) -> u32 {
+    let mut h: u32 = 0;
+    for c in name.bytes().map(|c| c.to_ascii_lowercase()) {
+        h = h.wrapping_add(u32::from(c));
+        h = h.wrapping_add(h << 10);
+        h ^= h >> 6;
+    }
+    h = h.wrapping_add(h << 3);
+    h ^= h >> 11;
+    h.wrapping_add(h << 15)
+}
+
+/// A key name of `native-keys.txt` as the virtual key the title's keyboard device gets. The
+/// mouse buttons come as F13 to F17 (`VICTORY_NATIVE_INPUT`, gameinput.rs).
+fn key_code(name: &str) -> Option<u32> {
+    let n = name.trim();
+    let named = match n.to_ascii_lowercase().as_str() {
+        "space" => 0x20, "shift" => 0xa0, "rightshift" => 0xa1, "ctrl" => 0xa2, "rightctrl" => 0xa3,
+        "alt" => 0xa4, "rightalt" => 0xa5, "tab" => 0x09, "esc" => 0x1b, "enter" => 0x0d, "backspace" => 0x08,
+        "capslock" => 0x14, "insert" => 0x2d, "delete" => 0x2e, "home" => 0x24, "end" => 0x23,
+        "pageup" => 0x21, "pagedown" => 0x22, "arrowup" => 0x26, "arrowdown" => 0x28, "arrowleft" => 0x25,
+        "arrowright" => 0x27, "comma" => 0xbc, "period" => 0xbe, "minus" => 0xbd, "equals" => 0xbb,
+        "leftbracket" => 0xdb, "rightbracket" => 0xdd, "semicolon" => 0xba, "quote" => 0xde, "slash" => 0xbf,
+        "backslash" => 0xdc, "backquote" => 0xc0, "leftclick" => 0x7c, "rightclick" => 0x7d,
+        "middleclick" => 0x7e, "mouse4" => 0x7f, "mouse5" => 0x80,
+        _ => 0,
+    };
+    if named != 0 {
+        return Some(named);
+    }
+    let up = n.to_ascii_uppercase();
+    if up.len() == 1 && up.as_bytes()[0].is_ascii_alphanumeric() {
+        return Some(u32::from(up.as_bytes()[0]));
+    }
+    if let Some(f) = up.strip_prefix('F').and_then(|d| d.parse::<u32>().ok()).filter(|f| (1..=12).contains(f)) {
+        return Some(0x6f + f);
+    }
+    if let Some(d) = up.strip_prefix("NUMPAD").and_then(|d| d.parse::<u32>().ok()).filter(|d| *d <= 9) {
+        return Some(0x60 + d);
+    }
+    None
+}
+
+/// `native-keys.txt`: lines `KEY = INPUT_ACTION, INPUT_ACTION ...` ('#' comments).
+fn parse_native_keys(text: &str) -> Vec<(u32, Vec<u32>)> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or(""))
+        .filter_map(|l| {
+            let (key, actions) = l.split_once('=')?;
+            let key = key_code(key)?;
+            let ids: Vec<u32> = actions.split(',').map(str::trim).filter(|a| !a.is_empty()).map(joaat).collect();
+            (!ids.is_empty()).then_some((key, ids))
+        })
+        .collect()
+}
+
 /// A pad source that is an axis (sticks and triggers) rather than a button.
 fn is_axis(source: u32) -> bool {
     matches!(source, 0x3009 | 0x300c | 0x3010..=0x3013)
@@ -366,7 +423,16 @@ unsafe fn hook_activation(base: usize) {
 /// Starts the subscriber thread when `VICTORY_KEYBOARD_EVENTS` is `1` or `log`.
 pub fn start(base: usize) {
     IMAGE.store(base, Ordering::Relaxed);
-    if let Ok(spec) = std::env::var("VICTORY_KEY_ACTIONS") {
+    if let Some(file) = std::env::var_os("VICTORY_NATIVE_KEYS") {
+        match std::fs::read_to_string(&file) {
+            Ok(text) => {
+                let map = parse_native_keys(&text);
+                tracing::info!(target: "keyboard_events", keys = map.len(), file = %std::path::Path::new(&file).display(), "native keys: each key stands for the game's own actions");
+                let _ = KEY_ACTIONS.set(map);
+            }
+            Err(e) => tracing::warn!(target: "keyboard_events", error = %e, "native keys file not read"),
+        }
+    } else if let Ok(spec) = std::env::var("VICTORY_KEY_ACTIONS") {
         let map = parse_key_actions(&spec);
         tracing::info!(target: "keyboard_events", keys = map.len(), "keys stand for the title's actions (sent as each active action's pad source)");
         let _ = KEY_ACTIONS.set(map);
@@ -430,5 +496,27 @@ pub fn start(base: usize) {
     });
     if let Err(e) = spawned {
         tracing::warn!(target: "keyboard_events", error = %e, "keyboard events did not start");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ids read from the title's action table (bindings dump 2026-11-27).
+    #[test]
+    fn names_hash_to_the_titles_action_ids() {
+        assert_eq!(joaat("INPUT_MOVE_UD"), 0xfda8_3190);
+        assert_eq!(joaat("INPUT_VEH_ACCELERATE"), 0x5b9f_d4e2);
+        assert_eq!(joaat("input_jump"), 0xd9d0_e1c0);
+    }
+
+    #[test]
+    fn native_keys_lines_parse() {
+        let map = parse_native_keys("# c\nW = INPUT_VEH_ACCELERATE, INPUT_MOVE_UP_ONLY\nLeftClick = INPUT_ATTACK\nF5 = INPUT_X\nbad\n");
+        assert_eq!(map[0], (0x57, vec![0x5b9f_d4e2, 0x8fd0_15d8]));
+        assert_eq!(map[1].0, 0x7c);
+        assert_eq!(map[2].0, 0x74);
+        assert_eq!(map.len(), 3);
     }
 }

@@ -606,10 +606,43 @@ impl State {
         native: Vec<KeyState>,
         mouse: &Mouse,
     ) -> Vec<Event> {
-        // The keyboard device sees the native-only keys too; the stand-in pad does not.
+        // `VICTORY_NATIVE_INPUT=1`: keys and mouse buttons are the title's own keyboard input
+        // (Vertex sends them as the game's actions, native-keys.txt); the stand-in pad keeps only
+        // the mouse's motion, as the right stick. The mouse buttons reach the keyboard device as
+        // F13 to F17 (left, right, middle, 4, 5).
+        static NATIVE: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("VICTORY_NATIVE_INPUT").is_some_and(|v| v == "1"));
+        let mouse_keys: Vec<KeyState> = if *NATIVE {
+            mouse
+                .buttons
+                .iter()
+                .filter_map(|&b| match b {
+                    0x01 => Some((0x7c, 0x64)),
+                    0x02 => Some((0x7d, 0x65)),
+                    0x04 => Some((0x7e, 0x66)),
+                    0x05 => Some((0x7f, 0x67)),
+                    0x06 => Some((0x80, 0x68)),
+                    _ => None,
+                })
+                .map(|(vk, scan)| KeyState { scan_code: scan, virtual_key: vk, ..Default::default() })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let motion_only = Mouse { buttons: Vec::new(), stick: mouse.stick };
+        let (pad_keys, pad_mouse): (Vec<KeyState>, &Mouse) =
+            if *NATIVE { (Vec::new(), &motion_only) } else { (keys.clone(), mouse) };
+        // The keyboard device sees the native-only keys and (native) the mouse buttons too; the
+        // stand-in pad does not.
         let with_native = |keys: Vec<KeyState>| {
             let mut all = keys;
-            all.extend(native.iter().filter(|n| !all.iter().any(|k| k.virtual_key == n.virtual_key)).copied().collect::<Vec<_>>());
+            let extra: Vec<KeyState> = native
+                .iter()
+                .chain(mouse_keys.iter())
+                .filter(|n| !all.iter().any(|k| k.virtual_key == n.virtual_key))
+                .copied()
+                .collect();
+            all.extend(extra);
             all
         };
         let now = now();
@@ -617,8 +650,8 @@ impl State {
         if one_pad {
             // The keyboard and mouse by the player's binds, taps kept until the
             // title has looked, together with every host pad.
-            let layout = binds::layout(|vk| pressed(&keys, mouse, vk));
-            let stand_in = self.unseen.add(fallback(&keys, mouse, &layout), now);
+            let layout = binds::layout(|vk| pressed(&pad_keys, pad_mouse, vk));
+            let stand_in = self.unseen.add(fallback(&pad_keys, pad_mouse, &layout), now);
             let pad = pads.into_iter().flatten().fold(stand_in, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(with_native(keys))), now, &mut events);
@@ -629,8 +662,8 @@ impl State {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
         let fallback = (!any_pad).then(|| {
-            let layout = binds::layout(|vk| pressed(&keys, mouse, vk));
-            Value::Pad(self.unseen.add(fallback(&keys, mouse, &layout), now))
+            let layout = binds::layout(|vk| pressed(&pad_keys, pad_mouse, vk));
+            Value::Pad(self.unseen.add(fallback(&pad_keys, pad_mouse, &layout), now))
         });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(with_native(keys))), now, &mut events);
