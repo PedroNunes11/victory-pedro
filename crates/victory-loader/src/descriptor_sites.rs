@@ -95,7 +95,7 @@ fn stub(store: &[u8], at: usize, to: usize, marks: usize) -> Option<Vec<u8>> {
     out.extend([0x48, 0x8b, 0x4a, 0x18]); // mov rcx, [rdx+24]
     out.extend([0xc6, 0x04, 0x01, 0x01]); // mov byte [rcx+rax], 1
     out.extend([0x59, 0x5a, 0x58]); // pop rcx ; pop rdx ; pop rax
-    let back = crate::console_insn::jump(to + out.len(), at + store.len())?;
+    let back = crate::code_stubs::jump(to + out.len(), at + store.len())?;
     out.extend(back);
     Some(out)
 }
@@ -136,17 +136,17 @@ pub unsafe fn apply(base: usize, size: usize, marks: usize, sites: &[Site]) -> V
             }
             let at = window + site.store;
             if room.is_none() {
-                room = crate::console_insn::near(at).map(|place| (place, 0));
+                room = crate::code_stubs::near(at).map(|place| (place, 0));
             }
             let Some((place, used)) = room.as_mut() else {
                 return Hooked::Failed("no room for code near the title's");
             };
             let to = *place + *used;
             let store = &site.bytes[site.store..site.store + site.len];
-            let (Some(body), Some(jump)) = (stub(store, at, to, marks), crate::console_insn::jump(at, to)) else {
+            let (Some(body), Some(jump)) = (stub(store, at, to, marks), crate::code_stubs::jump(at, to)) else {
                 return Hooked::Failed("not a store of the expected form, or out of reach");
             };
-            if *used + body.len() > crate::console_insn::STUBS_LEN {
+            if *used + body.len() > crate::code_stubs::STUBS_LEN {
                 return Hooked::Failed("no room for code near the title's");
             }
             let mut old = 0;
@@ -254,7 +254,7 @@ fn copy_128_stub(at: usize, to: usize, marks: usize, len: usize) -> Option<Vec<u
     out[skip_a + 1] = u8::try_from(past - (skip_a + 2)).ok()?;
     out[skip_b + 1] = u8::try_from(past - (skip_b + 2)).ok()?;
     out.extend([0x59, 0x5a, 0x58]); // pop rcx ; pop rdx ; pop rax
-    let back = crate::console_insn::jump(to + out.len(), at + len)?;
+    let back = crate::code_stubs::jump(to + out.len(), at + len)?;
     out.extend(back);
     Some(out)
 }
@@ -286,10 +286,10 @@ unsafe fn write_code(at: usize, bytes: &[u8], len: usize) -> bool {
 /// it: `body` is put there; where.
 fn place_for(at: usize, body: &[u8], room: &mut Option<(usize, usize)>) -> Option<usize> {
     if room.is_none() {
-        *room = crate::console_insn::near(at).map(|place| (place, 0));
+        *room = crate::code_stubs::near(at).map(|place| (place, 0));
     }
     let (place, used) = room.as_mut()?;
-    if *used + body.len() > crate::console_insn::STUBS_LEN {
+    if *used + body.len() > crate::code_stubs::STUBS_LEN {
         return None;
     }
     let to = *place + *used;
@@ -328,7 +328,7 @@ pub unsafe fn apply_copies(base: usize, size: usize, marks: usize, hook: usize) 
             let Some(to) = place_for(at, &body, &mut room) else {
                 return Hooked::Failed("no room for code near the title's");
             };
-            let Some(mut call) = crate::console_insn::jump(at, to) else {
+            let Some(mut call) = crate::code_stubs::jump(at, to) else {
                 return Hooked::Failed("out of reach");
             };
             call[0] = 0xe8;
@@ -361,7 +361,7 @@ fn copy_128(base: usize, size: usize, marks: usize, site: &Site, room: &mut Opti
         }
         let at = window + site.store;
         if room.is_none() {
-            *room = crate::console_insn::near(at).map(|place| (place, 0));
+            *room = crate::code_stubs::near(at).map(|place| (place, 0));
         }
         let Some((place, used)) = *room else {
             return Hooked::Failed("no room for code near the title's");
@@ -372,7 +372,7 @@ fn copy_128(base: usize, size: usize, marks: usize, site: &Site, room: &mut Opti
         let Some(to) = place_for(at, &body, room) else {
             return Hooked::Failed("no room for code near the title's");
         };
-        let Some(jump) = crate::console_insn::jump(at, to) else {
+        let Some(jump) = crate::code_stubs::jump(at, to) else {
             return Hooked::Failed("out of reach");
         };
         // SAFETY: the title's store, which nothing runs yet.

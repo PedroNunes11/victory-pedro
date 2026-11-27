@@ -22,7 +22,9 @@
 //!    on, pass every thread start and end on to the attached images.
 
 #[cfg(windows)]
-mod console_insn;
+mod code_stubs;
+#[cfg(windows)]
+mod console_ops;
 mod crash;
 #[cfg(windows)]
 pub mod descriptor_sites;
