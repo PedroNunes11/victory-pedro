@@ -6799,14 +6799,24 @@ impl HostList {
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let copy = crate::resource::host_copy(resource)?;
+        let (before, _) = self.transition_held(&copy, wanted)?;
         // SAFETY: as in `crate::resource::host_resource`; the list's states
         // hold the copy from here on.
-        let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
+        Some((unsafe { &*std::ptr::from_ref(&copy.texture) }, before))
+    }
+
+    /// [`HostList::transition`] of a host copy the caller holds: the state
+    /// it leaves and the (legal) state it takes, if that is a change.
+    pub(crate) fn transition_held(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<(u32, u32)> {
         let wanted = legal_for(copy.flags(), wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                v.insert((wanted, wanted, copy.clone()));
                 self.changed_something();
                 None
             }
@@ -6815,7 +6825,7 @@ impl HostList {
                 if before != wanted {
                     self.changed_something();
                 }
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some((before, wanted))
             }
         }
     }
@@ -6870,18 +6880,28 @@ impl HostList {
         colour: bool,
         write: bool,
     ) -> bool {
-        const UNORDERED_ACCESS: u32 = 0x8;
         // Asked for every texture a draw reads: most have no twin.
-        let Some(twin) = crate::resource::twin(resource) else {
+        let Some((depth, Some(twin))) = crate::resource::host_side(resource) else {
             return false;
         };
-        let Some(depth) = crate::resource::host_copy(resource) else {
-            return false;
-        };
+        self.twin_use_held(&depth, &twin, colour, write);
+        true
+    }
+
+    /// [`HostList::twin_use`] of a depth texture's host copy `depth` and
+    /// colour twin `twin`, both held by the caller.
+    pub(crate) fn twin_use_held(
+        &self,
+        depth: &std::sync::Arc<crate::resource::HostTexture>,
+        twin: &std::sync::Arc<crate::resource::Twin>,
+        colour: bool,
+        write: bool,
+    ) {
+        const UNORDERED_ACCESS: u32 = 0x8;
         let side = usize::from(colour);
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let u = twins
-            .entry(std::sync::Arc::as_ptr(&twin) as usize)
+            .entry(std::sync::Arc::as_ptr(twin) as usize)
             .or_insert_with(|| TwinUse {
                 depth: depth.clone(),
                 twin: twin.clone(),
@@ -6921,7 +6941,7 @@ impl HostList {
         }
         drop(twins);
         if copy {
-            self.twin_copy(&depth, &twin, colour);
+            self.twin_copy(depth, twin, colour);
         } else if colour {
             self.settle(&twin.colour, UNORDERED_ACCESS);
         }
@@ -6929,7 +6949,6 @@ impl HostList {
         if colour && let Some(plane) = &twin.plane {
             self.settle(plane, UNORDERED_ACCESS);
         }
-        true
     }
 
     /// Records the pass that draws the twin of the depth plane of `depth`

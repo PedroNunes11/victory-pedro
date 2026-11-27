@@ -401,15 +401,6 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
 pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// The colour twin of title texture `this`, if it has one.
-#[cfg(windows)]
-pub(crate) fn twin(this: This) -> Option<std::sync::Arc<Twin>> {
-    if this.is_null() {
-        return None;
-    }
-    hosted(this, true).and_then(|made| made.1)
-}
-
 /// The twin's texture, for the unordered access views of `this`.
 #[cfg(windows)]
 pub(crate) fn twin_resource<'a>(
@@ -1710,6 +1701,8 @@ pub(crate) fn host_waits(this: This) -> bool {
 #[cfg(windows)]
 fn hosted(this: This, make: bool) -> Option<Made> {
     use std::sync::atomic::Ordering::Relaxed;
+    #[cfg(test)]
+    HOSTED_ASKED.with(|n| n.set(n.get() + 1));
     let r = resource(this);
     if r.desc.dimension == BUFFER {
         return None;
@@ -2678,6 +2671,24 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 #[cfg(windows)]
 pub(crate) fn dropped(this: This) -> u32 {
     made_copy(this).map_or(0, |copy| copy.base)
+}
+
+/// A title texture's host copy and colour twin from one lookup (each
+/// lookup takes the texture's lock, reads the clock and clones the two),
+/// for a draw's read of it, which uses both.
+#[cfg(windows)]
+pub(crate) fn host_side(this: This) -> Option<Made> {
+    if this.is_null() {
+        return None;
+    }
+    hosted(this, true)
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    /// How many times this thread looked a texture's host side up
+    /// ([`hosted`]), for tests that count them.
+    pub(crate) static HOSTED_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// A title texture's host copy if it is made; not made here.
