@@ -1792,9 +1792,32 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
             .unwrap_or(DYNAMIC << 2)
     });
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        return dynamic_capped(null);
     }
     null.saturating_sub(count).min(most).max(DYNAMIC)
+}
+
+/// Dynamic slots in a view heap capped at [`PORTABLE_VIEWS`] (NVIDIA):
+/// [`DYNAMIC`] unless `VICTORY_DYNAMIC_SLOTS` is set, then that many, at
+/// most half the heap. Vertex port of unify 5a291f4d (after
+/// trustno1-coder/VIctory-NVIDIA a9632bc8: with 2^18, 1,100 to 4,800 of
+/// 12,000 to 16,600 tables a frame were refused on an RTX 5070, each a
+/// dropped draw; 524,288 left 0 to 33).
+fn dynamic_capped(null: u32) -> u32 {
+    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let asked = std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse::<u32>().ok());
+        let slots = capped_slots(asked, null);
+        if slots != DYNAMIC {
+            tracing::warn!(slots, "dynamic descriptor slots on a capped view heap (VICTORY_DYNAMIC_SLOTS)");
+        }
+        slots
+    })
+}
+
+/// [`dynamic_capped`]'s count for `asked` slots and the null slot `null`.
+fn capped_slots(asked: Option<u32>, null: u32) -> u32 {
+    asked.map_or(DYNAMIC, |n| n.clamp(DYNAMIC, (null / 2).max(DYNAMIC)))
 }
 
 impl HostHeap {

@@ -976,6 +976,10 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    // Vertex port (unify 39731795): the title's crowded thread groups may
+    // also run on spare processors (VICTORY_SPREAD=1|alt, off by default).
+    #[cfg(windows)]
+    crate::spread::start();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
