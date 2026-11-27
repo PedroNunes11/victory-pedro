@@ -11,6 +11,7 @@
 #[cfg(windows)]
 pub mod apu;
 pub mod audio;
+pub mod bink;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
@@ -74,6 +75,10 @@ pub(crate) fn all() -> Vec<HleModule> {
     // may hold some of it in place (`VICTORY_UNIFIED=1`).
     #[cfg(windows)]
     if victory_gpu::in_place_on() {
+        all.push(xmem::host_memory_module());
+    }
+    #[cfg(windows)]
+    if victory_gpu::title_pages_told() {
         all.push(xmem::host_memory_module());
     }
     #[cfg(windows)]

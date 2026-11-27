@@ -7,9 +7,10 @@
 //! barycentrics; `v_interp_mov` reads one vertex's value. After the 32-bit
 //! export patch ([`NativeProgram::patched_code`]) exports carry plain
 //! 32-bit values: `mrt<n>` is render target n, `mrtz` depth, stencil and
-//! sample mask, `null` nothing. A lane whose EXEC bit is clear at the
-//! export that ends the program (`done`) is discarded: that export's guard
-//! after structurisation.
+//! sample mask, `null` nothing. A pixel survives if its EXEC bit is set at
+//! the last export that has the valid-mask bit (`vm`): that export's guard
+//! after structurisation. An export without `vm` leaves the survival mask
+//! as it was (the `done` bit only marks the program's last export).
 //!
 //! Vertex shaders that run as the hardware VS get the vertex id in v0, the
 //! primitive id in v2 and the instance id in v3; the fetch shader loads
@@ -26,10 +27,10 @@
 //! index from the wave index (s3 bits 24-27) and the lane (`v_mbcnt`), and
 //! its group id from v5 of the first lane (`v_readfirstlane`: the group
 //! times the group size). Lane n exports vertex n (`exp pos`, `exp param`)
-//! and primitive n (`exp prim`: 10-bit vertex indices at bits 0, 10, 20,
-//! bit 31 culls); `param` entries with bit 7 are per-primitive outputs. One
-//! lane sends the output counts (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices |
-//! primitives << 12).
+//! and primitive n (`exp prim`: 9-bit vertex indices at bits 0, 10, 20,
+//! each with an edge flag above it, bit 31 culls); `param` entries with
+//! bit 7 are per-primitive outputs. One lane sends the output counts
+//! (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices | primitives << 12).
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
@@ -176,8 +177,13 @@ pub struct Export {
     pub values: [Option<Value>; 4],
     /// Two f16 values per dword.
     pub compressed: bool,
-    /// The program's last export (for pixels: kills the lanes not in EXEC).
+    /// The program's last export. Only a hint to the hardware: it decides
+    /// no pixel's fate.
     pub done: bool,
+    /// The valid-mask bit: a pixel export with it set makes EXEC, where the
+    /// export runs, the mask of the pixels that survive. One without it
+    /// leaves that mask as it was.
+    pub vm: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -369,6 +375,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         defs: &defs,
         phis: &phis,
     };
+    let mut first_halves = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -382,7 +389,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        ("v_interp_p1_f32", _) => first_halves.push((site, attribute)),
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -402,7 +409,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {}
+                    "v_interp_p1ll_f16" => {
+                        first_halves.push((site, attribute(inst, &v.src[0])?));
+                    }
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
@@ -421,7 +430,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     src,
                     compr,
                     done,
-                    ..
+                    vm,
                 } => {
                     let target = match *target {
                         t @ 0..=7 => Target::Color(t),
@@ -454,10 +463,57 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         values,
                         compressed: *compr,
                         done: *done,
+                        vm: *vm,
                     });
                 }
                 _ => {}
             }
+        }
+    }
+    if first_halves.is_empty() {
+        return Ok(io);
+    }
+    // A loaded i/j pair normally becomes one host interpolation: its first
+    // half need not be evaluated. A first half also read as data (or used
+    // without a second half) must keep P0 + i * P10. Follow phi uses too,
+    // without forcing ordinary pairs to read per-vertex attributes.
+    let folded: std::collections::HashSet<_> = io
+        .interps
+        .iter()
+        .filter_map(|(s, i)| matches!(i, Interp::Interpolated { .. }).then_some(*s))
+        .collect();
+    let mut used: std::collections::HashSet<_> = p
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(b, blk)| {
+            blk.insts
+                .iter()
+                .enumerate()
+                .map(move |(i, inst)| ((b, i), inst))
+        })
+        .filter(|(s, _)| !folded.contains(s))
+        .flat_map(|(_, inst)| inst.reads.iter().map(|r| r.1))
+        .collect();
+    loop {
+        let before = used.len();
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if used.contains(&phi.value) {
+                used.extend(&phi.args);
+            }
+        }
+        if used.len() == before {
+            break;
+        }
+    }
+    for (site, attribute) in first_halves {
+        if !io.interps.iter().any(|(s, _)| *s == site)
+            && p.blocks[site.0].insts[site.1]
+                .writes
+                .iter()
+                .any(|w| used.contains(&w.1))
+        {
+            io.interps.push((site, Interp::Weighted { attribute }));
         }
     }
     Ok(io)
@@ -723,6 +779,50 @@ mod tests {
                 ((0, 2), Interp::Weighted { attribute }),
             ]
         );
+    }
+
+    #[test]
+    fn first_halves_read_through_a_phi_keep_their_partial_values() {
+        let p = program(&[
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> second first half
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xBF82_0001, // s_branch -> export
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(io.interps.len(), 2);
+        assert!(
+            io.interps
+                .iter()
+                .all(|(_, i)| matches!(i, Interp::Weighted { .. }))
+        );
+    }
+
+    #[test]
+    fn a_standalone_f16_first_half_is_weighted() {
+        let p = program(&[
+            0xD742_0002,
+            0x0002_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+            0xF800_180F,
+            0x0202_0202,
+            S_ENDPGM,
+        ]);
+        let io = raise(
+            &p,
+            &pixel(
+                vec![PsInput {
+                    fp16: true,
+                    ..TEXCOORD
+                }],
+                2,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(&io.interps[..], [(_, Interp::Weighted { .. })]));
     }
 
     #[test]

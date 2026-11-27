@@ -19,7 +19,11 @@
 mod ab;
 mod ab_core;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod bake_probe;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod renderdoc;
 #[cfg(windows)]
 mod cardmeter;
 mod live;
@@ -34,6 +38,8 @@ pub mod device;
 mod ambient;
 #[cfg(windows)]
 mod drvwatch;
+#[cfg(windows)]
+mod spread;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
@@ -81,6 +87,8 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod marks;
+#[cfg(windows)]
 mod memory;
 #[cfg(windows)]
 mod shadow;
@@ -101,6 +109,11 @@ mod tick;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use bake_probe::{
+    Writer as BakeProbeWriter, dstorage_tag as bake_probe_dstorage_tag, note as bake_probe_note,
+    note_signal as bake_probe_dstorage_signal, probe_on as bake_probe_on,
+};
 #[cfg(windows)]
 pub use census::title_memory_reserved;
 #[cfg(windows)]
@@ -111,7 +124,7 @@ pub use softview::title_memory_section_gone;
 pub use unified::{in_place_on, title_memory_change};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_committed, title_memory_reading, title_memory_reading_range, title_memory_remapped,
-    title_memory_remapping, title_memory_remapping_range, title_memory_written,
-    writing as kernel_will_write,
+    Writing, title_memory_reading, title_memory_reading_now, title_memory_reading_range,
+    title_memory_remapped, title_memory_remapping, title_memory_remapping_range, title_memory_written,
+    title_pages_changed, title_pages_told, writing_async as kernel_will_write_async, writing_held as kernel_will_write,
 };

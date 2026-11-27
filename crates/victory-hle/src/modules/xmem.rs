@@ -167,11 +167,8 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
-    // Blocks the guards parked as unmapped there are asked about again
-    // (`VICTORY_GUARD_PARK`).
-    #[cfg(windows)]
     if !at.is_null() && kind & MEM_COMMIT != 0 {
-        victory_gpu::title_memory_committed(at as usize, size);
+        victory_gpu::title_pages_changed(at as usize, size);
     }
     if base.is_null() {
         // What shaders write to write-combining memory may stay on the card
@@ -324,6 +321,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     if block.is_null() {
         return block.cast();
     }
+    victory_gpu::title_pages_changed(block as usize, layout.size());
     // SAFETY: the block holds the alignment (at least the header) and then
     // `size` bytes.
     unsafe {
@@ -756,11 +754,14 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
 /// shows them (`victory_gpu::title_memory_written`; what it does with it
 /// is `VICTORY_PAGE_WRITES`' to say, and it counts either way). Call when
 /// the bytes are there, and without the page table's lock ([`shown_at`]
-/// takes and leaves it).
-pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
+/// takes and leaves it). Returns the bytes told, at all addresses.
+pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) -> usize {
+    let mut told = 0;
     for (at, bytes) in shown_at(pages, offset, len) {
         victory_gpu::title_memory_written(at, bytes, true);
+        told += bytes;
     }
+    told
 }
 
 /// Maps `n` pages at `address`, in place of what is mapped there; null
@@ -784,9 +785,11 @@ pub extern "system" fn XMemMapPhysicalPages(
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
-    // into that gap (`victory_gpu::title_memory_remapping_range`).
-    let _changing = victory_gpu::title_memory_remapping_range(physical.unmap_extent(base, end));
-    unmap(&mut physical, base, len);
+    // into that gap (`victory_gpu::title_memory_remapping`).
+    let _changing = n.checked_mul(PAGE)
+        .and_then(|len| mapping_extent(&physical, base, len))
+        .map_or_else(victory_gpu::title_memory_remapping, |(at, len)| victory_gpu::title_memory_remapping_range(at, len));
+    unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
     }
@@ -869,7 +872,8 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     }
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping_range(physical.unmap_extent(to, end));
+    let _changing = mapping_extent(&physical, to, len)
+        .map_or_else(victory_gpu::title_memory_remapping, |(at, len)| victory_gpu::title_memory_remapping_range(at, len));
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -1097,6 +1101,28 @@ fn commit_limit_message(
     message
 }
 
+/// The full views `unmap` temporarily takes away, including their parts
+/// outside the requested range. Overflow or an empty range stays global.
+fn mapping_extent(physical: &Physical, base: usize, len: usize) -> Option<(usize, usize)> {
+    if len == 0 || !base.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) { return None; }
+    let end = base.checked_add(len)?;
+    let mut low = base;
+    let mut high = end;
+    if let Some((&at, &(size, _))) = physical.views.range(..=base).next_back() {
+        let view_end = at.checked_add(size)?;
+        if view_end > base {
+            low = at;
+            high = high.max(view_end);
+        }
+    }
+    // Views do not overlap, so only the last view starting inside the
+    // request can extend beyond its end.
+    if let Some((&at, &(size, _))) = physical.views.range(base..end).next_back() {
+        high = high.max(at.checked_add(size)?);
+    }
+    Some((low, high.checked_sub(low)?))
+}
+
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
@@ -1248,45 +1274,28 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     moved.into()
 }
 
-/// The title's own `VirtualProtect` (`VICTORY_UNIFIED=1`): windows of the
-/// title's memory the host GPU holds in place lock their pages, and let go
-/// first.
-extern "system" fn title_virtual_protect(at: *const c_void, size: usize, protect: u32, old: *mut u32) -> BOOL {
+/// The title's `VirtualAlloc`: the host's, and the GPU side is told of the
+/// commit (`victory_gpu::title_pages_changed`).
+extern "system" fn title_virtual_alloc(base: *const c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
     // SAFETY: the title's own arguments, passed through.
-    victory_gpu::title_memory_change(at as usize, size, || unsafe {
-        windows_sys::Win32::System::Memory::VirtualProtect(at, size, protect, old)
-    })
+    let at = unsafe { VirtualAlloc(base, size, kind, protect) };
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        victory_gpu::title_pages_changed(at as usize, size);
+    }
+    at
 }
 
-/// The title's own `VirtualFree` (`VICTORY_UNIFIED=1`): a heap the host GPU
-/// holds on the memory locks its pages and the host refuses the free, so
-/// the windows go first.
-extern "system" fn title_virtual_free(at: *mut c_void, size: usize, kind: u32) -> BOOL {
-    let len = if kind & MEM_RELEASE != 0 { 0 } else { size };
-    // SAFETY: the title's own arguments, passed through.
-    victory_gpu::title_memory_change(at as usize, len, || unsafe { VirtualFree(at, size, kind) })
-}
-
-/// The host memory calls we stand in front of while the host GPU holds
-/// title memory in place (`victory_gpu::in_place_on`, with
-/// `VICTORY_UNIFIED=1`): a heap over memory locks it, and its free and
-/// protection fail until the windows are let go (after Marvisak/VIctory
-/// pull request 2921, as ka1qux/BRVIctory-ka1qux 23a83b739 has it). The
-/// title's `VirtualAlloc` stays the kernel module's.
+/// The host memory call we stand in front of, only while the GPU side
+/// wants to be told of commits (`victory_gpu::title_pages_told`, with
+/// `VICTORY_GUARD_HOLES_FRAME=2`; after victory-fork pull request #987).
 pub(crate) fn host_memory_module() -> HleModule {
     HleModule {
         name: "host memory",
         dlls: &["kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
-        exports: vec![
-            HleExport {
-                name: "VirtualProtect",
-                address: title_virtual_protect as *const () as usize,
-            },
-            HleExport {
-                name: "VirtualFree",
-                address: title_virtual_free as *const () as usize,
-            },
-        ],
+        exports: vec![HleExport {
+            name: "VirtualAlloc",
+            address: title_virtual_alloc as *const () as usize,
+        }],
     }
 }
 
@@ -1432,6 +1441,52 @@ mod tests {
         let mut after = WorkingSet::default();
         XMemGetWorkingSetStatistics(0x2000_0001, &mut after);
         assert_eq!(before.title_limit - after.title_limit, 128 * MIB);
+    }
+
+    #[test]
+    fn mapping_extent_includes_the_entire_old_view() {
+        let mut pages = [0usize; 3];
+        let mut n = pages.len();
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!base.is_null());
+        assert_eq!(XMemMapPhysicalPages(base, 3, pages.as_ptr()), base);
+        let extent = mapping_extent(&physical(), base as usize + PAGE, PAGE);
+        assert_eq!(extent, Some((base as usize, 3 * PAGE)));
+        assert_eq!(mapping_extent(&physical(), base as usize + 1, PAGE), None);
+        assert_eq!(mapping_extent(&physical(), base as usize, PAGE - 1), None);
+        assert_eq!(mapping_extent(&physical(), usize::MAX - PAGE + 1, PAGE), None);
+        assert_eq!(XMemMapPhysicalPages(base, 3, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn remapping_middle_waits_for_reader_of_old_view_edge() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let mut pages = [0usize; 3];
+        let mut n = pages.len();
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!base.is_null());
+        assert_eq!(XMemMapPhysicalPages(base, 3, pages.as_ptr()), base);
+        let reader = victory_gpu::title_memory_reading_range(base as usize, 1);
+        let (started, wait_started) = mpsc::channel();
+        let (finished, wait_finished) = mpsc::channel();
+        let middle = base as usize + PAGE;
+        let page = pages[1];
+        let writer = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let result = XMemMapPhysicalPages(middle as *mut c_void, 1, &page);
+            finished.send(result as usize).unwrap();
+        });
+        wait_started.recv().unwrap();
+        assert!(wait_finished.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(reader);
+        assert_eq!(wait_finished.recv_timeout(Duration::from_secs(3)).unwrap(), middle);
+        writer.join().unwrap();
+        assert_eq!(XMemMapPhysicalPages(base, 3, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     #[test]
@@ -1607,7 +1662,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut reads = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    let _reading = victory_gpu::title_memory_reading_range(first..first + 1);
+                    let _reading = victory_gpu::title_memory_reading_range(first, 1);
                     // SAFETY: the page is mapped whenever no change of
                     // mapping is under way, and none is while `_reading`
                     // is held.

@@ -13,6 +13,13 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
+/// The source bytes needed for a desktop CBV upload. Allocation and
+/// descriptor creation apply their own 256-byte rounding.
+#[cfg(any(windows, test))]
+pub(crate) fn constant_staging_bytes(size: u32) -> u32 {
+    size.min(64 * 1024)
+}
+
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,
@@ -688,7 +695,7 @@ const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 
 /// A shader view or sampler as the title described it (descriptions in the
 /// host's layout, kept as words), for the host to build its own from.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum View {
     /// Constant buffer: GPU address and size.
     Constant(u64, u32),
@@ -709,12 +716,16 @@ pub(crate) enum View {
 
 impl View {
     /// Whether the view reads buffer memory (constant buffers, buffer views
-    /// of resources or of memory) or memory the title placed a texture in:
-    /// such views get host slots only for draws.
+    /// of resources or of memory) or memory the title placed a texture in
+    /// to sample: such views get host slots only for draws. Placed
+    /// unordered texture views live on the host alone, as texture objects'
+    /// unordered views do, so shader-visible heap writes mirror them.
     #[cfg(windows)]
     fn is_buffer(&self) -> bool {
+        const BUFFER: u32 = 1;
         match self {
-            View::Constant(..) | View::Placed(..) => true,
+            View::Constant(..) | View::Placed(false, ..) => true,
+            View::Placed(true, resource, _) => resource[0] == BUFFER,
             View::Shader(r, _) | View::Unordered(r, _, _) => {
                 crate::resource::buffer_bytes(*r as This).is_some()
             }
@@ -1536,6 +1547,21 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[test]
+    fn constant_buffer_staging_uses_only_the_host_addressable_prefix() {
+        for (size, expected) in [
+            (0, 0),
+            (255, 255),
+            (65_535, 65_535),
+            (65_536, 65_536),
+            (65_537, 65_536),
+            (2_785_536, 65_536),
+            (u32::MAX, 65_536),
+        ] {
+            assert_eq!(constant_staging_bytes(size), expected, "guest CBV size {size}");
+        }
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.

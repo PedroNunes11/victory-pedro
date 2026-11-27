@@ -1220,7 +1220,7 @@ impl<'a> Tracer<'a> {
     /// address's high half) inside a branch that skips code when no lane
     /// is left for it, and uses it after the join, where only lanes that
     /// ran the branch are left (the title's
-    /// `CS_Alpha_Schedule`: the registers' values from before the branch,
+    /// scheduling compute program: the registers' values from before the branch,
     /// which the join also sees, are what a wave with no such lane holds).
     /// None at loop headers and without the lanes' paths.
     fn only_edge(&self, block: usize, known: &mut Known) -> Option<usize> {
@@ -2606,7 +2606,7 @@ pub(crate) mod tests {
     }
 
     /// Two paths add an index to one table in the code and meet before one load
-    /// (hair `CS_InterpolateStrands`): the join is the computed term, counted
+    /// (a hair compute program): the join is the computed term, counted
     /// from the `s_getpc_b64`.
     #[test]
     fn two_paths_into_one_code_table_load() {

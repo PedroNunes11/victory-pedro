@@ -11,13 +11,19 @@
 //! (no name of the title's in this source).
 //!
 //! `VICTORY_AMBIENT=<level>` sets it (0.6 by default, 0 for none); `off`
-//! keeps the title's own output.
+//! keeps the title's own output. `VICTORY_AMBIENT_TINT=r,g,b` sets its
+//! colour (warm white by default). Less of it reaches creases, corners and
+//! the underside of things, worked out from the scene's depth alone
+//! (`VICTORY_AMBIENT_SHADE=strength,radius[,near,tan]`, on by default; a
+//! strength of 0 turns it off). In diagnostics builds
+//! `VICTORY_AMBIENT_FILE=<file>` tunes all of it in a running game: the
+//! file holds `level r g b [strength radius near tan]`.
 //! shortcut: the same light everywhere, from everywhere; gone once rays run.
 //!
 //! After Belobug/VIctory-Belobug-AMD (`ambient.rs`, GPL-3.0-or-later).
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -62,81 +68,96 @@ pub(crate) fn level() -> Option<f32> {
     (level >= 0.0).then_some(level)
 }
 
+/// Warm white.
+const TINT: [f32; 3] = [1.0, 0.98, 0.94];
+
+/// `r,g,b`, or warm white if it is not three numbers.
+fn parse_tint(set: &str) -> [f32; 3] {
+    let set: Vec<f32> = set
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &f32| v.is_finite())
+        .collect();
+    match set[..] {
+        [r, g, b] => [r, g, b],
+        _ => TINT,
+    }
+}
+
 /// The light's colour: warm white, or what `VICTORY_AMBIENT_TINT=r,g,b`
-/// gives. With `VICTORY_AMBIENT_FILE=<file>` (diagnostics builds) the file's
-/// `level r g b` is read again twice a second, to tune both by eye in a
-/// running game.
+/// gives, or what `VICTORY_AMBIENT_FILE` last gave.
 fn tint() -> [f32; 3] {
-    let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, tint)) = *live {
+    if let Some((_, tint)) = *LIVE.lock().unwrap_or_else(|e| e.into_inner()) {
         return tint;
     }
     static SET: OnceLock<[f32; 3]> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set: Vec<f32> = std::env::var("VICTORY_AMBIENT_TINT")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|v| v.trim().parse().ok())
-            .collect();
-        match set[..] {
-            [r, g, b] => [r, g, b],
-            _ => [1.0, 0.98, 0.94],
-        }
-    })
+    *SET.get_or_init(|| parse_tint(&std::env::var("VICTORY_AMBIENT_TINT").unwrap_or_default()))
 }
 
 /// The level and colour last read from `VICTORY_AMBIENT_FILE`, if any.
-static LIVE: std::sync::Mutex<Option<(f32, [f32; 3])>> = std::sync::Mutex::new(None);
+static LIVE: Mutex<Option<(f32, [f32; 3])>> = Mutex::new(None);
 
-/// Where the resolve reads the scene's depth (reversed, D32 with stencil):
-/// root parameter and place in its table.
+/// Where the resolve reads the scene's depth (reversed, 32-bit float, with
+/// a stencil plane): the table's user-data slot and the dword in it.
 pub(crate) const DEPTH: (u8, u32) = (0, 464);
 
-/// How much less of the light reaches creases and corners, worked out from
-/// the depth image alone: strength (0 for none), the radius looked at in
-/// metres, the near plane's distance, and the tangent of half the vertical
-/// field of view (the last two are guesses the picture is not sensitive
-/// to). `VICTORY_AMBIENT_SHADE=s,r,n,t` sets them; the file's values after
-/// its first four replace them.
-/// shortcut: stands in for the occlusion the title's traced probes carry.
-static SHADE: std::sync::Mutex<Option<[f32; 4]>> = std::sync::Mutex::new(None);
+/// Strength (0 for none), the radius looked at in metres, the near plane's
+/// distance and the tangent of half the vertical field of view (the last
+/// two are guesses the picture is not sensitive to).
+const SHADE: [f32; 4] = [1.0, 0.6, 0.1, 0.45];
 
+/// [`SHADE`], with the values `s,r,n,t` gives in turn in place of its own.
+fn parse_shade(set: &str) -> [f32; 4] {
+    let mut shade = SHADE;
+    for (to, v) in shade.iter_mut().zip(set.split(',')) {
+        if let Ok(v) = v.trim().parse::<f32>()
+            && v.is_finite()
+        {
+            *to = v;
+        }
+    }
+    shade
+}
+
+/// The shading's values last read from `VICTORY_AMBIENT_FILE` (the four
+/// after its first four), if any.
+static LIVE_SHADE: Mutex<Option<[f32; 4]>> = Mutex::new(None);
+
+/// How much less of the light reaches creases and corners, worked out from
+/// the depth image alone (`VICTORY_AMBIENT_SHADE=s,r,n,t`, see [`SHADE`]).
+/// shortcut: stands in for the occlusion the title's traced probes carry.
 fn shade() -> [f32; 4] {
-    if let Some(live) = *SHADE.lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(live) = *LIVE_SHADE.lock().unwrap_or_else(|e| e.into_inner()) {
         return live;
     }
     static SET: OnceLock<[f32; 4]> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let mut shade = [1.0, 0.6, 0.1, 0.45];
-        let set = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
-        for (to, v) in shade.iter_mut().zip(set.split(',')) {
-            if let Ok(v) = v.trim().parse() {
-                *to = v;
-            }
-        }
-        shade
-    })
+    *SET.get_or_init(|| parse_shade(&std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default()))
 }
 
 /// The level from `VICTORY_AMBIENT_FILE`, if it gave one; starts the thread
-/// that reads the file.
+/// that reads the file twice a second (diagnostics builds only), to tune
+/// the light by eye in a running game.
 fn live_level() -> Option<f32> {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         if !cfg!(feature = "diagnostics") {
             return;
         }
-        let Some(file) = std::env::var_os("VICTORY_AMBIENT_FILE") else { return };
+        let Some(file) = std::env::var_os("VICTORY_AMBIENT_FILE") else {
+            return;
+        };
         let _ = std::thread::Builder::new().name("victory-ambient".into()).spawn(move || {
             loop {
                 let read: Vec<f32> = std::fs::read_to_string(&file)
                     .unwrap_or_default()
                     .split_whitespace()
                     .filter_map(|v| v.parse().ok())
+                    .filter(|v: &f32| v.is_finite())
                     .collect();
                 if let [level, r, g, b, ref rest @ ..] = read[..] {
-                    if let [s, r, n, t] = rest[..] {
-                        *SHADE.lock().unwrap_or_else(|e| e.into_inner()) = Some([s, r, n, t]);
+                    if let [s, radius, n, t] = rest[..] {
+                        *LIVE_SHADE.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some([s, radius, n, t]);
                     }
                     let new = Some((level.max(0.0), [r, g, b]));
                     let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
@@ -150,6 +171,21 @@ fn live_level() -> Option<f32> {
         });
     });
     LIVE.lock().unwrap_or_else(|e| e.into_inner()).map(|(level, _)| level)
+}
+
+/// The format the shading reads `depth`'s host copy through, if it is a
+/// 32-bit float depth of the light's size.
+fn depth_view(depth: &ID3D12Resource, width: u64, height: u32) -> Option<DXGI_FORMAT> {
+    // SAFETY: a live resource.
+    let d = unsafe { depth.GetDesc() };
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || (d.Width, d.Height) != (width, height) {
+        return None;
+    }
+    match d.Format {
+        DXGI_FORMAT_R32G8X24_TYPELESS => Some(DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS),
+        DXGI_FORMAT_R32_TYPELESS => Some(DXGI_FORMAT_R32_FLOAT),
+        _ => None,
+    }
 }
 
 const SOURCE: &str = r#"
@@ -219,7 +255,8 @@ void main(uint3 at : SV_DispatchThreadID) {
 }
 "#;
 
-/// Views, used in turn: more than the passes of every list in flight.
+/// Pairs of views (the light, then the depth), used in turn: more than the
+/// passes of every list in flight.
 const SLOTS: u32 = 1024;
 
 struct Pass {
@@ -302,13 +339,23 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
 
-/// Raises what `light` holds to the floor, in `list`, after the program that
-/// wrote it as an image. Whether it recorded anything (the list's bindings
-/// are then ours).
+/// Replaces what `light` holds, in `list`, after the program that wrote it
+/// as an image: less of the light where `depth` (what that program read the
+/// scene's depth from, in the state it read it in) shows creases. Whether
+/// it recorded anything (the list's bindings are then ours).
 pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
     let (Some(level), Some(host)) = (level(), host()) else {
         return false;
     };
+    // While the ray-tracing structure builder runs whole the resolve's
+    // light is the traced one: left as it is, unless
+    // `VICTORY_AMBIENT_WITH_RAYS=1` (to compare).
+    static WITH_RAYS: OnceLock<bool> = OnceLock::new();
+    if crate::pipeline::structures_built()
+        && !*WITH_RAYS.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_WITH_RAYS").is_some_and(|v| v == "1"))
+    {
+        return false;
+    }
     let Some(light) = crate::resource::host_resource(light) else {
         return false;
     };
@@ -330,18 +377,51 @@ pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
         ONCE.call_once(|| tracing::warn!(format = d.Format.0, "no ambient light: another format"));
         return false;
     }
+    let [r, g, b] = tint();
+    let [strength, radius, near, tan_y] = shade();
     ONCE.call_once(|| {
-        tracing::info!(level, width = d.Width, height = d.Height, "ambient light");
+        tracing::info!(
+            level,
+            r,
+            g,
+            b,
+            strength,
+            radius,
+            near,
+            tan_y,
+            width = d.Width,
+            height = d.Height,
+            "ambient light"
+        );
     });
-    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SLOTS * 2;
+    // The depth the resolve just read: of the light's size and a 32-bit
+    // float depth, or the shading is left out.
+    let depth = depth.and_then(crate::resource::host_resource);
+    let seen = depth.and_then(|t| depth_view(t, d.Width, d.Height));
+    static SHADED: std::sync::Once = std::sync::Once::new();
+    if strength > 0.0 {
+        SHADED.call_once(|| match (depth, seen) {
+            (_, Some(format)) => {
+                tracing::info!(format = format.0, "ambient light: shaded from the scene's depth");
+            }
+            (Some(t), None) => {
+                // SAFETY: a live resource.
+                let t = unsafe { t.GetDesc() };
+                tracing::warn!(
+                    format = t.Format.0,
+                    width = t.Width,
+                    height = t.Height,
+                    "ambient light: not shaded, the depth the resolve reads is not one it takes"
+                );
+            }
+            (None, _) => {
+                tracing::warn!("ambient light: not shaded, no depth where the resolve read it");
+            }
+        });
+    }
+    let depth = depth.filter(|_| seen.is_some());
+    let slot = (pass.next.fetch_add(1, Ordering::Relaxed) % SLOTS) * 2;
     list.keep(light);
-    // The depth the resolve just read, in the state it read it in; of the
-    // light's size, or the shading is left out.
-    let depth = depth.and_then(crate::resource::host_resource).filter(|t| {
-        // SAFETY: a live resource.
-        let t = unsafe { t.GetDesc() };
-        t.Format == DXGI_FORMAT_R32G8X24_TYPELESS && (t.Width, t.Height) == (d.Width, d.Height)
-    });
     if let Some(depth) = depth {
         list.keep(depth);
     }
@@ -363,22 +443,26 @@ pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
         };
         host.device
             .CreateUnorderedAccessView(light, None::<&ID3D12Resource>, Some(&view), at);
-        let seen = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+        // Without a depth, a null view: the table is read whole.
+        let read = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: seen.unwrap_or(DXGI_FORMAT_R32_FLOAT),
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
             },
         };
-        let beside = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at.ptr + pass.step as usize };
-        host.device.CreateShaderResourceView(depth, Some(&seen), beside);
+        let beside = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: at.ptr + pass.step as usize,
+        };
+        host.device.CreateShaderResourceView(depth, Some(&read), beside);
         l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);
-        let [r, g, b] = tint();
         let level = live_level().unwrap_or(level);
-        let [strength, radius, near, tan_y] = shade();
         let strength = if depth.is_some() { strength } else { 0.0 };
         let constants = [level, r, g, b, strength, radius, near, tan_y];
         l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
@@ -411,5 +495,18 @@ mod tests {
         assert!(!super::resolves_light(b"CS_ a container with another program in it"));
         assert!(!super::resolves_light(&[0u8; 64]));
         assert_eq!(super::fnv(b""), 0xcbf2_9ce4_8422_2325);
+    }
+
+    /// A tint is three numbers, or warm white; the shading's values replace
+    /// the defaults in turn, as many as are given.
+    #[test]
+    fn tint_and_shade_are_read() {
+        assert_eq!(super::parse_tint("0.5, 0.6,0.7"), [0.5, 0.6, 0.7]);
+        assert_eq!(super::parse_tint(""), super::TINT);
+        assert_eq!(super::parse_tint("1,2"), super::TINT);
+        assert_eq!(super::parse_shade(""), super::SHADE);
+        assert_eq!(super::parse_shade("0"), [0.0, 0.6, 0.1, 0.45]);
+        assert_eq!(super::parse_shade("0.5,1.2"), [0.5, 1.2, 0.1, 0.45]);
+        assert_eq!(super::parse_shade("x,2,,0.3"), [1.0, 2.0, 0.1, 0.3]);
     }
 }

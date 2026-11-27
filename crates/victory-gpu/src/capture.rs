@@ -160,6 +160,15 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    // RenderDoc, if loaded: a file named `rdc` in the folder asks for a
+    // capture of the frame that starts at this present.
+    if let Some(folder) = folder() {
+        crate::renderdoc::saved();
+        let rdc = folder.join("rdc");
+        if rdc.is_file() && std::fs::remove_file(&rdc).is_ok() {
+            crate::renderdoc::trigger();
+        }
+    }
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
     let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
@@ -342,6 +351,54 @@ pub(crate) fn save_read_back(
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
+    }
+}
+
+/// Reads a host texture back (every submission has run: the caller is at a
+/// frame's present) and gives `f` its first subresource's rows, the
+/// description and the row pitch. For the bake probe. `None` for a texture
+/// that is not a plain 2D one.
+pub(crate) fn with_rows<R>(
+    host: &crate::host::Host,
+    copy: &crate::resource::HostTexture,
+    f: impl FnOnce(&[u8], &D3D12_RESOURCE_DESC, &D3D12_SUBRESOURCE_FOOTPRINT) -> R,
+) -> Option<R> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let texture = &copy.texture;
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        return None;
+    }
+    let list = host.new_list().ok()?;
+    let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, copy.state.load(Relaxed)) as i32);
+    let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    // SAFETY: an open list of ours and a live texture.
+    let read = unsafe {
+        if state != source {
+            list.list
+                .ResourceBarrier(&[crate::host::transition(texture, state, source)]);
+        }
+        let read = read_back(&host.device, &list.list, texture);
+        if state != source {
+            list.list
+                .ResourceBarrier(&[crate::host::transition(texture, source, state)]);
+        }
+        read
+    };
+    list.close();
+    host.execute(&[&list]);
+    let (buffer, footprint) = read?;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the copy finished; the mapping spans the footprint's rows.
+    unsafe {
+        buffer.Map(0, None, Some(&mut data)).ok()?;
+        let f_ = footprint.Footprint;
+        let len = f_.RowPitch as usize * f_.Height as usize;
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
+        let out = f(rows, &d, &f_);
+        buffer.Unmap(0, None);
+        Some(out)
     }
 }
 

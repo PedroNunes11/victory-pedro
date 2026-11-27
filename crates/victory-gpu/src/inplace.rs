@@ -463,9 +463,19 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views();
-    v.sections.retain(|s| s.0 != section);
-    v.sections.push((section, bytes, committed));
+    {
+        let mut v = views();
+        v.sections.retain(|s| s.0 != section);
+        v.sections.push((section, bytes, committed));
+    }
+    // A view of our own made on an earlier section that had this handle's
+    // number shows that section's pages, not this one's: it is forgotten
+    // (left mapped: nothing reads it any more) and the next store through
+    // a view of ours maps this section.
+    let gone = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|own| own.remove(&section)).flatten();
+    if gone.is_some() {
+        tracing::info!(section, "a section handle's number came round again: our own view of the earlier section is forgotten");
+    }
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
@@ -511,6 +521,30 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             }
         }
     }
+}
+
+/// The pages of `[at, at + len)` that another view shows as well: `(here,
+/// there)`, the address of the page in the range and of the same page in
+/// the other view, page by page (the bake probe's sources).
+#[cfg(any(test, feature = "diagnostics"))]
+pub(crate) fn aliases(at: usize, len: usize) -> Vec<(usize, usize)> {
+    let v = views();
+    let mut pairs = Vec::new();
+    let end = at.saturating_add(len);
+    let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at);
+    for (&base, &(bytes, section, offset)) in first.into_iter().chain(v.views.range(at.saturating_add(1)..end)) {
+        let from = at.max(base) - base;
+        let to = end.min(base + bytes) - base;
+        for k in from / K64..to.div_ceil(K64) {
+            let here = base + k * K64;
+            for &there in v.pages.get(&(section, offset + (k * K64) as u64)).into_iter().flatten() {
+                if there != here {
+                    pairs.push((here, there));
+                }
+            }
+        }
+    }
+    pairs
 }
 
 /// The title views that overlap `[start, end)`, as `(address, bytes)`.
@@ -674,9 +708,32 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
 /// told the page was written (`crate::watch::wrote_own`) so that every
 /// other copy of it takes it again, and the copy that wrote it notes the
 /// page current (`put_back_own` in `crate::shadow`).
+///
+/// `VICTORY_BACK_OWN_VIEW=alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log, for measuring it in one scene.
 pub(crate) fn back_own() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_OWN_VIEW").is_some_and(|v| v == "1"))
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_BACK_OWN_VIEW").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "copy-back through views of our own from now (VICTORY_BACK_OWN_VIEW=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
 }
 
 /// A view of our own on a whole section of the title's physical pages:
@@ -1523,6 +1580,37 @@ mod tests {
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
     }
 
+    /// Pages mapped at two addresses are found from either, and from the
+    /// section's side; gone with their views.
+    #[test]
+    fn pages_shown_twice_are_found_from_both_sides() {
+        let (pool, heap) = (0x7_A000_0000usize, 0x7_B000_0000usize);
+        title_memory_view(pool, 4 * K64, 78, 8 * K64 as u64);
+        // The pool's second and third pages, in the tiled heap one by one.
+        title_memory_view(heap + K64, K64, 78, 10 * K64 as u64);
+        title_memory_view(heap, K64, 78, 9 * K64 as u64);
+        assert_eq!(
+            aliases(heap, 2 * K64),
+            [(heap, pool + K64), (heap + K64, pool + 2 * K64)]
+        );
+        assert_eq!(
+            aliases(pool, 4 * K64),
+            [(pool + K64, heap), (pool + 2 * K64, heap + K64)]
+        );
+        assert_eq!(aliases(pool + 3 * K64, K64), []);
+        assert_eq!(pages_of(heap), [pool + K64, heap]);
+        // Bytes from the middle of the section's 9th page into its 10th.
+        assert_eq!(
+            views_of_section(78, 9 * K64 as u64 + 100, K64),
+            [(pool + K64, 2 * K64), (heap, 2 * K64)]
+        );
+        views_gone(heap, 2 * K64);
+        assert_eq!(aliases(pool, 4 * K64), []);
+        assert_eq!(views_of_section(78, 9 * K64 as u64, 1), [(pool + K64, K64)]);
+        views_gone(pool, 4 * K64);
+        assert_eq!(views_of_section(78, 0, 16 * K64), []);
+    }
+
     /// Only private memory committed whole, read-write, is taken for a part.
     #[test]
     fn only_private_memory_committed_whole_is_a_part() {
@@ -1607,8 +1695,22 @@ mod tests {
             rig.store(&placed.buffer, placed.bias + 16, &[0xa5; 64]).unwrap();
             assert!(same((start + 16) as *const u8, &[0xa5; 64]), "the GPU's write is at the title's address");
             drop(placed);
+            drop(rig);
             // Half of it decommitted: turned down, the host not asked.
-            assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
+            // Windows refuses to decommit memory a heap is still open on,
+            // and the host lets go of the heap a moment after its last
+            // reference is dropped (the decommit failed in 3 runs of 8 on a
+            // Radeon RX 7800 XT with the other tests running beside it), so
+            // it is asked again for a while.
+            let mut freed = 0;
+            for _ in 0..500 {
+                freed = mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT);
+                if freed != 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_ne!(freed, 0, "the memory is decommitted once the heap on it is gone");
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }

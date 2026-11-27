@@ -24,6 +24,13 @@
 //! run empty, saturating without 32-bit wraparound so a list of thousands of
 //! garbage records cannot run for seconds either.
 //!
+//! A dispatch by a program that takes the number of its first group
+//! (`victory_shader::emit::USER_GROUP_BASE`) may ask for more groups in x than
+//! the host runs in one dimension (65,535); the console runs them. Those
+//! are run in parts, with or without the clamp: [`bound_split`] makes the
+//! parts of an indirect dispatch (the clamp's pass in another mode), and the
+//! direct ones are cut by [`dispatch_parts`].
+//!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
@@ -45,9 +52,11 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing. Bit 2: the records from the
-    // count to `records` are written empty (all zeros), so that the command
-    // runs `records` records with no count buffer (`no_count`).
+    // run is left empty and costs nothing. Bit 2: dispatches, each written as
+    // SPLIT records of at most 65,535 groups in x each (a program that takes
+    // the number of its first group runs them one after the other). Bit 3
+    // (with bit 2): no clamp and no budget, the groups as the title asked up
+    // to what SPLIT records hold.
     uint has_count;
     uint count_offset;
 };
@@ -62,6 +71,8 @@ static const uint BUDGET = 1u << 27;
 static const uint MOST_DRAW = 1u << 23;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+// Records a dispatch is made in, at most (`SPLIT` of this file's Rust side).
+static const uint SPLIT = 4;
 // Each group charges the budget once: the costs of its records go here,
 // one thread charges their sum, saturating as each record would in lane
 // order, and every thread then reads whether its own record fitted. A
@@ -78,6 +89,8 @@ groupshared uint all_asked;
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
+    bool split = (has_count & 4u) != 0;
+    bool unclamped = split && (has_count & 8u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
@@ -85,7 +98,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // and store nothing.
     bool active = id.x < eff_count;
     uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    // In parts, the records of one dispatch lie SPLIT of them apart.
+    uint dst_at = id.x * (split ? SPLIT * 12u : stride);
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
@@ -120,12 +134,32 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
+        uint3 wanted = src_args.Load3(src_at);
+        uint3 g;
+        if (split) {
+            // Diagnostics, in the budget buffer's fourth word: the largest
+            // x a dispatch in parts asked for.
+            uint was;
+            budget.InterlockedMax(12, wanted.x, was);
         }
-        cost = g.x * g.y * g.z * 64u;
+        if (unclamped) {
+            // As the title asked; only the groups past the last part are left
+            // out, and nothing is charged.
+            g = uint3(min(wanted.x, SPLIT * 65535u), wanted.y, wanted.z);
+            cost = 0;
+        } else {
+            g = min(wanted, uint3(65535u, 65535u, 65535u));
+            // In parts: one dimension, and not the garbage of an argument
+            // nothing wrote.
+            if (split && g.y <= 1u && g.z <= 1u && wanted.x <= SPLIT * 65535u) {
+                g.x = wanted.x;
+            }
+            // x * y fits 32 bits; the whole count may not.
+            if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+                g = uint3(0, 0, 0);
+            }
+            cost = g.x * g.y * g.z * 64u;
+        }
         groups = g;
     } else if (active) {
         // Mesh dispatches: the console's are one-dimensional.
@@ -215,6 +249,16 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
+        }
+        if (split) {
+            for (uint part = 0; part < SPLIT; part++) {
+                uint before = part * 65535u;
+                uint x = groups.x > before ? min(groups.x - before, 65535u) : 0u;
+                // A part with no groups is empty whatever else it says.
+                uint3 rest = x == 0u ? uint3(0, 0, 0) : groups;
+                dst_args.Store3(dst_at + part * 12u, uint3(x, rest.yz));
+            }
+            return;
         }
         dst_args.Store3(dst_at, groups);
         for (uint off = 12; off < stride; off += 4) {
@@ -318,8 +362,33 @@ fn min_stride(kind: u32) -> Option<u32> {
     }
 }
 
+/// Parses `VICTORY_INDIRECT_CLAMP`: enabled by default; explicit `"0"`,
+/// `"false"`, `"no"`, or `"off"` (ASCII case-insensitive) bypasses the
+/// argument-clamp compute pass so `ExecuteIndirect` reads the title's
+/// argument buffer directly.
+pub(crate) fn parse_clamp_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(value) = value else {
+        return true;
+    };
+    let Some(text) = value.to_str() else {
+        return true;
+    };
+    let trimmed = text.trim();
+    !(trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+        || trimmed.eq_ignore_ascii_case("off"))
+}
+
+/// Whether indirect arguments are copied and clamped by our compute shader
+/// before `ExecuteIndirect` (`VICTORY_INDIRECT_CLAMP=0` disables it).
+pub(crate) fn clamp_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_clamp_enabled(std::env::var_os("VICTORY_INDIRECT_CLAMP").as_deref()))
+}
+
 /// Validates record alignment and returns the scratch byte size `stride * records`.
-fn validate_layout(
+pub(crate) fn validate_layout(
     (kind, stride, records): (u32, u32, u32),
     src_offset: u64,
     count_offset: Option<u64>,
@@ -353,7 +422,15 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, (false, fill)).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, count, spec, 0).then_some(dst)
+}
+
+/// Ensures earlier compute writes to indirect argument/count buffers are
+/// visible before a direct (unclamped) `ExecuteIndirect`, without running
+/// the clamp compute shader or invalidating compute pipeline state.
+pub(crate) fn wait_direct(list: &HostList) {
+    // SAFETY: an open command list; global UAV barrier has no resource hazards.
+    unsafe { list.list.ResourceBarrier(&[uav_barrier()]) };
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -373,11 +450,70 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, (true, false)).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, None, spec, AHEAD).then_some(dst)
 }
 
-/// [`record_clamp_filled`] into `list`'s scratch buffer `dst`, from the
-/// state the list left it in; afterwards the list knows it is readable as
+/// The parts [`bound_split`] makes of a dispatch at most, the most groups of
+/// each, and the bytes of one. The host runs 65,535 groups in one dimension;
+/// the console runs more. The one the title is known to ask for: 115,200 in
+/// x (its final gather of indirect light, 8 groups for each 16x16 tile of
+/// 2560x1440), which is two parts; four parts (262,140 groups) leave room
+/// for a 3840x2160 gather (259,200). Mirrored by `SPLIT` in the clamp's
+/// source. A dispatch of more groups than all the parts hold keeps what they
+/// hold (clamped to the first part when the clamp's own limits are on: it
+/// is then more likely the garbage of arguments nothing wrote).
+pub(crate) const SPLIT: u32 = 4;
+pub(crate) const PART: u32 = 65_535;
+pub(crate) const PART_BYTES: u64 = 12;
+
+/// The bytes between a dispatch's records in [`bound_split`]'s buffer, which
+/// is the stride of the command signature that runs them.
+pub(crate) const SPLIT_STRIDE: u32 = SPLIT * PART_BYTES as u32;
+
+/// The parts a direct dispatch of `x` groups in one dimension is run in:
+/// each the number of its first group and its groups, at most [`PART`] of
+/// them (none for no groups). Any number of parts: a direct dispatch's
+/// count is known here.
+pub(crate) fn dispatch_parts(x: u32) -> impl Iterator<Item = (u32, u32)> {
+    (0..x.div_ceil(PART)).map(move |part| {
+        let base = part * PART;
+        (base, (x - base).min(PART))
+    })
+}
+
+/// [`bound`] for the dispatches of a program that takes the number of its
+/// first group (`victory_shader::emit::USER_GROUP_BASE`): every source
+/// record is made [`SPLIT`] records that follow each other in the scratch
+/// buffer, of which the first has the first [`PART`] groups in x and the
+/// next the ones after (empty if there are none). The caller runs part `n`
+/// with `ExecuteIndirect` at byte `n * PART_BYTES` of the buffer, records
+/// [`SPLIT_STRIDE`] apart, after setting the program's group base to
+/// `n * PART`. `limits`: the clamp's own (a dispatch past what the parts
+/// hold, or more than one dimension past what one dispatch runs, is cut or
+/// emptied, and the list's budget is charged); without them
+/// (`VICTORY_INDIRECT_CLAMP=0`) the groups are as the title asked, in parts.
+pub(crate) fn bound_split(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (stride, records): (u32, u32),
+    limits: bool,
+) -> Option<ID3D12Resource> {
+    let spec = (2, stride, records);
+    validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let bytes = u64::from(SPLIT_STRIDE).checked_mul(u64::from(records))?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let how = IN_PARTS | if limits { 0 } else { UNCLAMPED };
+    clamp_into(list, c, &dst, budget, src, count, spec, how).then_some(dst)
+}
+
+/// Bits of the clamp's `has_count` besides the count's own (bit 0).
+const AHEAD: u32 = 2;
+const IN_PARTS: u32 = 4;
+const UNCLAMPED: u32 = 8;
+
+/// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
+/// the list left it in; afterwards the list knows it is readable as
 /// indirect arguments.
 #[allow(clippy::too_many_arguments)]
 fn clamp_into(
@@ -388,10 +524,10 @@ fn clamp_into(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
-    (ahead, fill): (bool, bool),
+    how: u32,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_filled(c, &list.list, (dst, before), budget, src, count, spec, (ahead, fill));
+    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, how);
     if recorded {
         list.indirect_readable(dst);
     }
@@ -400,9 +536,11 @@ fn clamp_into(
 
 /// Records the clamp into `dst`, which is in state `before` (common, or
 /// indirect arguments after an earlier clamp into it), and leaves `dst` in
-/// `INDIRECT_ARGUMENT`. `ahead`: the records are a window clamped ahead of
-/// their draws ([`bound_ahead`]). False, with nothing recorded, if the
-/// layout or the addresses do not fit the clamp.
+/// `INDIRECT_ARGUMENT`. `how`: [`AHEAD`], the records are a window clamped
+/// ahead of their draws ([`bound_ahead`]); [`IN_PARTS`], dispatches in parts
+/// ([`bound_split`], with [`UNCLAMPED`] if without the clamp's limits).
+/// False, with nothing recorded, if the layout or the addresses do not fit
+/// the clamp.
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
@@ -429,7 +567,7 @@ fn record_clamp_filled(
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
-    (ahead, fill): (bool, bool),
+    how: u32,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -474,8 +612,7 @@ fn record_clamp_filled(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let mode = has_count | (u32::from(ahead) << 1) | (u32::from(fill && has_count != 0) << 2);
-    let constants = [kind, stride, records, args_offset, mode, count_offset];
+    let constants = [kind, stride, records, args_offset, has_count | how, count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -1281,7 +1418,7 @@ pub(crate) fn check_hit(
     // (common before and after every check).
     let common = D3D12_RESOURCE_STATE_COMMON;
     let spec = (kind, step, 1);
-    if !record_clamp_as(c, &list.list, (&check.args, common), budget, src, None, spec, true) {
+    if !record_clamp_as(c, &list.list, (&check.args, common), budget, src, None, spec, AHEAD) {
         return false;
     }
     let args = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
@@ -1593,7 +1730,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1621,6 +1758,39 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        // Every lane's slice is hashed: first byte of piece 0 (lane 0),
+        // last byte of piece 2 (lane 63), and swapping two 16-byte blocks
+        // across lanes in piece 1 must all be detected.
+        for &(offset, expected) in &[
+            (0usize, [1, 0, 0]),
+            (PIECE * 3 - 1, [0, 0, 1]),
+            (63 * 16 + 7, [1, 0, 0]),
+        ] {
+            // SAFETY: offset is inside the mapped buffer.
+            unsafe { now_ptr.add(offset).write_volatile(content[offset] ^ 0x01) };
+            assert_eq!(run(&mut warp, 1), expected);
+            // SAFETY: restore original byte.
+            unsafe { now_ptr.add(offset).write_volatile(content[offset]) };
+            assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        }
+        // Swap lane 0's first 16 bytes with lane 1's first 16 bytes in piece 1.
+        // SAFETY: both 16-byte blocks are inside piece 1 of the mapped buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(content[PIECE + 16..PIECE + 32].as_ptr(), now_ptr.add(PIECE), 16);
+            std::ptr::copy_nonoverlapping(content[PIECE..PIECE + 16].as_ptr(), now_ptr.add(PIECE + 16), 16);
+        }
+        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
+        // Restore piece 1, then flip the sign bit of the first u32 in both
+        // lane 0's and lane 32's final 16-byte loads of piece 0 (offsets
+        // 64,512 and 65,024). The asymmetric reduction must not let the pair
+        // cancel out.
+        // SAFETY: all offsets are inside the mapped buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(content[PIECE..PIECE + 32].as_ptr(), now_ptr.add(PIECE), 32);
+            now_ptr.add(64_512 + 3).write_volatile(content[64_512 + 3] ^ 0x80);
+            now_ptr.add(65_024 + 3).write_volatile(content[65_024 + 3] ^ 0x80);
+        }
+        assert_eq!(run(&mut warp, 1), [1, 0, 0]);
     }
 
     /// The compare by marks (`crate::host::CARD_MARKS`), on the software
@@ -1797,7 +1967,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(1, 1, 1);
+                warp.list.Dispatch(pieces, 1, 1);
                 if mode == 2 {
                     warp.list.ResourceBarrier(&[uav_barrier()]);
                     warp.list.SetComputeRootSignature(&fetch.root);
@@ -1975,7 +2145,7 @@ void main() {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
-            false,
+            0,
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -2022,7 +2192,7 @@ void main() {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
-            false,
+            0,
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -2139,7 +2309,7 @@ void main() {
                 (&src_buf, 0),
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
-                ahead,
+                if ahead { AHEAD } else { 0 },
             ));
             // SAFETY: an open list; the scratch buffer, which the clamp left
             // readable as arguments, is copied for the check.
@@ -2177,6 +2347,272 @@ void main() {
                 assert_eq!(spent, charged_filled + 13 * 65535 * 128, "clamped one by one, each slot is charged the most");
                 assert_eq!(largest, u32::MAX);
             }
+        }
+    }
+
+    /// The clamp's source and the host side agree on the parts: how many
+    /// records a dispatch is made in, and how many groups each holds.
+    #[test]
+    fn the_clamp_and_the_host_agree_on_the_parts() {
+        assert!(SOURCE.contains(&format!("static const uint SPLIT = {SPLIT};")));
+        assert!(SOURCE.contains(&format!("{PART}u")));
+        assert_eq!(SPLIT_STRIDE, SPLIT * 12);
+        assert_eq!(u64::from(SPLIT_STRIDE), u64::from(SPLIT) * PART_BYTES);
+    }
+
+    /// The parts of a direct dispatch: none for no groups, a part of 65,535
+    /// at most, and each part begins where the one before it ended.
+    #[test]
+    fn a_direct_dispatch_is_cut_into_parts_of_the_most_the_host_runs() {
+        let parts = |x| dispatch_parts(x).collect::<Vec<_>>();
+        assert_eq!(parts(0), []);
+        assert_eq!(parts(1), [(0, 1)]);
+        assert_eq!(parts(65_535), [(0, 65_535)]);
+        assert_eq!(parts(65_536), [(0, 65_535), (65_535, 1)]);
+        assert_eq!(parts(115_200), [(0, 65_535), (65_535, 49_665)]);
+        // Past the indirect parts too: a direct dispatch's count is known.
+        assert_eq!(parts(300_000).len(), 5);
+        assert_eq!(parts(300_000).last(), Some(&(262_140, 37_860)));
+        // Every group once, whatever the count, up to the most there is.
+        for x in [1, 2, 65_534, 65_535, 65_536, 131_070, 131_071, 1 << 20, u32::MAX] {
+            let all = parts(x);
+            assert!(all.iter().all(|&(_, groups)| (1..=PART).contains(&groups)));
+            let mut next = 0u64;
+            for &(base, groups) in &all {
+                assert_eq!(u64::from(base), next, "x {x}");
+                next += u64::from(groups);
+            }
+            assert_eq!(next, u64::from(x));
+        }
+    }
+
+    /// Makes `records` (three words each, `stride` bytes apart, then a tail
+    /// word of 0xabcd_0000 + the record's number) the parts of dispatches
+    /// with [`record_clamp_as`] (`how`: [`IN_PARTS`] with or without
+    /// [`UNCLAMPED`]; `count`: the record count a count buffer gives), and
+    /// returns the words the pass wrote for each record: [`SPLIT`] records
+    /// of three words.
+    fn made_in_parts(
+        warp: &mut WarpHarness,
+        records: &[[u32; 3]],
+        stride: u32,
+        count: Option<u32>,
+        how: u32,
+    ) -> Vec<u32> {
+        let n = records.len();
+        let out_words = n * SPLIT as usize * 3;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(u64::from(stride) * n as u64);
+        let (count_buf, count_ptr, _) = warp.shared_buffer(16);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(out_words as u64 * 4);
+        let dst_buf = warp.default_uav(out_words as u64 * 4);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            for (i, record) in records.iter().enumerate() {
+                let at = src_ptr.cast::<u32>().add(i * stride as usize / 4);
+                for (w, &word) in record.iter().enumerate() {
+                    at.add(w).write_volatile(word);
+                }
+                for w in 3..stride as usize / 4 {
+                    at.add(w).write_volatile(0xabcd_0000 + i as u32);
+                }
+            }
+            count_ptr.cast::<u32>().write_volatile(count.unwrap_or(0));
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0xee, out_words * 4);
+        }
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&src_buf, 0),
+            count.map(|_| (&count_buf, 0)),
+            (2, stride, n as u32),
+            how,
+        ));
+        done_on(&warp.list, &dst_buf);
+        // SAFETY: an open list; the scratch buffer is copied for the check.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, out_words as u64 * 4);
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; the mapping holds `out_words` words.
+        unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), out_words).to_vec() }
+    }
+
+    /// The words of [`SPLIT`] parts, each `(x, y, z)`; a part of no groups
+    /// is `(0, 0, 0)`.
+    fn parts_of(asked: [u32; SPLIT as usize], rest: [u32; 2]) -> Vec<u32> {
+        asked
+            .into_iter()
+            .flat_map(|x| if x == 0 { [0, 0, 0] } else { [x, rest[0], rest[1]] })
+            .collect()
+    }
+
+    /// One dispatch in parts, with the clamp's limits: groups past what one
+    /// dispatch runs go into the later records; what nothing wrote stays
+    /// clamped, or empty; a dispatch of more than one dimension is clamped
+    /// as before.
+    #[test]
+    fn warp_large_dispatch_is_made_in_parts() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let cases: [([u32; 3], Vec<u32>); 9] = [
+            ([115_200, 1, 1], parts_of([65_535, 49_665, 0, 0], [1, 1])),
+            ([65_535, 1, 1], parts_of([65_535, 0, 0, 0], [1, 1])),
+            ([65_536, 1, 1], parts_of([65_535, 1, 0, 0], [1, 1])),
+            // Exactly what the parts hold: all four, full.
+            ([262_140, 1, 1], parts_of([65_535; 4], [1, 1])),
+            // One group past them: the garbage of arguments nothing wrote,
+            // clamped to one part as a dispatch not in parts is.
+            ([262_141, 1, 1], parts_of([65_535, 0, 0, 0], [1, 1])),
+            ([u32::MAX, 1, 1], parts_of([65_535, 0, 0, 0], [1, 1])),
+            // More than one dimension: not in parts.
+            ([5, 3, 2], parts_of([5, 0, 0, 0], [3, 2])),
+            ([100_000, 2, 1], parts_of([65_535, 0, 0, 0], [2, 1])),
+            ([0, 1, 1], parts_of([0; 4], [1, 1])),
+        ];
+        for (asked, parts) in cases {
+            let made = made_in_parts(&mut warp, &[asked], 12, None, IN_PARTS);
+            assert_eq!(made, parts, "{asked:?}");
+        }
+    }
+
+    /// The same without the clamp (`VICTORY_INDIRECT_CLAMP=0`): the groups
+    /// as the title asked, cut into parts, and only what the parts cannot
+    /// hold is left out; nothing is cut to garbage limits.
+    #[test]
+    fn warp_large_dispatch_is_made_in_parts_without_the_clamp() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let cases: [([u32; 3], Vec<u32>); 8] = [
+            ([115_200, 1, 1], parts_of([65_535, 49_665, 0, 0], [1, 1])),
+            ([65_535, 1, 1], parts_of([65_535, 0, 0, 0], [1, 1])),
+            ([65_536, 1, 1], parts_of([65_535, 1, 0, 0], [1, 1])),
+            ([300_000, 1, 1], parts_of([65_535; 4], [1, 1])),
+            // Other dimensions go through as they were asked, in every part.
+            ([100_000, 3, 2], parts_of([65_535, 34_465, 0, 0], [3, 2])),
+            ([70_000, 0, 5], parts_of([65_535, 4_465, 0, 0], [0, 5])),
+            ([5, 3, 2], parts_of([5, 0, 0, 0], [3, 2])),
+            ([0, 7, 9], parts_of([0; 4], [7, 9])),
+        ];
+        for (asked, parts) in cases {
+            let made = made_in_parts(&mut warp, &[asked], 12, None, IN_PARTS | UNCLAMPED);
+            assert_eq!(made, parts, "{asked:?}");
+        }
+    }
+
+    /// Several records, strides past 12 and a count buffer: record `i`'s
+    /// parts lie [`SPLIT_STRIDE`] bytes after record `i - 1`'s, whatever the
+    /// source stride is, and records past the count are not made.
+    #[test]
+    fn warp_dispatches_in_parts_keep_their_records_apart() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let records = [[115_200, 1, 1], [7, 1, 1], [70_000, 1, 1], [9, 1, 1]];
+        for how in [IN_PARTS, IN_PARTS | UNCLAMPED] {
+            let made = made_in_parts(&mut warp, &records, 24, Some(3), how);
+            let per = SPLIT as usize * 3;
+            assert_eq!(made[..per], parts_of([65_535, 49_665, 0, 0], [1, 1]), "how {how}");
+            assert_eq!(made[per..2 * per], parts_of([7, 0, 0, 0], [1, 1]), "how {how}");
+            assert_eq!(made[2 * per..3 * per], parts_of([65_535, 4_465, 0, 0], [1, 1]), "how {how}");
+            // The fourth is past the count: not made (the scratch buffer
+            // holds what it did, not the record's 9 groups).
+            assert_ne!(made[3 * per..4 * per], parts_of([9, 0, 0, 0], [1, 1]), "how {how}");
+        }
+    }
+
+    /// A program given the number of its first group runs every group once
+    /// when a dispatch of 115,200 is run in parts, from an indirect record
+    /// (with and without the clamp) and from a direct dispatch.
+    #[test]
+    fn warp_a_dispatch_in_parts_runs_every_group_once() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const BASE_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+cbuffer First : register(b0) { uint base; };
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID) {
+    uint was;
+    // Groups run, the highest number + 1, the sum of the numbers (mod 2^32).
+    seen.InterlockedAdd(0, 1, was);
+    seen.InterlockedMax(4, base + group.x + 1, was);
+    seen.InterlockedAdd(8, base + group.x, was);
+}
+"#;
+        let program = compile_cs(&warp.device, BASE_CS).expect("the test program must compile");
+        const GROUPS: u32 = 115_200;
+        let expected = [GROUPS, GROUPS, (u64::from(GROUPS) * u64::from(GROUPS - 1) / 2) as u32];
+        let split = warp.signature(2, SPLIT_STRIDE);
+        for way in ["indirect, clamp on", "indirect, clamp off", "direct"] {
+            let (src_buf, src_ptr, _) = warp.shared_buffer(12);
+            let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (_seen_buf, seen_ptr, seen_gpu) = warp.shared_buffer(64);
+            let dst_buf = warp.default_uav(u64::from(SPLIT_STRIDE));
+            // SAFETY: mapped buffers of these sizes.
+            unsafe {
+                for (i, word) in [GROUPS, 1, 1].into_iter().enumerate() {
+                    src_ptr.cast::<u32>().add(i).write_volatile(word);
+                }
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+                std::ptr::write_bytes(seen_ptr, 0, 64);
+            }
+            let direct = way == "direct";
+            if !direct {
+                let how = if way == "indirect, clamp on" { IN_PARTS } else { IN_PARTS | UNCLAMPED };
+                assert!(record_clamp_as(
+                    &warp.clamp,
+                    &warp.list,
+                    (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
+                    budget_gpu,
+                    (&src_buf, 0),
+                    None,
+                    (2, 12, 1),
+                    how,
+                ));
+            }
+            // SAFETY: an open list; our root signature, program and buffers.
+            unsafe {
+                warp.list.SetComputeRootSignature(&program.root);
+                warp.list.SetPipelineState(&program.pso);
+                warp.list.SetComputeRootUnorderedAccessView(1, seen_gpu);
+                if direct {
+                    for (base, groups) in dispatch_parts(GROUPS) {
+                        warp.list.SetComputeRoot32BitConstant(0, base, 0);
+                        warp.list.Dispatch(groups, 1, 1);
+                    }
+                } else {
+                    for part in 0..SPLIT {
+                        warp.list.SetComputeRoot32BitConstant(0, part * PART, 0);
+                        warp.list.ExecuteIndirect(&split, 1, &dst_buf, u64::from(part) * PART_BYTES, None, 0);
+                    }
+                }
+            }
+            if !direct {
+                done_on(&warp.list, &dst_buf);
+            }
+            warp.submit_and_wait();
+            // SAFETY: the work is done; the mapping holds the words.
+            let words = unsafe { [0, 1, 2].map(|i| seen_ptr.cast::<u32>().add(i).read_volatile()) };
+            assert_eq!(words, expected, "{way}");
         }
     }
 
@@ -2229,7 +2665,7 @@ void main() {
             (&src_buf, 0),
             None,
             (KIND_INDEXED, STRIDE, RECORDS),
-            false,
+            0,
         ));
 
         // SAFETY: open command list; copy clamped scratch buffer (left
@@ -2265,10 +2701,15 @@ void main() {
 
         let mut kept = 0usize;
         let mut zeroed = 0usize;
+        // Each group of 64 charges its records in lane order, but which of
+        // the two groups charges first is the GPU's to choose: the two that
+        // fit are the first two real draws of one group (1 and 2, or 64 and
+        // 65).
+        let mut fitted = Vec::new();
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
+                fitted.push(i);
                 kept += 1;
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
@@ -2280,6 +2721,10 @@ void main() {
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        assert!(
+            fitted == [1, 2] || fitted == [64, 65],
+            "the first two real draws of one group fit the budget: {fitted:?}"
+        );
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's
@@ -2376,6 +2821,47 @@ void main() {
         list.reset();
     }
 
+    #[test]
+    fn parse_clamp_enabled_defaults_on_and_respects_explicit_disable() {
+        use std::ffi::OsStr;
+        assert!(parse_clamp_enabled(None));
+        for on in ["", "1", " 1 ", "true", "TRUE", "yes", "on"] {
+            assert!(
+                parse_clamp_enabled(Some(OsStr::new(on))),
+                "{on:?} must keep indirect clamp enabled"
+            );
+        }
+        for off in ["0", " 0 ", "false", "FALSE", "no", "NO", "off", "OFF"] {
+            assert!(
+                !parse_clamp_enabled(Some(OsStr::new(off))),
+                "{off:?} must disable indirect clamp"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_layout_rejects_misaligned_or_overflowing_direct_arguments() {
+        assert_eq!(validate_layout((0, 16, 4), 0, None), Some(64));
+        assert_eq!(validate_layout((10, 12, 8), 16, Some(4)), Some(96));
+        assert_eq!(validate_layout((0, 12, 1), 0, None), None);
+        assert_eq!(validate_layout((0, 16, 1), 2, None), None);
+        assert_eq!(validate_layout((0, 16, 1), 0, Some(2)), None);
+        assert_eq!(validate_layout((0, 16, u32::MAX), 0, None), None);
+    }
+
+    /// The scratch buffer back to the common state after a clamp, for
+    /// tests that copy it out on a list of their own.
+    fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
+        // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
+        unsafe {
+            list.ResourceBarrier(&[transition(
+                scratch,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COMMON,
+            )])
+        };
+    }
+
     /// A group charges its records in lane order: with 300 left of the
     /// budget, the first draw (100) fits, the second (250) does not and
     /// takes the rest, and the ones after it run empty. (Racing for the
@@ -2415,7 +2901,7 @@ void main() {
             (&src_buf, 0),
             None,
             (KIND_DRAW, STRIDE, counts.len() as u32),
-            false,
+            0,
         ));
         // SAFETY: an open list; the clamped records are copied for the check.
         unsafe {
@@ -2657,7 +3143,7 @@ void main() {
                 (src, 0),
                 None,
                 (KIND_DISPATCH, STEP, groups.len() as u32),
-                true,
+                AHEAD,
             ));
             state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
             // SAFETY: an open list; the worker's root signature and
@@ -3676,7 +4162,6 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
-        depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
@@ -3984,7 +4469,6 @@ void work() {
                     heap_pairs,
                     tables,
                     targets,
-                    depth_written,
                     depth_tested,
                     stamps,
                     back,

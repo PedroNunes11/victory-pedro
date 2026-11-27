@@ -599,6 +599,8 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        written_root_uavs: Vec::new(),
+        writes_guest_memory: false,
         root_indexed_views: Vec::new(),
         half_views: Vec::new(),
     }
@@ -619,6 +621,10 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A root UAV over a zeroed buffer of this many dwords, whose contents
+    /// [`Host::dispatch`] returns after the views' ([`Host::dispatch`]
+    /// only).
+    Uav(u32),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -856,7 +862,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -986,6 +992,9 @@ pub enum View<'a> {
     Texture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F cube SRV with mips (face size, mip count, texels in the
+    /// order of D3D's subresources: per face, its levels from the largest).
+    CubeMips(u32, u16, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1165,21 +1174,25 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..) | View::Cube(..) => {
-                        let (w, h, texels, faces) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1),
-                            View::Cube(n, t) => (n, n, t, 6),
+                    View::Texture(..) | View::Cube(..) | View::CubeMips(..) => {
+                        let (w, h, mut texels, faces, mips) = match *v {
+                            View::Texture(w, h, t) => (w, h, t, 1, 1),
+                            View::Cube(n, t) => (n, n, t, 6, 1),
+                            View::CubeMips(n, mips, t) => (n, n, t, 6, mips),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
                         desc.DepthOrArraySize = faces as u16;
+                        desc.MipLevels = mips;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        let pitch = (w as usize * 16).next_multiple_of(256);
-                        for face in 0..faces as usize {
+                        for sub in 0..u32::from(mips) * faces {
+                            let mip = sub % u32::from(mips);
+                            let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
+                            let pitch = (w as usize * 16).next_multiple_of(256);
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
                                 &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
@@ -1187,9 +1200,10 @@ impl Host {
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            let texels = &texels[face * (w * h) as usize..];
+                            let (level, rest) = texels.split_at((w * h) as usize);
+                            texels = rest;
                             for y in 0..h as usize {
-                                let row = &texels[y * w as usize..(y + 1) * w as usize];
+                                let row = &level[y * w as usize..(y + 1) * w as usize];
                                 std::ptr::copy_nonoverlapping(
                                     row.as_ptr().cast::<u8>(),
                                     p.cast::<u8>().add(y * pitch),
@@ -1198,7 +1212,7 @@ impl Host {
                             }
                             upload.Unmap(0, None);
                             let mut at_face = subresource(&tex);
-                            at_face.Anonymous.SubresourceIndex = face as u32;
+                            at_face.Anonymous.SubresourceIndex = sub;
                             list.CopyTextureRegion(
                                 &at_face,
                                 0,
@@ -1220,7 +1234,7 @@ impl Host {
                             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                 TextureCube: D3D12_TEXCUBE_SRV {
-                                    MipLevels: 1,
+                                    MipLevels: u32::from(mips),
                                     ..Default::default()
                                 },
                             },
@@ -1382,6 +1396,8 @@ impl Host {
             }
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(root);
+            // Root UAVs, read back after the views' UAVs.
+            let mut root_uavs = Vec::new();
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
@@ -1410,8 +1426,24 @@ impl Host {
                         }
                         keep.push(b);
                     }
+                    Root::Uav(n) => {
+                        let bytes = u64::from(*n) * 4;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COMMON,
+                        )?;
+                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        root_uavs.push((b, None, *n, rb));
+                    }
                 }
             }
+            uavs.append(&mut root_uavs);
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);
             for (r, size, n, rb) in &uavs {

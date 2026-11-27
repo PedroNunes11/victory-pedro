@@ -49,7 +49,7 @@ const TEXTURE_3D: u32 = 4;
 
 /// The mode the console's library picks for a description: linear for 1D,
 /// the XOR render and depth modes for targets, else 4 KiB standard
-/// (`.ttpf` textures without a mode of their own use it).
+/// (the title's texture files without a mode of their own use it).
 ///
 /// shortcut: the rule of the library's older optimal-mode function (any
 /// size, 2D, 3D and cubes alike); `XGSuggestSwizzleMode` itself is newer

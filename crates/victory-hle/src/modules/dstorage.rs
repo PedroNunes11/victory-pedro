@@ -172,16 +172,17 @@ extern "system" fn create_status_array(
     put(out, array)
 }
 
-/// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field the title sets to 1.
+/// DSTORAGE_QUEUE_DESC1, passed to IDStorageFactoryX2::CreateQueue1.
 #[repr(C)]
 struct QueueDesc {
     source_type: u64,
     capacity: u16,
     priority: i8,
     name: *const c_char,
-    unknown: u64,
+    options: u64,
 }
+
+const AUTO_SUBMIT_DISABLED: u64 = 1;
 
 extern "system" fn create_queue(
     _: Factory,
@@ -194,12 +195,13 @@ extern "system" fn create_queue(
         return E_INVALIDARG;
     };
     let name = text(desc.name);
+    let auto_submit = desc.options & AUTO_SUBMIT_DISABLED == 0;
     tracing::info!(
         source = desc.source_type,
         capacity = desc.capacity,
         priority = desc.priority,
         name,
-        unknown = desc.unknown,
+        auto_submit,
         iid = iid_text(iid),
         "dstorage: queue"
     );
@@ -214,7 +216,10 @@ extern "system" fn create_queue(
     drop(lanes);
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(
+            Object::new("dstorage queue", &QUEUE_VTABLE),
+            Queue { id, auto_submit },
+        ),
     )
 }
 
@@ -310,6 +315,7 @@ static STATUS_VTABLE: Methods<5> = Methods([
 /// A queue object: its lane in the scheduler.
 struct Queue {
     id: u64,
+    auto_submit: bool,
 }
 
 impl Drop for Queue {
@@ -422,7 +428,8 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers =
+            dstorage_worker_count(std::thread::available_parallelism().map_or(4, |n| n.get()));
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -434,6 +441,12 @@ fn scheduler() -> Option<&'static Scheduler> {
         tracing::info!(workers = started, "dstorage: workers");
     });
     Some(scheduler)
+}
+
+/// Number of DirectStorage I/O and decompression workers for a machine with
+/// `cores` logical processors.
+fn dstorage_worker_count(cores: usize) -> usize {
+    cores.clamp(2, 16)
 }
 
 impl Scheduler {
@@ -508,6 +521,8 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        PROBE_TAG.set(victory_gpu::bake_probe_dstorage_tag(job.lane, job.seq));
         let result = execute(&job.request);
         walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
@@ -552,6 +567,8 @@ impl Lanes {
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 waiting,
+                shown_requests = SHOWN[0].swap(0, Ordering::Relaxed),
+                shown_mb = SHOWN[1].swap(0, Ordering::Relaxed) >> 20,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
             );
@@ -602,7 +619,7 @@ impl Lanes {
             if let Err(hr) = result {
                 lane.failures.insert(job.seq, hr);
             }
-            lane.flush();
+            lane.flush(job.lane);
         }
     }
 
@@ -634,7 +651,7 @@ impl Lanes {
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
-        lane.flush();
+        lane.flush(id);
     }
 }
 
@@ -658,8 +675,10 @@ impl Lane {
         self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
     }
 
-    /// Writes the status entries whose earlier reads have all finished.
-    fn flush(&mut self) {
+    /// Writes the status entries whose earlier reads have all finished
+    /// (`id`: the lane's, for the bake probe).
+    fn flush(&mut self, id: u64) {
+        let _ = id;
         while let Some(&(seq, _)) = self.statuses.front() {
             let waiting = self.reads.front().map(|r| r.0);
             if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
@@ -675,6 +694,8 @@ impl Lane {
             status
                 .entry()
                 .store(first.unwrap_or(S_OK), Ordering::Release);
+            #[cfg(feature = "diagnostics")]
+            victory_gpu::bake_probe_dstorage_signal(id, seq);
         }
     }
 }
@@ -797,11 +818,10 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     queue(this, Command::Status(Status { array, index }));
 }
 
-/// Adds a command to the queue; blocks while the queue is full, and
-/// submits on its own once half of it is enqueued, as the console does.
+/// Blocks while full. Automatic queues submit when half their capacity is pending.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
-    let id = unsafe { &*this }.state.id;
+    let Queue { id, auto_submit } = unsafe { &*this }.state;
     let Some(scheduler) = scheduler() else {
         return;
     };
@@ -823,7 +843,7 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    if auto_submit && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         lanes.submit(id);
         scheduler.work.notify_all();
     }
@@ -1068,53 +1088,90 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Opens the guarded blocks and tells the GPU side a placed texture
-        // there changes. `fill` writes from user mode (a file read is read
-        // beside first, see `execute`), so a block guarded again meanwhile
-        // faults into the guard instead of failing the write.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        // Opens the guarded blocks, holds them open until the bytes are in,
+        // and tells the GPU side a placed texture there changes.
+        let writing = victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        let filled = fill(out).map(drop);
+        let filled = fill(out);
+        drop(writing);
+        #[cfg(feature = "diagnostics")]
+        if let Ok(n) = filled {
+            victory_gpu::bake_probe_note(
+                victory_gpu::BakeProbeWriter::DstorageToAddress,
+                request.destination as usize,
+                n,
+                PROBE_TAG.get(),
+            );
+        }
         // Said again now that the bytes are there (upstream's c75fdba holds
         // the blocks open over the read and marks them once more at its
         // end): a copy or a texture pass that took the memory while the
         // read was under way took what was there before. Counted; acted on
         // only with `VICTORY_PAGE_WRITES=all`.
         victory_gpu::title_memory_written(request.destination as usize, len, false);
-        return filled;
+        return filled.map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
-    };
+    let list = request.destination.cast::<usize>();
+    let count = (offset + len).div_ceil(PAGE);
+    let pages = page_list(list, count);
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        let filled = fill(window.bytes()).map(drop);
+    if let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
+        let filled = fill(window.bytes());
         drop(window);
-        // The title maps pages where the card reads them and has them
-        // filled afterwards: the GPU side's copies of those addresses
-        // learn of the bytes only from this (upstream c75fdba, fork PR
-        // #571). After a decode that failed part way too: what it wrote
-        // is there.
-        super::xmem::pages_written(pages, offset, len);
-        return filled;
+        // After a decode that failed part way too: what it wrote is there.
+        pages_written(&pages, offset, *filled.as_ref().unwrap_or(&len));
+        return filled.map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    // A page the title has just made, or a view the host refuses for a
-    // moment, comes right a little later: the write is tried again before
-    // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
-    // in all; 0: not tried again, as before). Runs 175-178 lost 12 to 446
-    // reads a launch here, all in one second of the loading; the one build
-    // that tried again (run 165) lost none of 13.
+    if super::xmem::write_physical(&pages, offset, &data[..n]) {
+        pages_written(&pages, offset, n);
+        return Ok(());
+    }
+    // Page number 0 is no page (numbers start at 0x10_0000): a list naming
+    // it is one the title has not filled yet. The title writes a request's
+    // page list after it enqueued the request, and a queue half full is
+    // submitted on its own, so a read can start first (and a title thread
+    // that fills the list may be put aside by the system for longer than a
+    // few milliseconds while pipelines are built). The data is read already;
+    // the list is read again until it holds no 0, for a tenth of a second at
+    // most, and then written.
+    let mut waited = std::time::Duration::ZERO;
+    if pages.contains(&0) {
+        let began = std::time::Instant::now();
+        while began.elapsed() < LATE_LIST_WAIT {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            let again = page_list(list, count);
+            if again.contains(&0) {
+                continue;
+            }
+            waited = began.elapsed();
+            if super::xmem::write_physical(&again, offset, &data[..n]) {
+                pages_written(&again, offset, n);
+                let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
+                if late <= 8 || late.is_power_of_two() {
+                    tracing::info!(
+                        late,
+                        waited_ms = waited.as_millis() as u64,
+                        "dstorage: a page list filled after its request started: written late"
+                    );
+                }
+                return Ok(());
+            }
+            break;
+        }
+        if waited.is_zero() {
+            waited = began.elapsed();
+        }
+    }
+    // A page the title has just made, or a view the host refuses for a moment (commit
+    // or address space short while a load maps many at once), can come right a little
+    // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
+    // about 1.5 s in all; 0: not tried again), each time with the list as it is then.
     static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let retries = *RETRIES.get_or_init(|| {
         std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
@@ -1122,48 +1179,98 @@ fn into_destination(
     // Since the start: writes that succeeded on a later try, and writes
     // given up.
     static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
-    let mut tries = 0u32;
-    while !written && tries < retries {
+    for tries in 0..retries {
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
-        tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
-    }
-    if written {
-        if tries > 0 {
+        let again = page_list(list, count);
+        if !again.contains(&0) && super::xmem::write_physical(&again, offset, &data[..n]) {
+            pages_written(&again, offset, n);
             let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
             tracing::info!(
                 offset,
                 len,
-                tries,
+                tries = tries + 1,
                 on_a_retry,
                 given_up = RETRIED[1].load(Ordering::Relaxed),
                 "dstorage: a destination's physical pages written after a retry"
             );
+            return Ok(());
         }
-        // As above, after the write that succeeded.
-        super::xmem::pages_written(pages, offset, n);
-        Ok(())
-    } else {
-        let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::warn!(
-            known = super::xmem::pages_known(pages, offset, len),
-            tries,
-            given_up,
-            on_a_retry = RETRIED[0].load(Ordering::Relaxed),
-            "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
-        );
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
+    }
+    let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::warn!(
+        tries = retries,
+        given_up,
+        on_a_retry = RETRIED[0].load(Ordering::Relaxed),
+        last_error = std::io::Error::last_os_error().raw_os_error(),
+        "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
+    );
+    // Said aloud: the title never reads a request's result
+    // (it only polls for completion), so a destination left unwritten
+    // is a model or texture that silently holds whatever its pages
+    // held before.
+    tracing::warn!(
+        offset,
+        len,
+        pages = pages.len(),
+        first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
+        options = format_args!("{:#x}", request.options),
+        unfilled = pages.contains(&0),
+        known = super::xmem::pages_known(&pages, offset, len),
+        waited_ms = waited.as_millis() as u64,
+        "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+    );
+    Err(E_INVALIDARG)
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// The bake probe's tag of the request a worker runs (its queue and
+    /// number), for the writes it notes.
+    static PROBE_TAG: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How long a request's page list naming page 0 is read again for.
+const LATE_LIST_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+/// Page lists filled after their request started (written late).
+static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
+
+/// The `count` page numbers of a destination, read now (the title may still
+/// be writing the list from another thread, and keeps it until the request
+/// completes).
+fn page_list(list: *const usize, count: usize) -> Vec<usize> {
+    // SAFETY: the title passes a page number per 64 KiB of destination,
+    // which holds at least `len` bytes from `offset`; the reads are
+    // volatile because another thread of the title may write them.
+    (0..count).map(|i| unsafe { list.add(i).read_volatile() }).collect()
+}
+
+/// Requests whose destination pages were mapped at title addresses when
+/// written, and the bytes at those addresses, since the last debug summary
+/// ([`pages_written`]).
+static SHOWN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Bytes `[offset, offset + len)` of physical pages were written through a
+/// view of our own: where the title has those pages mapped, the GPU side is
+/// told, as of a write through the kernel. Neither its guards nor its
+/// textures picked by index see a write through another view, so a texture
+/// the title maps first and streams into afterwards kept what its host copy
+/// took before (nothing yet, or the mip it replaced) until something else
+/// made it due. `VICTORY_DSTORAGE_SHOWN=0`: not told, as before.
+fn pages_written(pages: &[usize], offset: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    if victory_gpu::bake_probe_on() {
+        for (at, bytes) in super::xmem::shown_at(pages, offset, len) {
+            victory_gpu::bake_probe_note(victory_gpu::BakeProbeWriter::DstorageToPages, at, bytes, PROBE_TAG.get());
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_SHOWN").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let shown = super::xmem::pages_written(pages, offset, len);
+    if shown > 0 {
+        SHOWN[0].fetch_add(1, Ordering::Relaxed);
+        SHOWN[1].fetch_add(shown as u64, Ordering::Relaxed);
     }
 }
 
@@ -1241,14 +1348,18 @@ mod tests {
     }
 
     fn new_queue(source_type: u64) -> *mut c_void {
+        queue_with_options(source_type, 0x80, AUTO_SUBMIT_DISABLED)
+    }
+
+    fn queue_with_options(source_type: u64, capacity: u16, options: u64) -> *mut c_void {
         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
         let desc = QueueDesc {
             source_type,
-            capacity: 0x80,
+            capacity,
             priority: 0,
             name: c"test".as_ptr(),
-            unknown: 1,
+            options,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
@@ -1327,7 +1438,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source), 0x20);
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
-        assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+        assert_eq!(std::mem::offset_of!(QueueDesc, options), 0x18);
     }
 
     fn compress_zlib(plain: &[u8]) -> Vec<u8> {
@@ -1425,25 +1536,26 @@ mod tests {
     }
 
     #[test]
-    fn half_a_queue_submits_itself() {
+    fn queue_options_control_submission_at_half_capacity() {
         let (_dir, file) = file_with(&pattern(64));
-        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
-            call(factory(), 0x50);
-        let desc = QueueDesc {
-            source_type: 0,
-            capacity: 4,
-            priority: 1,
-            name: c"small".as_ptr(),
-            unknown: 1,
-        };
-        let mut queue = std::ptr::null_mut();
-        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
-        let array = status_array(1);
-        let mut out = [0u8; 16];
-        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
-        enqueue_status(queue, array, 0); // the second of four: no submit needed
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out, pattern(64)[8..24]);
+        for options in [0, AUTO_SUBMIT_DISABLED] {
+            let queue = queue_with_options(0, 4, options);
+            let array = status_array(1);
+            let mut out = [0u8; 16];
+            enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
+            enqueue_status(queue, array, 0);
+            if options == AUTO_SUBMIT_DISABLED {
+                // SAFETY: this test owns the live queue returned by CreateQueue1.
+                let id = unsafe { &*queue.cast::<Instance<Queue>>() }.state.id;
+                assert_eq!(scheduler().unwrap().lock().lanes[&id].unsubmitted.len(), 2);
+                assert_eq!(result(array, 0), E_PENDING);
+                void(queue, 0x30);
+            }
+            assert_eq!(wait(array, 0), S_OK);
+            assert_eq!(out, pattern(64)[8..24]);
+            release::<Queue>(queue.cast());
+            release::<StatusArray>(array.cast());
+        }
     }
 
     /// Lanes without workers: what `start` picks, and when statuses land.
@@ -1679,6 +1791,60 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
     }
+    /// The title writes a request's page list after it enqueued it: a list
+    /// naming no page when the read starts is read again, and the data goes
+    /// to the pages it names then; a list that is never filled fails.
+    #[test]
+    fn a_page_list_filled_after_its_request_starts_is_waited_for() {
+        use crate::modules::xmem;
+        let (mut given, mut page) = (1usize, [0usize; 1]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
+
+        let plain = pattern(4096);
+        let (queue, array) = (new_queue(1), status_array(2));
+        // The title's lists, empty when the requests are submitted; the
+        // second is never filled.
+        let lists: &'static mut [usize; 2] = Box::leak(Box::new([0usize; 2]));
+        let at = lists.as_mut_ptr() as usize;
+        for index in 0..2 {
+            let r = request(
+                PAGE_DESTINATION | MEMORY_SOURCE,
+                (at + index * size_of::<usize>()) as *mut c_void,
+                plain.len(),
+                plain.as_ptr().cast(),
+                0,
+                plain.len(),
+            );
+            enqueue(queue, &r);
+            enqueue_status(queue, array, index as u32);
+        }
+        let number = page[0];
+        let filler = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            // SAFETY: the leaked list, alive for the whole test.
+            unsafe { std::ptr::write_volatile(at as *mut usize, number) };
+        });
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        filler.join().unwrap();
+        // SAFETY: the page is mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
+        assert_eq!(seen, plain);
+        assert_eq!(wait(array, 1), E_INVALIDARG);
+    }
+
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
         use crate::modules::xmem;
@@ -1736,6 +1902,16 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn dstorage_worker_count_scales_with_cores() {
+        assert_eq!(dstorage_worker_count(2), 2);
+        assert_eq!(dstorage_worker_count(4), 4);
+        assert_eq!(dstorage_worker_count(8), 8);
+        assert_eq!(dstorage_worker_count(16), 16);
+        assert_eq!(dstorage_worker_count(28), 16);
+        assert_eq!(dstorage_worker_count(64), 16);
     }
 
     #[test]

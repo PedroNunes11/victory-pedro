@@ -38,9 +38,9 @@ pub(crate) enum Kind {
     Check,
     /// Every other host list: the title's own, our present copies.
     Lists,
-    /// Ours: a list's state prelude (texture state transitions, depth twin
-    /// copies), timed apart into [`PRELUDE_CARD`].
-    Prelude,
+    /// Inside one of those: from where a pipeline is bound to where the
+    /// next one is, or the list ends ([`begin_named`]).
+    Pipeline,
 }
 
 /// The card's time in state preludes since the last read, in microseconds,
@@ -49,9 +49,9 @@ pub(crate) static PRELUDE_CARD: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Pairs of timestamps in the ring.
-const PAIRS: u32 = 8192;
+const PAIRS: u32 = 32768;
 /// A pair is read this long after it was recorded.
-const AFTER: std::time::Duration = std::time::Duration::from_millis(1500);
+const AFTER: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// A pair being recorded: its place in the ring, or none.
 #[derive(Clone, Copy)]
@@ -78,6 +78,16 @@ struct Meter {
     next: u32,
     /// Pairs recorded and not read yet: place, kind, when recorded.
     pending: std::collections::VecDeque<(u32, Kind, std::time::Instant)>,
+    /// What the list of a pair mostly is ([`end_named`]), by place, until
+    /// the pair is read.
+    names: std::collections::HashMap<u32, String>,
+    /// Since the last table: by name, the lists and their microseconds.
+    by_name: std::collections::HashMap<String, (u64, u64)>,
+    /// The same by pipeline ([`begin_named`]): the times it was bound and
+    /// the microseconds until the next one was.
+    by_pipeline: std::collections::HashMap<String, (u64, u64)>,
+    /// Frames since the last table.
+    frames: u64,
     /// What each place held when it was last read: a place the card has
     /// not written since (its list never ran) still holds that, and is
     /// not counted again.
@@ -135,7 +145,19 @@ fn make() -> Option<Meter> {
         tracing::info!(
             "the card's time is measured by kind of list, a timestamp where each list begins and ends (VICTORY_CARD_METER=0: not)"
         );
-        Some(Meter { heap, back, mapped: mapped as usize, frequency, next: 0, pending: Default::default(), seen: vec![(0, 0); PAIRS as usize] })
+        Some(Meter {
+            heap,
+            back,
+            mapped: mapped as usize,
+            frequency,
+            next: 0,
+            pending: Default::default(),
+            names: Default::default(),
+            by_name: Default::default(),
+            by_pipeline: Default::default(),
+            frames: 0,
+            seen: vec![(0, 0); PAIRS as usize],
+        })
     }
 }
 
@@ -183,6 +205,61 @@ pub(crate) fn end(list: &ID3D12GraphicsCommandList, span: Span) {
     unsafe {
         list.EndQuery(&m.heap, D3D12_QUERY_TYPE_TIMESTAMP, span.0 * 2 + 1);
         list.ResolveQueryData(&m.heap, D3D12_QUERY_TYPE_TIMESTAMP, span.0 * 2, 2, &m.back, u64::from(span.0) * 16);
+    }
+}
+
+/// Whether the card's time is also measured pipeline by pipeline inside the
+/// title's lists (`VICTORY_CARD_METER_PIPELINES=1`; off by default: two
+/// more queries and a resolve at every change of pipeline).
+pub(crate) fn pipelines() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_CARD_METER_PIPELINES").is_some_and(|v| v == "1"))
+}
+
+/// The pipeline `name` is bound on `list` here: the first timestamp of a
+/// pair that [`end`] closes where the next pipeline is bound or the list
+/// ends. What the card does between the two (the draws or dispatches of
+/// that pipeline, and what the layer records around them) is that
+/// pipeline's time in the table.
+pub(crate) fn begin_named(list: &ID3D12GraphicsCommandList, name: &str) -> Span {
+    let span = begin(list, Kind::Pipeline);
+    if span.0 != u32::MAX {
+        let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Some(m)) = meter.as_mut() {
+            m.names.insert(span.0, name.to_owned());
+        }
+    }
+    span
+}
+
+/// [`end`] for one of the title's lists, with what it mostly is: the
+/// pipelines it binds (`names`, in order, as the list keeps them). Every
+/// 256 frames the card's time is logged by that name: which of the title's
+/// passes the card's time goes to, in a run like any other (the timing run
+/// that names every command sends each list alone and needs the
+/// device-removed notes).
+pub(crate) fn end_named(list: &ID3D12GraphicsCommandList, span: Span, names: &std::collections::BTreeSet<String>) {
+    if span.0 == u32::MAX {
+        return;
+    }
+    end(list, span);
+    let name = name_of(names);
+    let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Some(m)) = meter.as_mut() {
+        m.names.insert(span.0, name);
+    }
+}
+
+/// A list's name in the table: how many pipelines it binds and the first
+/// two of them (the set is in the order of the names, so a pass has the
+/// same name every frame).
+fn name_of(names: &std::collections::BTreeSet<String>) -> String {
+    let short = |n: &String| n.chars().take(60).collect::<String>();
+    let mut first = names.iter();
+    match (first.next(), first.next()) {
+        (None, _) => "no pipeline (copies, clears, barriers)".to_string(),
+        (Some(a), None) => format!("1 pipeline: {}", short(a)),
+        (Some(a), Some(b)) => format!("{} pipelines: {} / {}", names.len(), short(a), short(b)),
     }
 }
 
@@ -239,6 +316,18 @@ pub(crate) fn collect() {
             Kind::Lists => {
                 add(T::CardListsUs, us);
                 add(T::CardLists, 1);
+                if let Some(name) = m.names.remove(&pair) {
+                    let e = m.by_name.entry(name).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += us;
+                }
+            }
+            Kind::Pipeline => {
+                if let Some(name) = m.names.remove(&pair) {
+                    let e = m.by_pipeline.entry(name).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += us;
+                }
             }
             Kind::Prelude => {
                 PRELUDE_CARD[0].fetch_add(us as u64, std::sync::atomic::Ordering::Relaxed);
@@ -246,79 +335,60 @@ pub(crate) fn collect() {
             }
         }
     }
-    note_gaps(&mut spans, m.frequency);
-}
-
-/// Since the last frame line, the card's time between timed lists, by the
-/// size of each gap (under 20 µs, under 200 µs, longer): microseconds and
-/// count of each. A gap is from the latest end of the lists before it
-/// (lists of other queues may overlap) to the next begin.
-static GAPS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
-
-/// Lists read and not yet placed among their neighbours, and the latest
-/// end of those placed. Pairs are read by the time their lists were
-/// recorded, and lists recorded together need not run together: a gap is
-/// counted only where every list around it has been read, which is taken
-/// to be half a second of the card's clock before the latest begin read.
-static UNPLACED: Mutex<(Vec<(u64, u64)>, Option<u64>)> = Mutex::new((Vec::new(), None));
-
-/// [`GAPS`] of the lists read so far, `spans` the (begin, end) timestamps
-/// of those just read.
-fn note_gaps(spans: &mut Vec<(u64, u64)>, frequency: u64) {
-    let mut state = UNPLACED.lock().unwrap_or_else(|e| e.into_inner());
-    let (unplaced, latest) = &mut *state;
-    unplaced.append(spans);
-    unplaced.sort_unstable();
-    let Some(&(newest, _)) = unplaced.last() else {
-        return;
-    };
-    let horizon = newest.saturating_sub(frequency / 2);
-    let placed = unplaced.partition_point(|&(begin, _)| begin < horizon);
-    place_gaps(&unplaced[..placed], latest, frequency);
-    unplaced.drain(..placed);
-}
-
-/// [`GAPS`] of `spans` (sorted), after the lists that ended at `latest`.
-fn place_gaps(spans: &[(u64, u64)], latest: &mut Option<u64>, frequency: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    for &(begin, end) in spans {
-        if let Some(last) = *latest
-            && begin > last
-        {
-            let us = micros(last, begin, frequency);
-            // Gaps of over 50 ms are menus and loading, not the card's
-            // frames.
-            if us < 50_000 {
-                let size = if us < 20 { 0 } else if us < 200 { 1 } else { 2 };
-                GAPS[2 * size].fetch_add(us, Relaxed);
-                GAPS[2 * size + 1].fetch_add(1, Relaxed);
+    m.frames += 1;
+    if m.frames >= 256 {
+        let frames = m.frames as f64;
+        let mut table: Vec<(String, (u64, u64))> = m.by_name.drain().collect();
+        table.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
+        let all: u64 = table.iter().map(|&(_, (_, us))| us).sum();
+        tracing::info!(
+            "card time of the title's lists by what they bind, per frame over {} frames: {:.1} ms in {:.0} lists of {} kinds; the largest follow",
+            m.frames,
+            all as f64 / 1e3 / frames,
+            table.iter().map(|&(_, (n, _))| n).sum::<u64>() as f64 / frames,
+            table.len()
+        );
+        for (name, (n, us)) in table.into_iter().take(24) {
+            tracing::info!("  card {:6.2} ms a frame in {:5.1} lists: {name}", us as f64 / 1e3 / frames, n as f64 / frames);
+        }
+        if !m.by_pipeline.is_empty() {
+            let mut table: Vec<(String, (u64, u64))> = m.by_pipeline.drain().collect();
+            table.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
+            let all: u64 = table.iter().map(|&(_, (_, us))| us).sum();
+            tracing::info!(
+                "card time by pipeline (from where it is bound to where the next is), per frame over {} frames: {:.1} ms in {:.0} bindings of {} pipelines; the largest follow",
+                m.frames,
+                all as f64 / 1e3 / frames,
+                table.iter().map(|&(_, (n, _))| n).sum::<u64>() as f64 / frames,
+                table.len()
+            );
+            for (name, (n, us)) in table.into_iter().take(48) {
+                tracing::info!(
+                    "  pipeline {:6.2} ms a frame in {:6.1} bindings ({:7.1} us each): {name}",
+                    us as f64 / 1e3 / frames,
+                    n as f64 / frames,
+                    us as f64 / n.max(1) as f64
+                );
             }
         }
-        *latest = Some(latest.map_or(end, |l| l.max(end)));
+        m.frames = 0;
     }
-}
-
-/// With the card's clock line: [`GAPS`] per frame.
-pub(crate) fn gap_line(frames: f64) {
-    if !on() || frames <= 0.0 {
-        return;
-    }
-    let g = GAPS.each_ref().map(|g| g.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
-    tracing::info!(
-        "the card between its timed lists per frame: {:.1} ms in {:.0} gaps under 20 us, {:.1} ms in {:.0} of 20-200 us, \
-         {:.1} ms in {:.0} longer",
-        g[0] / 1000.0,
-        g[1],
-        g[2] / 1000.0,
-        g[3],
-        g[4] / 1000.0,
-        g[5]
-    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_list_is_named_by_the_pipelines_it_binds() {
+        let mut names = std::collections::BTreeSet::new();
+        assert_eq!(name_of(&names), "no pipeline (copies, clears, barriers)");
+        names.insert("compute CS_Blur".to_string());
+        assert_eq!(name_of(&names), "1 pipeline: compute CS_Blur");
+        names.insert("mesh VS_A, pixel PS_B".to_string());
+        names.insert("a".repeat(100));
+        assert_eq!(name_of(&names), format!("3 pipelines: {} / compute CS_Blur", "a".repeat(60)));
+    }
 
     #[test]
     fn a_pairs_length_is_in_microseconds_of_the_queues_clock() {

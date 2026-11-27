@@ -212,64 +212,6 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     whole
 }
 
-thread_local! {
-    /// This thread's copy in place writes title memory ([`copy_data`]): a
-    /// write fault at the copy's instruction ends it as a read fault does.
-    static TITLE_DST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// The address this thread's last copy in place faulted at (0: not known).
-    static FAULT_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Whether copies of data are made in place whatever their size and also
-/// into title memory (`VICTORY_COPY_PLAIN_ALL=1`, with [`on`]; off by
-/// default; live, `crate::live`).
-///
-/// Run 122's profile: the submitting thread was ~4 ms a frame in the
-/// kernel's copy for the copies [`copy`] leaves to it: the title's buffer
-/// copies done at submission (into title memory, some 13,000 a frame of
-/// 500 bytes on average) and the small fills of upload memory. Those are
-/// data, read because they are there; [`LEAST`] is for the reads that ask
-/// whether a page is there, which do not come this way (`read_into`).
-pub(crate) fn all() -> bool {
-    static ON: crate::live::Switch = crate::live::Switch::new("COPY_PLAIN_ALL", 0);
-    on() && ON.on()
-}
-
-/// With [`all`]: copies `len` bytes of data from `from` to `to` in place,
-/// whatever the size; `title_dst`: `to` is title memory (which may be gone:
-/// a write fault there ends the copy as a read fault does). False if a page
-/// was not there, if one of them faulted lately, or if the two overlap
-/// (the kernel's copy then, as before).
-pub(crate) fn copy_data(to: *mut u8, from: *const u8, len: usize, title_dst: bool) -> bool {
-    if len == 0 {
-        return true;
-    }
-    let (t, f) = (to as usize, from as usize);
-    if title_dst && t < f.saturating_add(len) && f < t.saturating_add(len) {
-        return false;
-    }
-    if faulted_lately(f, len) || (title_dst && faulted_lately(t, len)) {
-        COUNT[3].fetch_add(1, Relaxed);
-        return false;
-    }
-    TITLE_DST.set(title_dst);
-    let whole = guarded(to, from, len);
-    TITLE_DST.set(false);
-    if whole {
-        COUNT[0].fetch_add(1, Relaxed);
-        COUNT[1].fetch_add(len as u64, Relaxed);
-    } else {
-        COUNT[2].fetch_add(1, Relaxed);
-        // The block of the side that is gone (the source, unless the
-        // fault says otherwise): the other side may well be there.
-        match FAULT_AT.replace(0) {
-            0 => note_fault(f, len),
-            at => note_fault(at, 1),
-        }
-    }
-    whole
-}
-
 /// With the frame line: what [`copy`] did per frame over `frames`.
 pub(crate) fn line(frames: f64) {
     if !on() {
@@ -331,35 +273,6 @@ mod tests {
         // And the registers the caller owns came back: this still works.
         assert!(guarded(to.as_mut_ptr(), base, PAGE));
         assert!(to[..PAGE].iter().all(|&b| b == 0xAB));
-        // SAFETY: the test's reservation.
-        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
-    }
-
-    /// Data copies ([`copy_data`]): small ones are made in place; into title
-    /// memory that is not there the copy ends with false and no fault (the
-    /// thread goes on, and a write fault elsewhere is still not ours); two
-    /// ranges that overlap are left to the kernel's copy.
-    #[test]
-    fn data_copies_of_any_size_and_into_title_memory() {
-        // SAFETY: memory of the test's own: one page committed, one not.
-        let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
-        assert!(!base.is_null());
-        // SAFETY: the first page of that reservation.
-        assert!(!unsafe { VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
-        let from: Vec<u8> = (0..64u8).collect();
-        // A small copy into title memory that is there.
-        assert!(copy_data(base.wrapping_add(100), from.as_ptr(), 16, true));
-        // SAFETY: committed.
-        assert_eq!(unsafe { std::slice::from_raw_parts(base.wrapping_add(100), 16) }, &from[..16]);
-        // Into the page that is not there (a block no other test uses).
-        assert!(!copy_data(base.wrapping_add(PAGE + 8), from.as_ptr(), 16, true));
-        assert!(!TITLE_DST.get(), "the flag is down again");
-        // Overlapping ranges of title memory: the kernel's.
-        assert!(!copy_data(base.wrapping_add(8), base, 64, true));
-        // Into host memory, small: in place.
-        let mut to = [0u8; 8];
-        assert!(copy_data(to.as_mut_ptr(), from.as_ptr(), 8, false));
-        assert_eq!(&to, &from[..8]);
         // SAFETY: the test's reservation.
         unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }

@@ -90,6 +90,44 @@ const fn vgpr(n: u8) -> u16 {
     256 + n as u16
 }
 
+/// The first group's number the host gives the programs that ask for it.
+const GROUP_BASE: u32 = 65_535;
+
+/// A compute program that reads its group's number in x alone adds the number of
+/// the first group: a dispatch of more groups than the host runs comes in
+/// parts.
+#[test]
+fn a_group_number_in_x_counts_from_the_host_s_first_group() {
+    let program = |y: bool| -> Vec<u32> {
+        // s12 and s13: the group's number in x and in y (s5 and s6, after
+        // the 5 user SGPRs).
+        let mut words = vec![s_mov_b32(12, 5)];
+        if y {
+            words.push(s_mov_b32(13, 6));
+        }
+        words.push(s_mov_b32(5, 0x80));
+        words.extend_from_slice(&s_load_dwordx4(8, 4));
+        words.push(vop1(0x001, 1, sgpr(if y { 13 } else { 12 }))); // v_mov_b32 v1
+        words.push(vop1(0x001, 0, sgpr(12))); // v_mov_b32 v0, s12
+        // With y: what is stored is the number in y.
+        if y {
+            words.push(vop1(0x001, 0, vgpr(1))); // v_mov_b32 v0, v1
+        }
+        words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+        words.push(S_ENDPGM);
+
+        words
+    };
+    const X: u32 = 1 << 7;
+    const Y: u32 = 1 << 8;
+    for (enabled, y, expected) in [(X, false, GROUP_BASE), (X | Y, false, GROUP_BASE), (X | Y, true, 0)] {
+        let shader = lower_words(program(y), 1, 0, enabled);
+        let asks = shader.user_data.iter().any(|u| u.root == RootType::Other(super::USER_GROUP_BASE));
+        assert_eq!(asks, expected != 0);
+        run_cases(&shader, &[[1, 2, 3, 4]], |label, _, _, out| assert_eq!(out, expected, "{label}"));
+    }
+}
+
 /// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
@@ -112,7 +150,12 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
+    lower_words(words, threads, lds_bytes, 0)
+}
 
+/// Lowers a whole program of [`build_cs`]'s layout; `rsrc2`: more bits of
+/// that register.
+fn lower_words(words: Vec<u32>, threads: u32, lds_bytes: u32, rsrc2: u32) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -147,7 +190,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
+            rsrc2: rsrc2 | (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
             threads: [threads, 1, 1],
         }),
         code,
@@ -181,6 +224,8 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
     };
@@ -234,6 +279,7 @@ fn run_cases_on(
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
                     (RootType::Table, 1) => 0,
+                    (RootType::Other(super::USER_GROUP_BASE), _) => GROUP_BASE,
                     other => panic!("unexpected user data {other:?}"),
                 };
             }
@@ -578,6 +624,62 @@ fn v_cmp_lg_is_false_for_nan() {
                 inp[0], inp[1],
             );
         });
+    }
+}
+
+/// 64-bit integer compares order by the high dword (signed for i64), then
+/// by the low one. AMD's D3D12 compiler runs an ordered i64 `icmp` as if the
+/// dwords were swapped (RX 9070 and gfx1036 alike), so the lowering compares
+/// the dwords; the values are picked so that the two orders disagree.
+#[test]
+fn v_cmp_u64_and_i64_order_by_the_high_dword() {
+    type Order = fn(u64, u64) -> bool;
+    let ops: [(u16, &str, Order); 12] = [
+        (0x0a1, "v_cmp_lt_i64", |a, b| (a as i64) < (b as i64)),
+        (0x0a2, "v_cmp_eq_i64", |a, b| a == b),
+        (0x0a3, "v_cmp_le_i64", |a, b| (a as i64) <= (b as i64)),
+        (0x0a4, "v_cmp_gt_i64", |a, b| (a as i64) > (b as i64)),
+        (0x0a5, "v_cmp_ne_i64", |a, b| a != b),
+        (0x0a6, "v_cmp_ge_i64", |a, b| (a as i64) >= (b as i64)),
+        (0x0e1, "v_cmp_lt_u64", |a, b| a < b),
+        (0x0e2, "v_cmp_eq_u64", |a, b| a == b),
+        (0x0e3, "v_cmp_le_u64", |a, b| a <= b),
+        (0x0e4, "v_cmp_gt_u64", |a, b| a > b),
+        (0x0e5, "v_cmp_ne_u64", |a, b| a != b),
+        (0x0e6, "v_cmp_ge_u64", |a, b| a >= b),
+    ];
+    let values: [u64; 10] = [
+        0,
+        1,
+        0xFFFF_FFFF,
+        0x1_0000_0000,
+        0x1_FFFF_FFFF,
+        0x0000_0040_C010_FBFF,
+        0x0001_8000_0000_0040,
+        0x7FFF_FFFF_FFFF_FFFF,
+        0x8000_0000_0000_0001,
+        0xFFFF_FFFF_0000_0000,
+    ];
+    let inputs: Vec<[u32; 4]> = values
+        .iter()
+        .flat_map(|&a| values.iter().map(move |&b| (a, b)))
+        .map(|(a, b)| [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32])
+        .collect();
+    for (op, name, order) in ops {
+        // op s20, v[1:2], v[3:4] and, sharing v2, op s20, v[1:2], v[2:3];
+        // v_cndmask_b32_e64 v0, 0, 1, s20
+        for second in [3, 2] {
+            let mut body = vop3(op, 20, vgpr(1), vgpr(second), 0x80).to_vec();
+            body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+            let shader = build_valu_cs(&body);
+            let at = usize::from(second) - 1;
+            run_cases(&shader, &inputs, |backend, _, inp, got| {
+                let a = u64::from(inp[0]) | u64::from(inp[1]) << 32;
+                let b = u64::from(inp[at]) | u64::from(inp[at + 1]) << 32;
+                let want = u32::from(order(a, b));
+                assert_eq!(got, want, "{backend}: {name}({a:#018x}, {b:#018x})");
+            });
+        }
     }
 }
 
@@ -1234,14 +1336,12 @@ fn ds_min_max_f32_order_floats_and_return_the_old_value() {
         returns_new.extend(ds(plain, 0, 5, 2));
         returns_new.extend(ds(DS_READ_B32, 0, 5, 0));
         for (body, old_result) in [(returns_old, true), (returns_new, false)] {
-            // One thread with LDS declares WaveSize(32), which WARP's
-            // pipeline creation refuses: hardware only (the 64-thread test
-            // below runs on WARP too).
+            // One thread with LDS has no peers and needs no WaveSize(32), so it
+            // runs on both hardware (including 64-only GCN GPUs) and WARP.
             let shader = build_cs(&body, 1, 512);
-            run_cases_on(
+            run_cases(
                 &shader,
                 &cases,
-                &[("hardware", false)],
                 |backend, _, inp, got| {
                     let (old, data) = (f32::from_bits(inp[0]), f32::from_bits(inp[1]));
                     let want = if old_result {
@@ -1570,6 +1670,8 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: Vec::new(),
         half_views: lowered.half_views,
     };

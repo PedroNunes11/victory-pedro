@@ -127,32 +127,33 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Refreshes of view memory passed over with nothing asked, as found
+    /// all clean before (`shadow::clean_spans`), and their bytes.
+    CleanSkips,
+    CleanSkipBytes,
     /// `watch::writes` kernel askings that failed (the range is not
     /// write-watched: view memory or not watchable).
     WatchFailed,
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
-    /// Copying back, 64 KiB pieces of declared ranges whose writes shaders
-    /// mark (`victory_shader::emit`, "Write marks"): compared because a
-    /// shader marked them, and left out because none did.
-    MarkedPieces,
-    MarkedSkipped,
-    /// Indirect commands recorded, by whether the title bounds them with a
-    /// count buffer and by their most records (none or 1, 2-16, 17-256,
-    /// more); and those with a count buffer run without it
-    /// (`crate::indirect::no_count`).
-    CountedMax1,
-    CountedMax16,
-    CountedMax256,
-    CountedMore,
-    UncountedMax1,
-    UncountedMax16,
-    UncountedMax256,
-    UncountedMore,
-    CountLeftOut,
+    /// Askings the guards answered (`watch::guard_settled`), and those of
+    /// them whose range was all clean (answered at once).
+    GuardAsks,
+    GuardAllClean,
+    /// With `VICTORY_GUARD_HOLES_FRAME=2`: blocks an asking found still a
+    /// hole after a look, blocks the runtime told of a commit while noted
+    /// a hole, and blocks found committed with no word from the runtime.
+    HolesLooked,
+    HolesTold,
+    HolesUntold,
+    /// Refreshes of guarded view memory by what the clean spans had: not
+    /// noted all clean, noted but its regions changed since, unchanged.
+    CleanNotNoted,
+    CleanMoved,
+    CleanSame,
 }
-const COUNTERS: usize = 91;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -286,15 +287,16 @@ pub(crate) fn barrier_test() -> u8 {
     })
 }
 
-/// Per range compared after a submission (start, length): times, and the
-/// bytes of it written back to the title.
-static COMPARED: Mutex<Option<HashMap<(usize, usize), (u64, u64)>>> = Mutex::new(None);
+/// Per range compared after a submission (start, length, whether the card
+/// compared it): times, and the bytes of it written back to the title.
+static COMPARED: Mutex<Option<HashMap<(usize, usize, bool), (u64, u64)>>> = Mutex::new(None);
 
-/// `len` bytes at `src` were compared after a submission and `written` of
-/// them put back into title memory.
-pub(crate) fn compared(src: usize, len: usize, written: usize) {
+/// `len` bytes at `src` were compared after a submission, on the card
+/// (`card`: a copy in the card's memory, hashed there) or on the CPU
+/// (against a snapshot), and `written` of them put back into title memory.
+pub(crate) fn compared(src: usize, len: usize, written: usize, card: bool) {
     let mut map = COMPARED.lock().unwrap_or_else(|e| e.into_inner());
-    let e = map.get_or_insert_with(HashMap::new).entry((src, len)).or_insert((0, 0));
+    let e = map.get_or_insert_with(HashMap::new).entry((src, len, card)).or_insert((0, 0));
     e.0 += 1;
     e.1 += written as u64;
 }
@@ -799,7 +801,9 @@ fn log_memory() {
          host copies the host renders to or writes: {} alive {:.0} MB; host copies the title \
          fills: {} alive {:.0} MB ({} of them placed), {} let go {:.0} MB and {} made again \
          {:.0} MB since the start; {} host copies made in all; passes that made none for lack of \
-         room: {}; the card: {:.0} MB in use of a budget of {:.0} MB, {:.0} MB of the PC's memory \
+         room: {}, slots refused for it {}, slots made without their largest mips for it {} ({} \
+         such host copies, {:.0} MB; uploads of textures made level by level given only their small \
+         levels for it {}); the card: {:.0} MB in use of a budget of {:.0} MB, {:.0} MB of the PC's memory \
          shared with it in use",
         census[2],
         mb(census[3]),
@@ -814,6 +818,11 @@ fn log_memory() {
         mb(kinds[5]),
         kinds[6],
         crate::draw::HEAP_TEXTURES_FULL.load(Relaxed),
+        crate::draw::HEAP_TEXTURES_REFUSED.load(Relaxed),
+        crate::draw::HEAP_TEXTURES_SHORT.load(Relaxed),
+        crate::resource::SHORT_MADE[0].load(Relaxed),
+        mb(crate::resource::SHORT_MADE[1].load(Relaxed)),
+        crate::resource::SHORT_MADE[2].load(Relaxed),
         mb(card[1]),
         mb(card[0]),
         mb(card[3]),
@@ -1335,7 +1344,8 @@ pub(crate) fn log(frames: f64) {
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
          refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
-         guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
+         guards {:.1} ms ({:.0} refreshes of view memory clean since their last look not asked, \
+         {:.1} MB); {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
          {:.0} steps {:.1} MB left out",
         c[C::RecordCalls as usize],
@@ -1351,6 +1361,8 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::BackCompared as usize]),
         ms(c[C::SparseUs as usize]),
         ms(c[C::GuardUs as usize]),
+        c[C::CleanSkips as usize],
+        mb(c[C::CleanSkipBytes as usize]),
         mb(c[C::WholeBytes as usize]),
         c[C::PaceWaits as usize],
         ms(c[C::PaceUs as usize]),
@@ -1536,11 +1548,29 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
          is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway); such ranges left \
-         out of the submissions' askings ahead: {:.0}",
+         out of the submissions' askings ahead: {:.0}; askings the guards answered: {:.0}, {:.0} of them all clean",
         c[C::WatchFailed as usize],
         c[C::WatchKnownView as usize],
         crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
+        c[C::GuardAsks as usize],
+        c[C::GuardAllClean as usize],
     );
+    tracing::info!(
+        "  refreshes of guarded view memory per frame by their clean span: {:.0} not noted all clean, {:.0}          noted but their regions changed since, {:.0} unchanged (passed over); regions of {} KiB          (VICTORY_CLEAN_REGION_KB)",
+        c[C::CleanNotNoted as usize],
+        c[C::CleanMoved as usize],
+        c[C::CleanSame as usize],
+        crate::watch::clean_region_kb(),
+    );
+    if c[C::HolesLooked as usize] + c[C::HolesTold as usize] + c[C::HolesUntold as usize] > 0.0 {
+        tracing::info!(
+            "  holes of title memory per frame (VICTORY_GUARD_HOLES_FRAME=2): {:.0} blocks looked at and              still holes, {:.0} told committed by the runtime, {:.0} found committed with no word",
+            c[C::HolesLooked as usize],
+            c[C::HolesTold as usize],
+            c[C::HolesUntold as usize],
+        );
+    }
+    crate::draw::window_line(frames);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
@@ -1578,11 +1608,15 @@ pub(crate) fn log(frames: f64) {
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut compared: Vec<_> = compared.into_iter().flatten().collect();
-    compared.sort_by_key(|&((_, len), (n, _))| std::cmp::Reverse(len as u64 * n));
+    compared.sort_by_key(|&((_, len, _), (n, _))| std::cmp::Reverse(len as u64 * n));
     tracing::info!("  compared after submissions: {} ranges; the largest follow", compared.len());
-    for ((src, len), (n, written)) in compared.into_iter().take(8) {
+    // Then the largest the CPU compares: what its snapshots and searches go
+    // to (those the card compares cost the CPU only the pieces that differ).
+    let on_cpu: Vec<_> = compared.iter().skip(8).filter(|((_, _, card), _)| !card).take(8).copied().collect();
+    for ((src, len, card), (n, written)) in compared.into_iter().take(8).chain(on_cpu) {
         tracing::info!(
-            "  compared {src:#x}+{len:#x}: {:.1}x/frame, {:.2} MB/frame, {:.3} MB/frame of it written back",
+            "  compared {src:#x}+{len:#x} on the {}: {:.1}x/frame, {:.2} MB/frame, {:.3} MB/frame of it written back",
+            if card { "card" } else { "CPU" },
             n as f64 / frames,
             (len as u64 * n) as f64 / 1e6 / frames,
             written as f64 / 1e6 / frames

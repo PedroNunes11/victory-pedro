@@ -114,7 +114,7 @@ struct List {
     /// Ours, after the console layout: memory handed out by
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
-    uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    uploads: std::sync::Mutex<Uploads>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
@@ -203,7 +203,7 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 #[cfg(windows)]
 pub(crate) struct Detached {
     host: crate::host::HostList,
-    _uploads: Vec<Vec<u8>>,
+    _uploads: Uploads,
     _state: crate::draw::State,
 }
 
@@ -495,7 +495,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                     part.waits,
                     Detached {
                         host: part.host,
-                        _uploads: Vec::new(),
+                        _uploads: Uploads::default(),
                         _state: Default::default(),
                     },
                 )
@@ -726,7 +726,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *uploads.lock().unwrap_or_else(|e| e.into_inner()) = Uploads::default();
     // The parts of a recording that was cut and never submitted go with it
     // (a submission takes the parts it runs).
     #[cfg(windows)]
@@ -909,6 +909,24 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        // With the structure builder asked for: a source the list's
+        // shaders write, in a list whose shaders store through addresses
+        // (the builder's), is copied on the card behind them
+        // (`HostList::copy_on_card`); at submission it would take what the
+        // source held before they ran. Only there: moving every title copy
+        // to the card cost 205 -> 232 ms a frame (victory-fork).
+        // `VICTORY_CARD_TITLE_COPIES=0`: always at submission, as before.
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| {
+            crate::pipeline::builder_allowed() && std::env::var_os("VICTORY_CARD_TITLE_COPIES").is_none_or(|v| v != "0")
+        });
+        if on
+            && list.asked(crate::memory::STORES)
+            && list.shaders_wrote(from as usize, len as usize)
+            && list.copy_on_card(to as u64, from as u64, len)
+        {
+            return;
+        }
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
@@ -927,7 +945,17 @@ fn unlike(dst: This, src: This) -> bool {
             tracing::warn!(?dst, ?src, "copy between a stand-in target and title-format texels skipped")
         });
     }
-    unlike
+    // shortcut: a copy from or into a host copy without the title's largest
+    // mips (`crate::resource::drop_levels`) is not made; one into it keeps
+    // what the title's memory gives it.
+    let short = crate::resource::dropped(dst) > 0 || crate::resource::dropped(src) > 0;
+    if short {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(?dst, ?src, "copy with a texture whose host copy leaves out its largest mips skipped")
+        });
+    }
+    unlike || short
 }
 
 /// Copies left out because both sides were one host texture
@@ -985,6 +1013,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
+            #[cfg(feature = "diagnostics")]
+            crate::bake_probe::copied(src, dst, "copy_resource");
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             list.count_write();
@@ -1050,6 +1080,8 @@ extern "system" fn copy_texture_region(
             // before.
             static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            #[cfg(feature = "diagnostics")]
+            crate::bake_probe::copied(src.resource, dst.resource, "texture_to_buffer");
             let made = read_back(list, dst, x, y, z, src, source_box);
             if n <= 16 || n.is_multiple_of(4096) || made.is_err() {
                 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1134,6 +1166,8 @@ extern "system" fn copy_texture_region(
         // a copy into a level without memory is dropped.
         crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         crate::texture::host_written(dst.resource);
+        #[cfg(feature = "diagnostics")]
+        crate::bake_probe::copied(src.resource, dst.resource, "copy_texture_region");
         if same {
             SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
@@ -1205,6 +1239,9 @@ fn read_back(
     }
     if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
         return Err("not a texture subresource into a placed footprint");
+    }
+    if crate::resource::dropped(src.resource) > 0 {
+        return Err("a texture whose host copy leaves out its largest mips");
     }
     if (x, y, z) != (0, 0, 0) {
         return Err("a destination corner other than the footprint's");
@@ -1295,6 +1332,8 @@ extern "system" fn resolve(
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
+        #[cfg(feature = "diagnostics")]
+        crate::bake_probe::copied(src, dst, "resolve");
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
@@ -1458,14 +1497,16 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a compute dispatch with console
+/// `COMPUTE_DISPATCH_INITIATOR` flags (bit 5, `0x20`, is
+/// `USE_THREAD_DIMENSIONS`: `(x, y, z)` are raw thread counts rather than
+/// thread-group counts).
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    state::dispatch_x(this, x, y, z, flags);
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
 }
@@ -1556,21 +1597,267 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
+    let Some((size, len)) = usize::try_from(size)
+        .ok()
+        .and_then(|s| Some((s, s.checked_add(align)?)))
+    else {
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
+    // SAFETY: the title passes one of our lists.
+    let uploads = unsafe { &(*this.cast::<List>()).uploads };
+    let mut uploads = uploads.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(windows)]
+    if upload::reachable()
+        && let Some(at) = uploads.carve(size, align)
+    {
+        // Zeros, as the heap blocks below are (a chunk comes back with
+        // what its last list left in it).
+        // SAFETY: the bytes just carved out of a committed chunk the list
+        // holds.
+        unsafe { at.write_bytes(0, size) };
+        return at;
+    }
+    let _ = size;
     let mut block = vec![0u8; len];
     let start = block.as_mut_ptr();
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
-    // SAFETY: the title passes one of our lists.
-    let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    uploads.heap.push(block);
     at
+}
+
+/// What [`allocate_upload`] handed out to a list, kept until the list is
+/// reset or, once submitted, until the submission has run.
+#[derive(Default)]
+pub(crate) struct Uploads {
+    /// Chunks of upload memory shaders reach by address ([`upload`]), the
+    /// last one being carved, and the bytes of it handed out.
+    #[cfg(windows)]
+    chunks: Vec<upload::Chunk>,
+    #[cfg(windows)]
+    used: usize,
+    /// Blocks of the process heap: requests larger than a chunk, or all of
+    /// them when no chunk can be had.
+    heap: Vec<Vec<u8>>,
+}
+
+impl Uploads {
+    /// `size` bytes at a multiple of `align` (a power of two) from the
+    /// list's last chunk, or from a new one.
+    #[cfg(windows)]
+    fn carve(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+        if size > upload::CHUNK || align > upload::CHUNK {
+            return None;
+        }
+        let fits = |used: usize| used.next_multiple_of(align) + size <= upload::CHUNK;
+        if self.chunks.is_empty() || !fits(self.used) {
+            self.chunks.push(upload::Chunk::take()?);
+            self.used = 0;
+        }
+        let offset = self.used.next_multiple_of(align);
+        self.used = offset + size;
+        // (Chunks start at multiples of their size, so of `align`.)
+        let at = self.chunks.last()?.at() + offset;
+        upload::handed(at + size);
+        Some(at as *mut u8)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        #[cfg(windows)]
+        if !self.chunks.is_empty() {
+            return false;
+        }
+        self.heap.is_empty()
+    }
+}
+
+/// List upload memory ([`allocate_upload`]) that shaders reach by address.
+///
+/// The title's ray-tracing structure builder writes
+/// what its stages read into list upload memory and hands the stages its
+/// addresses: its header stage gets the address of its
+/// 40-byte records as a root view and reads them through a buffer
+/// descriptor it makes of that address, that is by address. Blocks of the
+/// process heap, which the layer gave out before, lie at 1.5-1.8 TiB (runs
+/// rt-trace5, rt-dry1), beyond the console's 40 bits and the directory of
+/// title memory by address (`memory.rs`, below 128 GiB): the records read
+/// as zeros, so the stage stored its headers at address 0, which drops
+/// them. So the memory comes from 4 MiB chunks of one reservation where the
+/// title's GPU memory lies (from 4 GiB, below 128 GiB), write-watched as
+/// XMem makes the title's: each chunk is one window of memory outside
+/// buffers (`shadow.rs`), whose pages the CPU wrote are copied when a list
+/// that names it is submitted (run rt-trace7: the records at 66 GiB).
+#[cfg(windows)]
+pub(crate) mod upload {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use windows_sys::Win32::System::Memory::{
+        MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE,
+        MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+        VirtualAlloc2,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    /// A chunk: one window of memory outside buffers (`shadow.rs`).
+    pub(crate) const CHUNK: usize = 4 << 20;
+
+    /// Whether list upload memory comes from the chunks: with the
+    /// structure builder asked for (`crate::pipeline::builder_allowed`), or
+    /// `VICTORY_UPLOAD_CHUNKS=1`; `=0` never. Otherwise from the process
+    /// heap, as before.
+    pub(crate) fn reachable() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| match std::env::var("VICTORY_UPLOAD_CHUNKS").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => crate::pipeline::builder_allowed(),
+        })
+    }
+    /// Chunks reserved (512 MiB).
+    const CHUNKS: usize = 128;
+    /// The host's write watching (not in windows-sys' memory module).
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    struct Region {
+        /// The reservation's start; 0 if it could not be made.
+        base: usize,
+        /// Chunks committed so far, from the start.
+        next: usize,
+        /// Committed chunks no list holds.
+        free: Vec<usize>,
+    }
+
+    static REGION: Mutex<Option<Region>> = Mutex::new(None);
+
+    /// A chunk a list holds; it goes back to the free ones when dropped.
+    pub(crate) struct Chunk(usize);
+
+    impl Chunk {
+        /// A free chunk, or a new one; none when all are held (the heap
+        /// serves then, out of shaders' reach).
+        pub(crate) fn take() -> Option<Chunk> {
+            let mut region = REGION.lock().unwrap_or_else(|e| e.into_inner());
+            let r = region.get_or_insert_with(|| {
+                let base = reserve().unwrap_or(0);
+                BASE.store(base, Ordering::Relaxed);
+                Region {
+                    base,
+                    next: 0,
+                    free: Vec::new(),
+                }
+            });
+            if r.base == 0 {
+                return None;
+            }
+            if let Some(at) = r.free.pop() {
+                return Some(Chunk(at));
+            }
+            if r.next == CHUNKS {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        chunks = CHUNKS,
+                        "list upload memory: every chunk is held; more comes from the heap, which shaders cannot reach by address"
+                    );
+                });
+                return None;
+            }
+            let at = r.base + r.next * CHUNK;
+            // SAFETY: a chunk of our reservation.
+            if unsafe { VirtualAlloc(at as *const _, CHUNK, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+                return None;
+            }
+            r.next += 1;
+            Some(Chunk(at))
+        }
+
+        pub(crate) fn at(&self) -> usize {
+            self.0
+        }
+    }
+
+    impl Drop for Chunk {
+        fn drop(&mut self) {
+            if let Some(i) = place(self.0) {
+                USED[i].store(0, Ordering::Relaxed);
+            }
+            if let Some(r) = REGION.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                r.free.push(self.0);
+            }
+        }
+    }
+
+    /// The reservation's start, once made (0 before).
+    static BASE: AtomicUsize = AtomicUsize::new(0);
+    /// Per chunk, by its place in the reservation: the bytes from its start
+    /// handed out so far by the list that holds it.
+    static USED: [AtomicUsize; CHUNKS] = [const { AtomicUsize::new(0) }; CHUNKS];
+
+    /// The place of the chunk holding `address` in the reservation.
+    fn place(address: usize) -> Option<usize> {
+        let base = BASE.load(Ordering::Relaxed);
+        let i = address.checked_sub(base)? / CHUNK;
+        (base != 0 && i < CHUNKS).then_some(i)
+    }
+
+    /// Bytes up to `end` of a chunk were handed out.
+    pub(crate) fn handed(end: usize) {
+        if let Some(i) = place(end.saturating_sub(1)) {
+            USED[i].fetch_max(end - (BASE.load(Ordering::Relaxed) + i * CHUNK), Ordering::Relaxed);
+        }
+    }
+
+    /// Where what was handed out of the chunk holding `address` ends, if
+    /// `address` lies in it: a bound for the block a root view points into
+    /// (the blocks after it in the chunk are the same list's).
+    pub(crate) fn handed_end(address: u64) -> Option<u64> {
+        let address = usize::try_from(address).ok()?;
+        let i = place(address)?;
+        let end = BASE.load(Ordering::Relaxed) + i * CHUNK + USED[i].load(Ordering::Relaxed);
+        (address < end).then_some(end as u64)
+    }
+
+    /// The chunks committed so far, held or free: start and bytes.
+    pub(crate) fn span() -> Option<(u64, u64)> {
+        let region = REGION.lock().unwrap_or_else(|e| e.into_inner());
+        let r = region.as_ref()?;
+        (r.base != 0 && r.next > 0).then(|| (r.base as u64, (r.next * CHUNK) as u64))
+    }
+
+    fn reserve() -> Option<usize> {
+        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: (1usize << 32) as *mut _,
+            HighestEndingAddress: (((victory_shader::emit::MEMORY_PAGES as usize) << 16) - 1) as *mut _,
+            Alignment: CHUNK,
+        };
+        let mut parameter = MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+        // SAFETY: a reservation of our own; the parameter and the
+        // requirements it points at outlive the call.
+        let at = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                CHUNKS * CHUNK,
+                MEM_RESERVE | MEM_WRITE_WATCH,
+                PAGE_NOACCESS,
+                &mut parameter,
+                1,
+            )
+        };
+        if at.is_null() {
+            tracing::warn!("list upload memory: no room below 128 GiB; it comes from the heap, which shaders cannot reach by address");
+            return None;
+        }
+        Some(at as usize)
+    }
 }
 
 /// Draw state the host has no use for (root signatures: ours come with
@@ -1725,6 +2012,10 @@ mod state {
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
+    }
+    pub(super) fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+        super::count_dispatch();
+        with_state(this, |list, s| s.dispatch_x(list, x, y, z, flags));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -2363,6 +2654,26 @@ mod tests {
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
         assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
+        // Where shaders reach title memory by address; more than a chunk
+        // comes from the heap.
+        // (Carved from chunks only with the structure builder asked for:
+        // the chunks themselves, below.)
+        #[cfg(windows)]
+        {
+            let mut chunks = Uploads::default();
+            if let Some(p) = chunks.carve(40, 0x100) {
+                assert!((1 << 32..(victory_shader::emit::MEMORY_PAGES as usize) << 16).contains(&(p as usize)));
+                let q = chunks.carve(24, 16);
+                assert_eq!(q.map(|q| q as usize), Some(p as usize + 48), "carved from the same chunk");
+                // How far the chunk was handed out bounds the block a root
+                // view points into when the title addresses in it are
+                // looked for (`crate::memory`).
+                assert_eq!(upload::handed_end(p as u64 + 8), Some(p as u64 + 72));
+                assert_eq!(upload::handed_end(p as u64 + 72), None, "past what was handed out");
+                assert!(chunks.carve(8 << 20, 16).is_none(), "more than a chunk comes from the heap");
+            }
+            assert!(!allocate_upload(list, 8 << 20, 16).is_null());
+        }
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());

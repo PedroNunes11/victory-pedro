@@ -196,8 +196,11 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
         }
         let enter = near[0].max(near[1]).max(near[2]);
         let leave = far[0].min(far[1]).min(far[2]);
-        // A box whose minimum x is NaN is switched off.
-        if !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
+        // A box whose minimum x is NaN is switched off. A child that is
+        // not there is no hit (an empty slot can have inverted infinite
+        // bounds): as one it would take a distance and be sorted ahead of
+        // the real hits.
+        if children[n] != NONE && !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
             ids[n] = children[n];
             distances[n] = enter;
         }
@@ -475,6 +478,17 @@ pub(crate) mod tests {
         let ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
         // Child 1 is hit but is not there: its pointer is what "none" is.
         assert_eq!(intersect(&node, 5, &ray, true), [8, NONE, NONE, NONE]);
+    }
+
+    #[test]
+    fn a_missing_child_is_not_sorted_ahead_of_real_hits() {
+        // An empty slot with inverted infinite bounds is entered at -inf,
+        // ahead of everything; it is no hit at all.
+        let empty = [f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+        let everywhere = [-1e30, -1e30, -1e30, 1e30, 1e30, 1e30];
+        let node = box32([NONE, 16, NONE, 32], [everywhere, UNIT, empty, moved(UNIT, [4.0, 0.0, 0.0])]);
+        let ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
+        assert_eq!(intersect(&node, 5, &ray, true), [16, 32, NONE, NONE]);
     }
 
     #[test]
