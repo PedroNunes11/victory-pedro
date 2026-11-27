@@ -282,6 +282,8 @@ pub fn run(
         // Research: who asks the input devices for which sources (VICTORY_INPUT_SPY=1).
         // SAFETY: as above.
         unsafe { victory_loader::input_spy::apply(image.base(), size) };
+        // Research: which title code reads the pad's state (VICTORY_INPUT_WATCH=1).
+        victory_loader::input_watch::start(image.base());
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
