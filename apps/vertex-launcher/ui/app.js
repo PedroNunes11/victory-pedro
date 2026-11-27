@@ -1312,6 +1312,16 @@
       });
       return;
     }
+    // A graphics mode not warmed yet (switched since the last warm): warm it, then play.
+    let needWarm = false;
+    try { needWarm = await invoke("warm_needed"); } catch {}
+    if (needWarm) {
+      const mode = (S.home.modes[st.profile.preset] || {}).title || st.profile.preset;
+      toast(fmt(S.cold.modeChanged, { mode }));
+      st.startAfterPrebuild = true;
+      startRun("prebuild");
+      return;
+    }
     startRun("play");
   }
 

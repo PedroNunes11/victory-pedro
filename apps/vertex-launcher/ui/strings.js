@@ -119,6 +119,7 @@ window.STR = {
     anyway: "Start Anyway",
     then: "The game starts automatically once warming finishes.",
     failed: "Pipeline warming ended with code {code}. The game was not started.",
+    modeChanged: "{mode}: warming its pipelines first. The game starts automatically when warming is done.",
   },
   best: {
     title: "Apply measured Vertex-AXX settings?",

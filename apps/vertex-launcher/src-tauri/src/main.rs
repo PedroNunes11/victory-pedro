@@ -470,6 +470,36 @@ async fn restart_game(handle: tauri::AppHandle, app: State<'_, App>) -> R<Starte
     launch_play_now(&app)
 }
 
+/// The settings a warm is made for: the graphics mode and what changes render sizes, the upscaler
+/// or the passes run. Play warms again first whenever these differ from the last warm's.
+fn warm_signature(p: &Profile) -> String {
+    serde_json::json!({
+        "preset": p.preset,
+        "output_resolution": p.output_resolution,
+        "dlss": p.dlss,
+        "console": p.console,
+        "reflections": p.reflections,
+    })
+    .to_string()
+}
+
+/// `<cache>\pipelines\warm-mode.txt`: the signature of the last warm that ended well.
+fn warm_mark(profile: &Profile, victory: &std::path::Path) -> PathBuf {
+    let wd = runner::workdir(victory);
+    PathBuf::from(profile.cache_folder(Some(&wd)).path)
+        .join("pipelines")
+        .join("warm-mode.txt")
+}
+
+/// Whether the current mode has not been warmed yet (the last warm was for another mode, or none).
+#[tauri::command]
+async fn warm_needed(app: State<'_, App>) -> R<bool> {
+    let profile = app.profile();
+    let victory = app.victory()?;
+    let last = std::fs::read_to_string(warm_mark(&profile, &victory)).unwrap_or_default();
+    Ok(last.trim() != warm_signature(&profile))
+}
+
 #[tauri::command]
 async fn start_prebuild(app: State<'_, App>) -> R<Started> {
     let profile = app.profile();
@@ -478,7 +508,9 @@ async fn start_prebuild(app: State<'_, App>) -> R<Started> {
     let data_dir = resolved_data_dir(&app);
     let args = profile.prebuild_args(&game);
     let threads = app.cpu_threads();
-    runner::start(
+    // A warm that ends well is written down for its mode.
+    let (mark, signature) = (warm_mark(&profile, &victory), warm_signature(&profile));
+    runner::start_then(
         &app.run,
         runner::Kind::Prebuild,
         &victory,
@@ -487,6 +519,11 @@ async fn start_prebuild(app: State<'_, App>) -> R<Started> {
         &game,
         &data_dir,
         threads,
+        move |code| {
+            if code == Some(0) {
+                let _ = std::fs::write(&mark, &signature);
+            }
+        },
     )?;
     Ok(Started {
         command: runner::describe(&victory, &args, &profile, Some(&game), &data_dir, threads),
@@ -761,6 +798,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            warm_needed,
             get_start,
             get_system,
             save_profile,

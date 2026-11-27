@@ -217,6 +217,23 @@ pub fn start(
     data_dir: &Path,
     cpu_threads: u32,
 ) -> Result<(), String> {
+    start_then(shared, kind, victory, args, profile, game, data_dir, cpu_threads, |_| {})
+}
+
+/// [`start`], and `done` called with the exit code once the run has ended (before anyone can
+/// start another run).
+#[allow(clippy::too_many_arguments)]
+pub fn start_then(
+    shared: &Shared,
+    kind: Kind,
+    victory: &Path,
+    args: Vec<String>,
+    profile: &Profile,
+    game: &Path,
+    data_dir: &Path,
+    cpu_threads: u32,
+    done: impl FnOnce(Option<i32>) + Send + 'static,
+) -> Result<(), String> {
     {
         let run = shared.lock().unwrap();
         if run.running {
@@ -262,10 +279,13 @@ pub fn start(
     std::thread::spawn(move || {
         let status = child.wait();
         let mut run = shared.lock().unwrap();
+        let code = status.ok().and_then(|s| s.code());
+        // Under the lock: nothing starts another run until this is done.
+        done(code);
         run.running = false;
         run.game_hwnd = None;
         run.launch_signature = None;
-        run.exit_code = status.ok().and_then(|s| s.code());
+        run.exit_code = code;
     });
     Ok(())
 }
