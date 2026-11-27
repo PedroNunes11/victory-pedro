@@ -103,6 +103,13 @@ pub(crate) fn start(hwnd: windows::Win32::Foundation::HWND, adapter: Option<IDXG
     if std::env::var_os("VICTORY_OVERLAY").is_some_and(|v| v == "0") {
         return;
     }
+    // Vice-Tay's panel (VICTORY_PANEL=1) draws in the same corner, on the picture itself: this
+    // window would cover it. With the panel on, this one starts hidden (F10 still shows it, F12
+    // screenshots still work); VICTORY_OVERLAY=1 shows both anyway.
+    if crate::switch::on("VICTORY_PANEL") && std::env::var_os("VICTORY_OVERLAY").is_none_or(|v| v != "1") {
+        VISIBLE.store(false, Ordering::Relaxed);
+        tracing::info!("overlay hidden: the performance panel is on in the same corner (F10 shows it)");
+    }
     let game = hwnd.0 as usize;
     ONCE.call_once(|| {
         let spawned = std::thread::Builder::new()
