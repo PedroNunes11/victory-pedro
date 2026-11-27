@@ -4025,6 +4025,7 @@ impl State {
                 }
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
+                    Some(view @ View::Constant(_, 0)) => host.make_at(index, &view),
                     Some(View::Constant(address, size)) => {
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
