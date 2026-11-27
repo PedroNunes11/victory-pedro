@@ -140,35 +140,41 @@ fn hotkey_status(app: &App) -> HotkeyStatus {
 }
 
 /// Brings the launcher window up over the game (In-Game Menu) or dismisses it
-/// back to the game window.
+/// back to the game window. Dispatches window activation onto the Tauri main
+/// thread so `AttachThreadInput` + `HWND_TOPMOST` reliably lifts over fullscreen.
 fn set_ingame_overlay(handle: &tauri::AppHandle, open: bool) {
     let state = handle.state::<App>();
     state.overlay_open.store(open, Ordering::Relaxed);
-    let game_hwnd = state.run.lock().unwrap().game_hwnd;
-    let game_running = {
+    let (tracked_hwnd, tracked_running) = {
         let r = state.run.lock().unwrap();
-        r.running && r.kind == Some(runner::Kind::Play)
+        (r.game_hwnd, r.running && r.kind == Some(runner::Kind::Play))
     };
-    if let Some(w) = handle.get_webview_window("main") {
-        if open {
-            system::release_cursor_clip();
-            let _ = w.set_always_on_top(true);
-            let _ = w.unminimize();
-            let _ = w.show();
-            let _ = w.set_focus();
-            if let Ok(hwnd) = w.hwnd() {
-                system::focus_window(hwnd.0 as isize);
-            }
-        } else {
-            let _ = w.set_always_on_top(false);
-            if game_running {
-                let _ = w.minimize();
-                if let Some(gh) = game_hwnd {
-                    system::focus_window(gh);
+    let game_hwnd = tracked_hwnd.or_else(system::find_running_game_hwnd);
+    let game_running = tracked_running || game_hwnd.is_some();
+
+    let h2 = handle.clone();
+    let _ = handle.run_on_main_thread(move || {
+        if let Some(w) = h2.get_webview_window("main") {
+            if open {
+                system::release_cursor_clip();
+                let _ = w.set_always_on_top(true);
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+                if let Ok(hwnd) = w.hwnd() {
+                    system::focus_window_with_z(hwnd.0 as isize, Some(true));
+                }
+            } else {
+                let _ = w.set_always_on_top(false);
+                if game_running {
+                    let _ = w.minimize();
+                    if let Some(gh) = game_hwnd {
+                        system::focus_window(gh);
+                    }
                 }
             }
         }
-    }
+    });
     let _ = handle.emit(
         "ingame-overlay",
         serde_json::json!({ "open": open, "game_running": game_running }),
@@ -726,17 +732,29 @@ fn main() {
             let toggle_handle = handle.clone();
             let mgr = hotkey::HotkeyManager::start(&initial_hotkey, move || {
                 let state = toggle_handle.state::<App>();
-                let currently_open = state.overlay_open.load(Ordering::Relaxed);
+                let launcher_focused = toggle_handle
+                    .get_webview_window("main")
+                    .and_then(|w| w.hwnd().ok())
+                    .is_some_and(|h| system::is_foreground(h.0 as isize));
                 let game_running = {
                     let r = state.run.lock().unwrap();
                     r.running && r.kind == Some(runner::Kind::Play)
-                };
+                } || system::find_running_game_hwnd().is_some();
                 if game_running {
-                    set_ingame_overlay(&toggle_handle, !currently_open);
-                } else if let Some(w) = toggle_handle.get_webview_window("main") {
-                    let _ = w.unminimize();
-                    let _ = w.show();
-                    let _ = w.set_focus();
+                    // Always open when in-game; close back to game only if launcher is focused.
+                    set_ingame_overlay(&toggle_handle, !launcher_focused);
+                } else {
+                    let h = toggle_handle.clone();
+                    let _ = toggle_handle.run_on_main_thread(move || {
+                        if let Some(w) = h.get_webview_window("main") {
+                            let _ = w.unminimize();
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                            if let Ok(hwnd) = w.hwnd() {
+                                system::focus_window(hwnd.0 as isize);
+                            }
+                        }
+                    });
                 }
             });
             *handle.state::<App>().hotkey.lock().unwrap() = Some(mgr);

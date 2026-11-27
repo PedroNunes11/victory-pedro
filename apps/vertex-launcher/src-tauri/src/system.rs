@@ -23,12 +23,15 @@ use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW,
 };
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, ClipCursor, EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE,
-    GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, SW_RESTORE, SW_SHOWNORMAL, SWP_ASYNCWINDOWPOS,
-    SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
+    AdjustWindowRectEx, BringWindowToTop, ClipCursor, EnumWindows, GW_OWNER, GWL_EXSTYLE,
+    GWL_STYLE, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowTextW,
+    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible,
+    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
     WINDOW_STYLE,
 };
 use windows::core::{BOOL, HSTRING, Interface, PCWSTR};
@@ -369,26 +372,98 @@ pub fn release_cursor_clip() {
     let _ = unsafe { ClipCursor(None) };
 }
 
+/// Finds a visible top-level window of any running Vertex / Victory engine process
+/// (even if launched externally via PowerShell rather than from this launcher).
+pub fn find_running_game_hwnd() -> Option<isize> {
+    let pids: Vec<u32> = processes()
+        .into_iter()
+        .filter(|(_, _, name)| {
+            name.eq_ignore_ascii_case("vertex-axx.exe")
+                || name.eq_ignore_ascii_case("vertex.exe")
+                || name.eq_ignore_ascii_case("victory.exe")
+        })
+        .map(|(pid, _, _)| pid)
+        .collect();
+    if pids.is_empty() {
+        return None;
+    }
+    window_of(&pids).map(|(h, _)| h)
+}
+
 /// Brings a live window (either the Vertex menu or the game window) to the
-/// foreground cleanly, restoring it if minimized.
-pub fn focus_window(handle: isize) {
+/// foreground reliably even over a borderless fullscreen D3D12 game window,
+/// using `AttachThreadInput` to bypass Windows' background foreground lock.
+pub fn focus_window_with_z(handle: isize, topmost: Option<bool>) {
     if handle == 0 {
         return;
     }
     let hwnd = HWND(handle as *mut _);
-    // SAFETY: guarded by IsWindow; standard Win32 foreground activation.
+    // SAFETY: guarded by IsWindow; thread input attachment is always paired with detach.
     unsafe {
         if !IsWindow(Some(hwnd)).as_bool() {
             return;
         }
+        let fg = GetForegroundWindow();
+        let fg_tid = if !fg.0.is_null() {
+            GetWindowThreadProcessId(fg, None)
+        } else {
+            0
+        };
+        let target_tid = GetWindowThreadProcessId(hwnd, None);
+        let cur_tid = GetCurrentThreadId();
+
+        let attached_fg = fg_tid != 0 && fg_tid != cur_tid
+            && AttachThreadInput(cur_tid, fg_tid, true).as_bool();
+        let attached_target = target_tid != 0 && target_tid != cur_tid && target_tid != fg_tid
+            && AttachThreadInput(cur_tid, target_tid, true).as_bool();
+
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOW);
         }
-        let fg = GetForegroundWindow();
-        if fg != hwnd {
-            let _ = SetForegroundWindow(hwnd);
+        if let Some(top) = topmost {
+            let insert_after = if top { HWND_TOPMOST } else { HWND_NOTOPMOST };
+            let _ = SetWindowPos(
+                hwnd,
+                Some(insert_after),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+        }
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetActiveWindow(hwnd);
+
+        if attached_target {
+            let _ = AttachThreadInput(cur_tid, target_tid, false);
+        }
+        if attached_fg {
+            let _ = AttachThreadInput(cur_tid, fg_tid, false);
         }
     }
+}
+
+/// Returns true if `handle` is currently the active foreground window (and not minimized).
+pub fn is_foreground(handle: isize) -> bool {
+    if handle == 0 {
+        return false;
+    }
+    let hwnd = HWND(handle as *mut _);
+    // SAFETY: plain Win32 foreground/iconic query.
+    unsafe {
+        IsWindow(Some(hwnd)).as_bool()
+            && !IsIconic(hwnd).as_bool()
+            && GetForegroundWindow() == hwnd
+    }
+}
+
+/// Brings a live window to the foreground cleanly without changing topmost state.
+pub fn focus_window(handle: isize) {
+    focus_window_with_z(handle, None);
 }
 
 /// Opens a file, folder or link as Explorer would.

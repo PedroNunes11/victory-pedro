@@ -1520,6 +1520,10 @@ mod host {
         keys: Latch,
         /// Button presses, per pad.
         buttons: [Latch; PADS],
+        /// Cooldown after a Windows key was held so Win+<Key> OS/overlay shortcuts
+        /// (e.g. Win+Alt+V for Vertex Menu, Win+G, Win+Shift+S) never leak `<Key>`
+        /// into the game even if Win is released milliseconds before `<Key>`.
+        win_suppressed_until: Option<Instant>,
     }
 
     impl Host {
@@ -1581,18 +1585,30 @@ mod host {
             let mut down = asked_keys();
             down.extend(scripted());
             if focused() {
+                let now = Instant::now();
+                // SAFETY: plain virtual-key queries for Left/Right Windows keys.
+                let win_down = unsafe { GetAsyncKeyState(0x5B) < 0 || GetAsyncKeyState(0x5C) < 0 };
+                if win_down {
+                    self.win_suppressed_until = Some(now + Duration::from_millis(250));
+                }
+                let win_suppressed = win_down
+                    || self.win_suppressed_until.is_some_and(|until| now < until);
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08; `mouse` has them).
-                let held: Vec<u8> = (0x08..=0xFE_u8)
-                    .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
-                    // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
-                    .collect();
+                let held: Vec<u8> = if win_suppressed {
+                    Vec::new()
+                } else {
+                    (0x08..=0xFE_u8)
+                        .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
+                        // SAFETY: plain queries.
+                        .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                        .collect()
+                };
                 // A key tapped between two of the title's looks stays down
                 // until it has looked.
                 let held: Vec<u32> = held.into_iter().map(u32::from).collect();
                 let looks = LOOKS.load(Ordering::Relaxed);
-                let latched = self.keys.report(&held, looks, Instant::now());
+                let latched = self.keys.report(&held, looks, now);
                 for vk in latched.into_iter().map(|vk| vk as u8) {
                     if !down.contains(&vk) {
                         down.push(vk);
