@@ -101,7 +101,7 @@ The modes' texture budgets (room percent, spares, partial frames, LOD bias) are 
 | DLSS Frame Generation | Streamline integration (2.14.16 downloaded, D:/sdk/streamline-dl) not started; costs 0.5-2 GB VRAM | after VRAM pressure is solved |
 | Ray-traced reflections (BVH builder) | builder left out; `-Reflections` blows out | VNV's stand-in (`VICTORY_AMBIENT_SPECULAR`) as the interim |
 | Map cursor exact placement | the title only takes stick input; current tracker is distance-based | find the map cursor's position in memory for closed-loop control |
-| **Keyboard key icons instead of controller icons** | not started | see below |
+| **Keyboard key icons instead of controller icons** | built on `vertex/glyphs`: plugin DLL + engine hook, off by default | one identification session (`docs/GLYPHS.md`) |
 | Ultrawide | `resolution.rs` MODES is a 16:9 whitelist | relax `parse_output`, add the launcher option |
 | Pause-menu / settings mouse cursor | menus step by D-pad from mouse motion | the title's CURSOR actions have no bindings |
 | `VICTORY_NAN_SCRUB` (rorodev6 megafork) | not in our tree | recommended by the floor fix's author for banding rings and eyes |
@@ -116,8 +116,9 @@ registers a gamepad and a keyboard with GameInput, no mouse, no key-name strings
    Context-dependent bindings (one pad button = several keys) show the primary key only.
 2. **The title's own PC prompt code** (if any survives in the console binary): research, uncertain.
 
-It belongs inside the engine (the texture upload path), not a separate DLL: the engine already owns
-every texture the title uploads.
+Route 1 is built on branch `vertex/glyphs`: the hook sits in the engine's texture upload path
+(`VICTORY_GLYPHS_PLUGIN`, `VICTORY_GLYPHS_DUMP`), and the key caps come from a plugin DLL
+(`plugins/glyphs`), as the user asked. See `docs/GLYPHS.md`.
 
 ## Research and tools
 - Reports: `D:/dev/unify/axx-audit/best-of/anyxboxx.md`, `victory-nvidia.md`, `vertex-features.md`.
