@@ -11,6 +11,14 @@
 //! through [`relay`], which logs the events and whether the buffer took them
 //! (its count at +0x26b8 grew), then lets the title's handler have them;
 //! `=log` only logs. Nothing changes without the switch.
+//!
+//! `VICTORY_KEY_BINDS=<action>:<key>:<flags>,...` (hex: action id = joaat of its
+//! `INPUT_*` name, Windows virtual key, record flags) adds a keyboard record to
+//! each action's bindings as soon as the actions exist (input system
+//! 0x14ab77b90: actions of 0x160 bytes, count at +0x44, array at +0x48; id at
+//! +0x128; entry +0x10 -> `{capacity, count, records}`, records of 12 bytes
+//! `{source, second source or 0xf000, flags}`). An action links its sources
+//! when its context activates, so this runs early (start screen).
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,8 +77,81 @@ unsafe extern "system" fn relay(me: *mut c_void, event: *const Event) {
     }
 }
 
+/// The input system's action array (count, first), as offsets in the image.
+const ACTION_COUNT: usize = 0xab7_7bd4;
+const ACTION_ARRAY: usize = 0xab7_7bd8;
+
+fn parse_binds(spec: &str) -> Vec<(u32, u32, u32)> {
+    spec.split(',')
+        .filter_map(|b| {
+            let mut p = b.trim().split(':').map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok());
+            Some((p.next()??, p.next()??, p.next().flatten().unwrap_or(0)))
+        })
+        .collect()
+}
+
+/// Adds the asked keyboard records once the title has its actions.
+fn add_binds(base: usize, binds: Vec<(u32, u32, u32)>) {
+    let read32 = |at: usize| -> u32 {
+        // SAFETY: words of the mapped image or of title objects it points at.
+        unsafe { std::ptr::read_volatile(at as *const u32) }
+    };
+    let read = |at: usize| -> usize {
+        // SAFETY: as above.
+        unsafe { std::ptr::read_volatile(at as *const usize) }
+    };
+    let (count, array) = loop {
+        let count = read32(base + ACTION_COUNT) as usize;
+        let array = read(base + ACTION_ARRAY);
+        if count > 0 && array != 0 {
+            break (count, array);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let _ = (count, array);
+    for (id, key, flags) in binds {
+        // The actions are filled in after the array appears: look again for a minute.
+        let mut found = None;
+        for _ in 0..300 {
+            let count = read32(base + ACTION_COUNT) as usize;
+            let array = read(base + ACTION_ARRAY);
+            if let Some(action) = (0..count).map(|i| array + i * 0x160).find(|&a| read32(a + 0x128) == id) {
+                let first = read(action + 8);
+                if read32(action + 4) != 0 && first != 0 && read(first) != 0 && read(read(first) + 0x10) != 0 {
+                    found = Some(read(read(first) + 0x10));
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let Some(desc) = found else {
+            tracing::warn!(target: "keyboard_events", action = format_args!("{id:#010x}"), "no such action with bindings");
+            continue;
+        };
+        let n = read32(desc + 4) as usize;
+        let old = read(desc + 8);
+        let mut records: Vec<u32> = (0..n * 3).map(|i| read32(old + 4 * i)).collect();
+        records.extend([key, 0xf000, flags]);
+        let new = Box::leak(records.into_boxed_slice());
+        // SAFETY: the action's binding descriptor: records first, then count and capacity, so a reader
+        // never sees a count past its records.
+        unsafe {
+            std::ptr::write_volatile((desc + 8) as *mut usize, new.as_ptr() as usize);
+            std::ptr::write_volatile((desc + 4) as *mut u32, (n + 1) as u32);
+            std::ptr::write_volatile(desc as *mut u32, (n + 1) as u32);
+        }
+        tracing::info!(target: "keyboard_events", action = format_args!("{id:#010x}"), key = format_args!("{key:#x}"), flags, records = n + 1, "keyboard binding added");
+    }
+}
+
 /// Starts the subscriber thread when `VICTORY_KEYBOARD_EVENTS` is `1` or `log`.
 pub fn start(base: usize) {
+    if let Ok(spec) = std::env::var("VICTORY_KEY_BINDS") {
+        let binds = parse_binds(&spec);
+        if !binds.is_empty() {
+            let _ = std::thread::Builder::new().name("key binds".into()).spawn(move || add_binds(base, binds));
+        }
+    }
     let forward = match std::env::var("VICTORY_KEYBOARD_EVENTS").as_deref() {
         Ok("1") => true,
         Ok("log") => false,
