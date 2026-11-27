@@ -2504,6 +2504,14 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// How many of the title texture's largest levels its host copy goes without
+/// ([`HostTexture::base`], held levels): such a copy has another size than
+/// the title's texture, which DLSS's inputs may not have. 0 without a copy.
+#[cfg(windows)]
+pub(crate) fn dropped(this: This) -> u32 {
+    made_copy(this).map_or(0, |copy| copy.base)
+}
+
 /// A title texture's host copy if it is made; not made here.
 #[cfg(windows)]
 pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {

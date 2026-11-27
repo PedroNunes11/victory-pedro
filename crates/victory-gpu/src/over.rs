@@ -21,6 +21,9 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
+// This tree composes a present's second plane in `crate::compose`; the plane pass below is kept for
+// `readback`'s test of stretch and overlay together.
+#[cfg_attr(not(test), allow(dead_code))]
 const SOURCE: &str = r#"
 Texture2D<float4> plane : register(t0);
 SamplerState bilinear : register(s0);
@@ -41,8 +44,10 @@ float4 over(Corner c) : SV_Target { return plane.Sample(bilinear, c.at); }
 /// flight. Presents sent ahead each hold a back buffer and the swap chain
 /// has two, so no more than a few lists are ever waiting; 16 is well past
 /// that.
+#[cfg_attr(not(test), allow(dead_code))]
 const RING: u32 = 16;
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct Pass {
     format: i32,
     root: ID3D12RootSignature,
@@ -57,6 +62,7 @@ struct Pass {
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Pass {}
 
+#[cfg_attr(not(test), allow(dead_code))]
 static PASS: Mutex<Option<Pass>> = Mutex::new(None);
 
 /// A bilinear, clamping sampler at `s0` for the stages `visibility` names.
@@ -132,6 +138,7 @@ fn table(ranges: &[D3D12_DESCRIPTOR_RANGE], visibility: D3D12_SHADER_VISIBILITY)
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn make(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Pass> {
     use windows::core::s;
     let vs = crate::host::compile(SOURCE, s!("corner"), s!("vs_5_1"))?;
@@ -219,6 +226,7 @@ fn make(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Pas
 /// The pass sets the list's descriptor heap, root signature, pipeline,
 /// target, viewport, scissor and topology and puts none of them back: it is
 /// for a list of ours that records nothing of the title's.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn record(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
