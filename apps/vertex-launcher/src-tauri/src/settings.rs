@@ -600,6 +600,12 @@ impl Profile {
         // Dynamic descriptor slots on NVIDIA's capped heap: this base dropped ~115 draws a frame
         // for want of them (Vertex 5a291f4d; 393216 first, 524288 if the log still says refused).
         put("VICTORY_DYNAMIC_SLOTS", "393216");
+        // Floors, glass and eyes without the frosty sky glare (Whiplash floor fix): reflections held
+        // to half the light around them, after the screen-space resolve (needs VICTORY_AMBIENT).
+        if !self.reflections {
+            put("VICTORY_REFLECT_SCREEN", "1");
+            put("VICTORY_AMBIENT_REFLECT", "0.5");
+        }
 
         // --- Native KB/M Controls ---
         if self.native_controls {
