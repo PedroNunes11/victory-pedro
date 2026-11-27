@@ -113,10 +113,19 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// [`lower`]; `counted`: the lanes past a dispatch's count of threads leave
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
+const MAX_COMPUTE_LDS_DWORDS: u32 = (32 * 1024) / 4;
+
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run(counted) {
+        let lower = Lower::new(parts, &bad);
+        if matches!(parts.native.io, StageIo::Cs(_)) && lower.s.lds_dwords > MAX_COMPUTE_LDS_DWORDS {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "compute LDS and wave exchange exceed D3D12's 32 KiB limit",
+            });
+        }
+        match lower.run(counted) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -1999,8 +2008,11 @@ impl<'a> Lower<'a> {
             }
             if wave == 32 && x.native.wave64 {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
-                halves = Some(s.lds_dwords);
-                s.lds_dwords += 1;
+                // At the limit the ticket can borrow LDS[0]. The prologue
+                // finishes using it before any emulated LDS instructions.
+                let slot = if s.lds_dwords == MAX_COMPUTE_LDS_DWORDS { 0 } else { s.lds_dwords };
+                halves = Some(slot);
+                s.lds_dwords = s.lds_dwords.max(slot + 1);
             } else if console_lanes && group > wave && ticket_on() {
                 // the flat id rounded down is not a host wave's base on every host (#1243)
                 ticket = Some(s.lds_dwords);

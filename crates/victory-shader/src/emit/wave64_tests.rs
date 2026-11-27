@@ -1612,6 +1612,47 @@ fn flag_wave(native: &NativeProgram) -> Option<u32> {
 }
 
 #[test]
+fn wave64_thread_ticket_fits_at_the_d3d12_lds_limit() {
+    let mut words = vec![
+        vop2(0x1A, 1, k(2), 0),  // byte offset 4 * lane
+        vop2(0x26, 2, k(63), 0), // mirror lane
+        vop2(0x1A, 2, k(2), 2),  // mirror byte offset
+    ];
+    words.extend(vop3(0x169, 3, v(0), k(3)));
+    words.push(vop2(0x25, 3, k(1), 3));
+    words.extend([0xD834_0000, 1 | 3 << 8]); // ds_write_b32 v1, v3
+    words.extend([0xD8D8_0000, 2 | 4 << 24]); // ds_read_b32 v4, v2
+    words.extend(stores([4, 3, 0, 0]));
+    let mut native = native(&words);
+    let StageIo::Cs(cs) = &mut native.io else { unreachable!() };
+    cs.rsrc2 |= 64 << 15; // 32 KiB promised by the shader metadata.
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("split wave64 at the LDS limit");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("valid group-shared allocation");
+    }
+    let want: Vec<_> = (0..64u32).flat_map(|n| [3 * (63 - n) + 1, 3 * n + 1, n, n]).collect();
+    let _lock = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(actual) = run_lanes(&shader, [0; 4], 256) else { return };
+    same_as_console(&actual, &want);
+}
+
+#[test]
+fn wave64_exchange_reports_an_lds_overflow() {
+    let mut words = readlane(14, 0, 0); // reading any console lane requires cross-half exchange
+    words.push(vop1(0x01, 3, 14)); // the read remains live
+    words.extend(stores([3, 0, 0, 0]));
+    let mut native = native(&words);
+    let StageIo::Cs(cs) = &mut native.io else { unreachable!() };
+    cs.rsrc2 |= 64 << 15;
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    assert!(matches!(lowered(&native, &p, &HashSet::new()), Err(ShaderError::Unsupported {
+        what: "compute LDS and wave exchange exceed D3D12's 32 KiB limit",
+        ..
+    })));
+}
+
+#[test]
 fn a_branch_that_only_raises_an_lds_flag_runs_in_waves_of_32() {
     // a read that misses the other host wave's write changes nothing the branch leaves behind
     assert_eq!(flag_wave(&flag_program(None)), Some(32));
