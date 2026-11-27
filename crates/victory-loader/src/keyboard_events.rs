@@ -109,6 +109,10 @@ fn add_binds(base: usize, binds: Vec<(u32, u32, u32)>) {
         std::thread::sleep(std::time::Duration::from_millis(200));
     };
     let _ = (count, array);
+    // The title fills and reworks its actions during "Game Init" (a patch then crashed it): wait
+    // `VICTORY_KEY_BINDS_AFTER` seconds (default 0) first.
+    let after = std::env::var("VICTORY_KEY_BINDS_AFTER").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    std::thread::sleep(std::time::Duration::from_secs(after));
     for (id, key, flags) in binds {
         // The actions are filled in after the array appears: look again for a minute.
         let mut found = None;
