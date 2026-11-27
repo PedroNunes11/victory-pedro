@@ -6254,7 +6254,7 @@ mod tests {
     fn card_room_preserves_texture_retries_after_a_hold() {
         let mut q = TextureQueue::default();
         for index in 1..=4 {
-            q.written(index, 0, 0, false);
+            q.written(index, 0, 0, Origin::Write);
         }
         let due = q.due(0, 4);
         for &(index, write) in &due {
