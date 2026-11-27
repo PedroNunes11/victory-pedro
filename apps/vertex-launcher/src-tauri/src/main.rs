@@ -471,9 +471,17 @@ async fn restart_game(handle: tauri::AppHandle, app: State<'_, App>) -> R<Starte
 }
 
 /// The settings a warm is made for: the graphics mode and what changes render sizes, the upscaler
-/// or the passes run. Play warms again first whenever these differ from the last warm's.
-fn warm_signature(p: &Profile) -> String {
+/// or the passes run, and the engine it was made with (its size and time: a new engine translates
+/// shaders anew). Play warms again first whenever these differ from the last warm's.
+fn warm_signature(p: &Profile, victory: &std::path::Path) -> String {
+    let engine = std::fs::metadata(victory)
+        .map(|m| {
+            let secs = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+            format!("{}:{secs}", m.len())
+        })
+        .unwrap_or_default();
     serde_json::json!({
+        "engine": engine,
         "preset": p.preset,
         "output_resolution": p.output_resolution,
         "dlss": p.dlss,
@@ -497,7 +505,7 @@ async fn warm_needed(app: State<'_, App>) -> R<bool> {
     let profile = app.profile();
     let victory = app.victory()?;
     let last = std::fs::read_to_string(warm_mark(&profile, &victory)).unwrap_or_default();
-    Ok(last.trim() != warm_signature(&profile))
+    Ok(last.trim() != warm_signature(&profile, &victory))
 }
 
 #[tauri::command]
@@ -509,7 +517,7 @@ async fn start_prebuild(app: State<'_, App>) -> R<Started> {
     let args = profile.prebuild_args(&game);
     let threads = app.cpu_threads();
     // A warm that ends well is written down for its mode.
-    let (mark, signature) = (warm_mark(&profile, &victory), warm_signature(&profile));
+    let (mark, signature) = (warm_mark(&profile, &victory), warm_signature(&profile, &victory));
     runner::start_then(
         &app.run,
         runner::Kind::Prebuild,
