@@ -98,8 +98,45 @@ const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
 /// Staging buffers taken from the spare ones, and made, since the start;
 /// then those freed because the spare ones already held the most bytes, and
 /// their bytes; then those made too big to be pooled, and their bytes; then
-/// the bytes of those made (pooled sizes).
-pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+/// the bytes of those made (pooled sizes); then those evicted to make room
+/// ([`spare_evict`]), and their bytes.
+pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// Whether a staging buffer let go while the spare ones are full takes the
+/// place of spare ones of the size holding the most bytes, instead of being
+/// freed. With the pool full, the buffers let go in a streaming burst were
+/// freed (10.2 GB in 55 s at 1024 MB, item2-spare2, 76% of them of pooled
+/// sizes) while the pool held sizes nobody asked for again.
+/// `VICTORY_STAGING_SPARE_EVICT=1`: evict (default off: freed, as before).
+pub(crate) fn spare_evict() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_SPARE_EVICT").is_some_and(|v| v == "1"))
+}
+
+/// Takes spare entries out of `map` (whose bytes are `bytes`) until `need`
+/// more bytes fit under `most`, each time from the size holding the most
+/// bytes, oldest entry first; returns them with their sizes. Takes nothing
+/// when `need` alone is more than `most`.
+fn make_room<T>(map: &mut std::collections::BTreeMap<u64, Vec<T>>, bytes: &mut u64, need: u64, most: u64) -> Vec<(u64, T)> {
+    let mut out = Vec::new();
+    if need > most {
+        return out;
+    }
+    while *bytes + need > most {
+        let Some(size) = map
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .max_by_key(|(size, v)| **size * v.len() as u64)
+            .map(|(size, _)| *size)
+        else {
+            break;
+        };
+        let v = map.get_mut(&size).expect("the size just found");
+        out.push((size, v.remove(0)));
+        *bytes -= size;
+    }
+    out
+}
 
 /// The most bytes of staging buffers kept spare. In a streaming burst the
 /// title's textures let go of 0.5 to 1.2 GB of staging at once, more than
@@ -644,12 +681,23 @@ impl Drop for Staging {
         if self.pooled != 0 {
             let mut evicted = Vec::new();
             let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            if all.1 + self.pooled > spare_most() && spare_evict() {
+                let (map, bytes) = &mut *all;
+                evicted = make_room(map, bytes, self.pooled, spare_most());
+            }
             if all.1 + self.pooled <= spare_most() {
                 all.1 += self.pooled;
                 all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
             } else {
                 SPARE_STATS[2].fetch_add(1, Relaxed);
                 SPARE_STATS[3].fetch_add(self.pooled, Relaxed);
+            }
+            drop(all);
+            // The evicted buffers are freed outside the pool's lock.
+            for (size, spare) in evicted {
+                SPARE_STATS[7].fetch_add(1, Relaxed);
+                SPARE_STATS[8].fetch_add(size, Relaxed);
+                drop(spare);
             }
         }
     }
@@ -2216,6 +2264,39 @@ mod fingerprint_tests {
         assert!(fingerprint_sees(at, len, at + len - 1, at + len + (1 << 20)), "the end, the write past it");
         assert!(!fingerprint_sees(at, len, at + len, at + len + 4096), "a write wholly past the texture");
         assert!(!fingerprint_sees(at, len, at - 4096, at), "or wholly before it");
+    }
+}
+
+#[cfg(test)]
+mod spare_tests {
+    use super::make_room;
+    use std::collections::BTreeMap;
+
+    /// A full pool makes room from the size holding the most bytes, oldest
+    /// entry first, and only as much as the incoming buffer needs.
+    #[test]
+    fn make_room_takes_from_the_biggest_size_oldest_first() {
+        let mut map: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+        map.insert(64, vec![1, 2]); // 128 bytes
+        map.insert(256, vec![3, 4, 5]); // 768 bytes
+        let mut bytes = 896;
+        let out = make_room(&mut map, &mut bytes, 300, 1024);
+        assert_eq!(out, vec![(256, 3), (256, 4)]);
+        assert_eq!(bytes, 384);
+        assert_eq!(map[&256], vec![5]);
+        assert_eq!(map[&64], vec![1, 2]);
+    }
+
+    /// Nothing is taken when the buffer fits, or when it could never fit.
+    #[test]
+    fn make_room_takes_nothing_it_need_not() {
+        let mut map: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+        map.insert(64, vec![1]);
+        let mut bytes = 64;
+        assert!(make_room(&mut map, &mut bytes, 64, 1024).is_empty());
+        assert!(make_room(&mut map, &mut bytes, 2048, 1024).is_empty());
+        assert_eq!(bytes, 64);
+        assert_eq!(map[&64], vec![1]);
     }
 }
 

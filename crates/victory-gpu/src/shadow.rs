@@ -648,6 +648,8 @@ fn card_for(start: u64, size: u64) -> Option<ID3D12Resource> {
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         card_refused(CardRefusal::Limit, start, size);
+        CARD_CAPPED[0].fetch_add(1, Ordering::Relaxed);
+        CARD_CAPPED[1].fetch_add(size, Ordering::Relaxed);
         return None;
     }
     let buffer = host.uav_buffer(size);

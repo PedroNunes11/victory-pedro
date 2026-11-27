@@ -921,8 +921,8 @@ fn log_memory() {
         let s = &crate::texture::SPARE_STATS;
         tracing::info!(
             "memory, spare staging buffers since the start: {} taken, {} made {:.0} MB; {} freed with the spare ones \
-             full {:.0} MB; {} made too big to keep {:.0} MB; the spare ones hold at most {:.0} MB \
-             (VICTORY_STAGING_SPARE_MB)",
+             full {:.0} MB; {} made too big to keep {:.0} MB; {} evicted for room {:.0} MB \
+             (VICTORY_STAGING_SPARE_EVICT); the spare ones hold at most {:.0} MB (VICTORY_STAGING_SPARE_MB)",
             s[0].load(Relaxed),
             s[1].load(Relaxed),
             mb(s[6].load(Relaxed)),
@@ -930,7 +930,22 @@ fn log_memory() {
             mb(s[3].load(Relaxed)),
             s[4].load(Relaxed),
             mb(s[5].load(Relaxed)),
+            s[7].load(Relaxed),
+            mb(s[8].load(Relaxed)),
             mb(crate::texture::spare_most()),
+        );
+    }
+    {
+        let c = crate::shadow::card_copies();
+        tracing::info!(
+            "memory, card copies of title buffers: {:.0} MB alive of at most {:.0} MB (VICTORY_CARD_BUFFERS_MB); \
+             turned down since the start for that most: {} ({:.0} MB), for the card's room: {} ({:.0} MB)",
+            mb(c[0]),
+            mb(c[1]),
+            c[2],
+            mb(c[3]),
+            c[4],
+            mb(c[5]),
         );
     }
     tracing::info!(
