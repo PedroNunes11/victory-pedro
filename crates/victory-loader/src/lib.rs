@@ -29,6 +29,8 @@ mod crash;
 #[cfg(windows)]
 pub mod descriptor_sites;
 pub mod frame_rate;
+#[cfg(windows)]
+pub mod input_spy;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolution;

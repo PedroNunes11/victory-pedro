@@ -279,6 +279,9 @@ pub fn run(
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        // Research: who asks the input devices for which sources (VICTORY_INPUT_SPY=1).
+        // SAFETY: as above.
+        unsafe { victory_loader::input_spy::apply(image.base(), size) };
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
