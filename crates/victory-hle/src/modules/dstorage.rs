@@ -967,16 +967,20 @@ impl Lane {
     }
 }
 
-/// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// Upper bound on the temporary buffers a request may hold while it runs.
 fn staging_bytes(request: &Request) -> u64 {
-    let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
-        u64::from(request.source_size)
-    } else {
-        0
+    let options = request.options;
+    let compressed = options & (ZLIB | BCPACK) != 0;
+    let source = u64::from(request.source_size);
+    let mut bytes = if compressed && options & MEMORY_SOURCE == 0 { source } else { 0 };
+    if options & ZLIB != 0 && options & BCPACK != 0 {
+        bytes += u64::from(request.intermediate_size);
     }
+    // A destination spread across physical allocations may require a scatter buffer.
+    if options & PAGE_DESTINATION != 0 {
+        bytes += if compressed { u64::from(request.destination_size) } else { source };
+    }
+    bytes
 }
 
 /// Ends a queue: what was not started is dropped, and this waits for the
@@ -2277,6 +2281,35 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn staging_limits_scatter_buffers_for_memory_sources() {
+        let mut lanes = lanes(100);
+        lanes.lanes.insert(0, Lane::new(0, 64));
+        let options = MEMORY_SOURCE | PAGE_DESTINATION;
+        read(&mut lanes, 0, options, 60);
+        read(&mut lanes, 0, options, 60);
+        lanes.submit(0, false);
+        let first = lanes.start().unwrap();
+        assert_eq!(first.staging, 60);
+        assert!(lanes.start().is_none(), "another scatter buffer would exceed 100 bytes");
+        lanes.finish(&first, Ok(()));
+        let second = lanes.start().unwrap();
+        assert_eq!(second.staging, 60);
+        lanes.finish(&second, Ok(()));
+        assert_eq!(lanes.staged, 0);
+    }
+
+    #[test]
+    fn staging_counts_compressed_input_intermediate_and_scatter_storage() {
+        let mut r = request(ZLIB | 2 | PAGE_DESTINATION, std::ptr::null_mut(), 80, std::ptr::null(), 0, 30);
+        r.intermediate_size = 50;
+        assert_eq!(staging_bytes(&r), 30 + 50 + 80);
+        r.options |= MEMORY_SOURCE;
+        assert_eq!(staging_bytes(&r), 50 + 80);
+        r.options = 0;
+        assert_eq!(staging_bytes(&r), 0);
     }
 
     #[test]
