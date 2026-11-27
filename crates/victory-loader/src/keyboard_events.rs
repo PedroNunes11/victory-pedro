@@ -66,21 +66,8 @@ unsafe extern "system" fn relay(me: *mut c_void, event: *const Event) {
         }
         return;
     }
-    // Once, on the title's thread: a "released" event for every bound key, so the title's drain
-    // makes each key's source state record the way it makes the pad's (an action that activates
-    // with a source that has no record yet made the title end itself).
-    static PRIMED: std::sync::Once = std::sync::Once::new();
-    PRIMED.call_once(|| {
-        let mut keys: Vec<u32> = BINDS.get().map(|b| b.iter().map(|b| b.1).collect()).unwrap_or_default();
-        keys.sort_unstable();
-        keys.dedup();
-        for key in &keys {
-            let released = Event { source: key << 8, kind: 11, extra: 0, value: 0.0 };
-            // SAFETY: the title's handler with its own object and an event of its form.
-            unsafe { (me.handler)(me.object, &released) };
-        }
-        tracing::info!(target: "keyboard_events", keys = ?keys, "released events sent for the bound keys (their source records)");
-    });
+    // SAFETY: on the title's thread, with the title's handler and object.
+    unsafe { translate(me, &e) };
     let count = (me.object as usize + BUFFER_COUNT) as *const u16;
     // SAFETY: the buffer object's count; read without its lock, for the log only.
     let before = unsafe { count.read_volatile() };
@@ -92,6 +79,101 @@ unsafe extern "system" fn relay(me: *mut c_void, event: *const Event) {
     let taken = if took { TAKEN.fetch_add(1, Ordering::Relaxed) + 1 } else { TAKEN.load(Ordering::Relaxed) };
     if n <= 64 || n.is_power_of_two() {
         tracing::info!(target: "keyboard_events", n, taken, took, source = format_args!("{:#x}", e.source), key = format_args!("{:#x}", e.source >> 8), kind = e.kind, value = e.value, "keyboard event to the title's buffer");
+    }
+}
+
+/// The input system's actions (count, array), as offsets in the image.
+const ACTION_COUNT: usize = 0xab7_7bd4;
+const ACTION_ARRAY: usize = 0xab7_7bd8;
+/// The first pad's index in the device registry: the low byte of its events' source.
+const PAD_INDEX: u32 = 1;
+
+/// `VICTORY_KEY_ACTIONS=<key>=<action>/<action>...,...` (hex: Windows virtual key, action ids =
+/// joaat of their `INPUT_*` names, in order of preference).
+static KEY_ACTIONS: std::sync::OnceLock<Vec<(u32, Vec<u32>)>> = std::sync::OnceLock::new();
+/// Keys down and the pad source each was sent as (axis or button), to release the same one.
+static HELD: std::sync::Mutex<Vec<(u32, u32, bool)>> = std::sync::Mutex::new(Vec::new());
+
+fn parse_key_actions(spec: &str) -> Vec<(u32, Vec<u32>)> {
+    let hex = |x: &str| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+    spec.split(',')
+        .filter_map(|b| {
+            let (key, actions) = b.split_once('=')?;
+            Some((hex(key)?, actions.split('/').filter_map(hex).collect()))
+        })
+        .collect()
+}
+
+/// A pad source that is an axis (sticks and triggers) rather than a button.
+fn is_axis(source: u32) -> bool {
+    matches!(source, 0x3009 | 0x300c | 0x3010..=0x3013)
+}
+
+/// A key event, as the action it stands for: of the key's actions, the first the title has active
+/// right now (+0x158 bit 2), sent as that action's own pad source (its first binding record) to
+/// the title's buffer, as the pad would send it. The title's contexts decide what the key does
+/// (on foot, in a car, in a menu); its action table is not changed.
+///
+/// # Safety
+/// On the title's thread, inside the keyboard's event broadcast.
+unsafe fn translate(me: &Relay, e: &Event) {
+    let Some(map) = KEY_ACTIONS.get() else { return };
+    let key = e.source >> 8;
+    let Some((_, actions)) = map.iter().find(|(k, _)| *k == key) else { return };
+    let base = IMAGE.load(Ordering::Relaxed);
+    // SAFETY (both): the title's action array and its objects, read only.
+    let read32 = |at: usize| unsafe { std::ptr::read_volatile(at as *const u32) };
+    let read = |at: usize| unsafe { std::ptr::read_volatile(at as *const usize) };
+    let send = |source: u32, kind: u32, value: f32| {
+        let ev = Event { source: source << 8 | PAD_INDEX, kind, extra: 0, value };
+        // SAFETY: the title's handler with its own object and an event of the pad's form.
+        unsafe { (me.handler)(me.object, &ev) };
+    };
+    let mut held = HELD.lock().unwrap_or_else(|p| p.into_inner());
+    match e.kind {
+        7 => {
+            if held.iter().any(|h| h.0 == key) {
+                return;
+            }
+            let count = read32(base + ACTION_COUNT) as usize;
+            let array = read(base + ACTION_ARRAY);
+            for &id in actions {
+                let Some(action) = (0..count).map(|i| array + i * 0x160).find(|&a| read32(a + 0x128) == id) else {
+                    continue;
+                };
+                if read32(action + 0x158) & 2 == 0 || read32(action + 4) == 0 || read(action + 8) == 0 {
+                    continue;
+                }
+                let entry = read(read(action + 8));
+                let desc = if entry == 0 { 0 } else { read(entry + 0x10) };
+                if desc == 0 || read32(desc + 4) == 0 {
+                    continue;
+                }
+                let records = read(desc + 8);
+                let (source, flags) = (read32(records), read32(records + 8) & 0xff);
+                if !(0x3000..=0x3013).contains(&source) {
+                    continue;
+                }
+                let axis = is_axis(source);
+                let value = if axis && flags == 1 { -1.0 } else { 1.0 };
+                send(source, if axis { 3 } else { 7 }, value);
+                held.push((key, source, axis));
+                static SAID: AtomicU64 = AtomicU64::new(0);
+                if SAID.fetch_add(1, Ordering::Relaxed) < 200 {
+                    tracing::info!(target: "keyboard_events", key = format_args!("{key:#x}"), action = format_args!("{id:#010x}"), source = format_args!("{source:#x}"), value, "key sent as its active action's pad source");
+                }
+                return;
+            }
+        }
+        11 => {
+            held.retain(|&(k, source, axis)| {
+                if k == key {
+                    if axis { send(source, 3, 0.0) } else { send(source, 11, 0.0) }
+                }
+                k != key
+            });
+        }
+        _ => {}
     }
 }
 
@@ -283,6 +365,12 @@ unsafe fn hook_activation(base: usize) {
 
 /// Starts the subscriber thread when `VICTORY_KEYBOARD_EVENTS` is `1` or `log`.
 pub fn start(base: usize) {
+    IMAGE.store(base, Ordering::Relaxed);
+    if let Ok(spec) = std::env::var("VICTORY_KEY_ACTIONS") {
+        let map = parse_key_actions(&spec);
+        tracing::info!(target: "keyboard_events", keys = map.len(), "keys stand for the title's actions (sent as each active action's pad source)");
+        let _ = KEY_ACTIONS.set(map);
+    }
     if let Ok(spec) = std::env::var("VICTORY_KEY_BINDS") {
         let binds = parse_binds(&spec);
         if !binds.is_empty() && BINDS.set(binds).is_ok() {
