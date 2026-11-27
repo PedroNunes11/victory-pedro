@@ -105,6 +105,10 @@ pub fn run(
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
     victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
+    // The player's keys (`keys.txt` in the data folder), read and written by the Controls menu (F1).
+    victory_hle::modules::gameinput::binds::use_file(cfg.data_dir.join("keys.txt"));
+    #[cfg(windows)]
+    victory_hle::modules::gameinput::menu::start();
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
     victory_hle::console::set(match console {

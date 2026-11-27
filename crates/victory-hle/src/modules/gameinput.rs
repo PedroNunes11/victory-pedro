@@ -27,6 +27,8 @@ use crate::{HleExport, HleModule};
 mod dualsense;
 
 pub mod binds;
+#[cfg(windows)]
+pub mod menu;
 pub(crate) mod mouse;
 use binds::Part;
 use mouse::{Mouse, Pace};

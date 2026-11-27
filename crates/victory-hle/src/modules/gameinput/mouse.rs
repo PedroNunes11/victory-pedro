@@ -78,6 +78,11 @@ impl Look {
         }
     }
 
+    /// A new speed (the Controls menu, or the keys file changed).
+    pub fn set_sensitivity(&mut self, sensitivity: f32) {
+        self.sensitivity = sensitivity;
+    }
+
     pub fn clear(&mut self) {
         self.moves.clear();
     }
@@ -312,6 +317,8 @@ mod host {
     pub(in super::super) struct Host {
         look: Look,
         taken: bool,
+        /// VICTORY_MOUSE_SENSITIVITY is set: it wins over the keys file's.
+        env_sensitivity: bool,
     }
 
     impl Default for Host {
@@ -324,6 +331,7 @@ mod host {
             Host {
                 look: Look::new(sensitivity),
                 taken: false,
+                env_sensitivity: std::env::var_os("VICTORY_MOUSE_SENSITIVITY").is_some(),
             }
         }
     }
@@ -339,7 +347,15 @@ mod host {
                 self.look.clear();
             }
             // Motion while the mouse is not taken turns nothing.
-            let moved = (DX.swap(0, Ordering::Relaxed), DY.swap(0, Ordering::Relaxed));
+            let mut moved = (DX.swap(0, Ordering::Relaxed), DY.swap(0, Ordering::Relaxed));
+            // The keys file's [mouse] section (the Controls menu writes it).
+            let options = super::super::binds::mouse_options();
+            if !self.env_sensitivity {
+                self.look.set_sensitivity(options.sensitivity);
+            }
+            if options.invert_y {
+                moved.1 = -moved.1;
+            }
             let Some(buttons) = held else {
                 return Mouse::default();
             };

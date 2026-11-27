@@ -115,7 +115,8 @@ pub(super) const DEFAULT: &str = "\
 # Period, Slash, Semicolon, Minus, Backquote, LeftClick, RightClick,
 # MiddleClick, Mouse4, Mouse5. The mouse's motion is always the right stick.
 # Left Alt gives the mouse back and cannot be used. Delete this file to get
-# the one VIctory comes with again.
+# the one VIctory comes with again. F1 in the game opens the Controls menu,
+# which writes this file.
 
 [general]
 # Switches between the two layouts below (the window's log says which).
@@ -173,6 +174,11 @@ LOOK_UP = I
 LOOK_DOWN = K
 LOOK_LEFT = J
 LOOK_RIGHT = L
+
+[mouse]
+# The mouse turns the view (the right stick). SENSITIVITY: 0.1 to 10.
+SENSITIVITY = 1
+INVERT_Y = no
 ";
 
 /// The virtual key of a name, whatever its case.
@@ -192,6 +198,22 @@ pub(super) struct Binds {
     pub walk: Layout,
     pub drive: Layout,
     pub switch: Vec<u8>,
+    pub mouse: MouseOptions,
+}
+
+/// The mouse's share of the right stick, from the file's `[mouse]` section.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct MouseOptions {
+    /// 1 is the speed VIctory comes with; 0.1 to 10.
+    pub sensitivity: f32,
+    /// Moving the mouse up looks down.
+    pub invert_y: bool,
+}
+
+impl Default for MouseOptions {
+    fn default() -> MouseOptions {
+        MouseOptions { sensitivity: 1.0, invert_y: false }
+    }
 }
 
 impl Binds {
@@ -199,7 +221,7 @@ impl Binds {
     /// understand (number from 1, why). A section the file leaves out, or
     /// leaves empty, is the one VIctory comes with.
     pub fn read(text: &str) -> (Binds, Vec<(usize, String)>) {
-        let mut binds = Binds { walk: Vec::new(), drive: Vec::new(), switch: Vec::new() };
+        let mut binds = Binds { walk: Vec::new(), drive: Vec::new(), switch: Vec::new(), mouse: MouseOptions::default() };
         let mut wrong = Vec::new();
         let mut section = String::new();
         let mut named_switch = false;
@@ -210,7 +232,7 @@ impl Binds {
             }
             if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
                 section = name.trim().to_ascii_lowercase();
-                if !matches!(section.as_str(), "general" | "walk" | "drive") {
+                if !matches!(section.as_str(), "general" | "walk" | "drive" | "mouse") {
                     wrong.push((n + 1, format!("no section [{name}]")));
                 }
                 continue;
@@ -219,6 +241,22 @@ impl Binds {
                 wrong.push((n + 1, "no '='".into()));
                 continue;
             };
+            if section == "mouse" {
+                let value = keys.trim();
+                match what.trim().to_ascii_uppercase().as_str() {
+                    "SENSITIVITY" => match value.parse::<f32>() {
+                        Ok(v) if v.is_finite() && (0.1..=10.0).contains(&v) => binds.mouse.sensitivity = v,
+                        _ => wrong.push((n + 1, format!("SENSITIVITY {value:?}: a number from 0.1 to 10"))),
+                    },
+                    "INVERT_Y" => match value.to_ascii_lowercase().as_str() {
+                        "yes" | "on" | "true" | "1" => binds.mouse.invert_y = true,
+                        "no" | "off" | "false" | "0" => binds.mouse.invert_y = false,
+                        _ => wrong.push((n + 1, format!("INVERT_Y {value:?}: yes or no"))),
+                    },
+                    other => wrong.push((n + 1, format!("{other} is not known here"))),
+                }
+                continue;
+            }
             let mut found = Vec::new();
             for name in keys.split(',').filter(|k| !k.trim().is_empty()) {
                 match key(name) {
@@ -340,6 +378,89 @@ pub(super) fn layout(down: impl Fn(u8) -> bool) -> Layout {
     NOW.lock().unwrap_or_else(PoisonError::into_inner).layout(Instant::now(), down)
 }
 
+/// The name the file uses for virtual key `vk`, if it has one.
+pub(super) fn key_name(vk: u8) -> Option<String> {
+    if vk.is_ascii_uppercase() || vk.is_ascii_digit() {
+        return Some((vk as char).to_string());
+    }
+    KEYS.iter().find(|k| k.1 == vk).map(|k| k.0.to_string())
+}
+
+/// The file's name of a pad control.
+pub(super) fn part_name(part: Part) -> &'static str {
+    PARTS.iter().find(|p| p.1 == part).map_or("?", |p| p.0)
+}
+
+/// The pad's controls in the file's order.
+pub(super) fn parts() -> impl Iterator<Item = Part> {
+    PARTS.iter().map(|p| p.1)
+}
+
+/// `binds` as the file says it (the comment VIctory's file starts with, then the three sections):
+/// what the Controls menu saves.
+pub(super) fn to_text(binds: &Binds) -> String {
+    let mut out = String::new();
+    // The comment at the top of the file VIctory comes with.
+    for line in DEFAULT.lines().take_while(|l| l.starts_with('#') || l.is_empty()) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let names = |keys: &[u8]| keys.iter().filter_map(|&vk| key_name(vk)).collect::<Vec<_>>().join(", ");
+    out.push_str(&format!("[general]\nSWITCH = {}\n", names(&binds.switch)));
+    for (section, layout) in [("walk", &binds.walk), ("drive", &binds.drive)] {
+        out.push_str(&format!("\n[{section}]\n"));
+        for part in parts() {
+            let keys: Vec<u8> = layout.iter().filter(|b| b.1 == part).map(|b| b.0).collect();
+            if !keys.is_empty() {
+                out.push_str(&format!("{} = {}\n", part_name(part), names(&keys)));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "\n[mouse]\nSENSITIVITY = {}\nINVERT_Y = {}\n",
+        binds.mouse.sensitivity,
+        if binds.mouse.invert_y { "yes" } else { "no" }
+    ));
+    out
+}
+
+/// The keys that hold now (the file's, or VIctory's own without one).
+pub(super) fn current() -> Binds {
+    let mut now = NOW.lock().unwrap_or_else(PoisonError::into_inner);
+    now.look(Instant::now());
+    now.binds.clone().unwrap_or_else(|| Binds::read(DEFAULT).0)
+}
+
+/// The mouse options that hold now.
+pub(super) fn mouse_options() -> MouseOptions {
+    let mut now = NOW.lock().unwrap_or_else(PoisonError::into_inner);
+    now.look(Instant::now());
+    now.binds.as_ref().map(|b| b.mouse).unwrap_or_default()
+}
+
+/// Whether the driving layout holds now.
+pub(super) fn driving() -> bool {
+    NOW.lock().unwrap_or_else(PoisonError::into_inner).driving
+}
+
+/// Writes `binds` to the player's file and makes them hold at once.
+pub(super) fn save(binds: &Binds) -> std::io::Result<()> {
+    let mut now = NOW.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(file) = now.file.clone() else {
+        return Err(std::io::Error::other("no keys file was given"));
+    };
+    std::fs::write(&file, to_text(binds))?;
+    now.changed = std::fs::metadata(&file).ok().and_then(|m| m.modified().ok());
+    now.binds = Some(binds.clone());
+    tracing::info!(file = %file.display(), "keys file written by the Controls menu: the new keys hold");
+    Ok(())
+}
+
+/// VIctory's own keys.
+pub(super) fn defaults() -> Binds {
+    Binds::read(DEFAULT).0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +529,24 @@ mod tests {
         assert!(is_drive(now.layout(at, |vk| vk == b'G')));
         assert!(is_drive(now.layout(at, |_| false)));
         assert!(!is_drive(now.layout(at, |vk| vk == b'G')));
+    }
+
+    /// What the Controls menu writes reads back as the same keys, the mouse's too.
+    #[test]
+    fn written_keys_read_back_the_same() {
+        let mut b = Binds::read(DEFAULT).0;
+        b.mouse = MouseOptions { sensitivity: 2.5, invert_y: true };
+        b.walk.push((0x70, Part::Button(A)));
+        let (again, wrong) = Binds::read(&to_text(&b));
+        assert!(wrong.is_empty(), "{wrong:?}");
+        let sorted = |l: &Layout| {
+            let mut v: Vec<String> = l.iter().map(|(k, p)| format!("{k}:{p:?}")).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(sorted(&again.walk), sorted(&b.walk));
+        assert_eq!(sorted(&again.drive), sorted(&b.drive));
+        assert_eq!(again.switch, b.switch);
+        assert_eq!(again.mouse, b.mouse);
     }
 }
