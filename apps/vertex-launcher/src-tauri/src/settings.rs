@@ -576,6 +576,31 @@ impl Profile {
             put("VICTORY_PIPELINE_WAIT_MS", &s);
         }
 
+        // --- Best of VIctory-NVIDIA, AnyXboxX and Vertex (2026-11-28; any can be turned off in
+        // the extra switches, e.g. VICTORY_WC_NO_BACK=0) ---
+        // Shader writes into big write-combined copies stay on the card (VNV 50c15a1/2f81d0c,
+        // 4070 SUPER: gameplay 38.3 -> 33.3 ms, cutscenes 47.3 -> 36.3; under 1 MB they go back,
+        // or cutscenes go near black).
+        put("VICTORY_WC_NO_BACK", "1");
+        put("VICTORY_WC_NO_BACK_MIN_KB", "1024");
+        // Page-mapping copies kept in the books until the title's CPU touches them: no freezes at
+        // scene cuts (VNV fb838e8: 20 s of map and 33 s of unmap calls in 143 s before).
+        put("VICTORY_SOFT_VIEWS", "copies");
+        // No 64 MiB blocks made ahead: 768 MiB of the card back for textures (VNV).
+        put("VICTORY_RIPE_BLOCKS", "0");
+        // The texture pass stops at 16 ms a frame and does not catch up (a pass could hold a
+        // frame for up to 750 ms), as VNV runs it.
+        put("VICTORY_TEXTURE_STAGE_MS", "16");
+        put("VICTORY_TEXTURE_CATCHUP", "0");
+        put("VICTORY_CARD_AWAKE", "1");
+        put("VICTORY_SYNC_FINE", "1");
+        // The heat-haze pass smears blocks of pixels (water too) and spoils the motion vectors
+        // DLSS reads (VNV 672442b).
+        put("VICTORY_LEAVE_OUT", "731a39171b568298");
+        // Dynamic descriptor slots on NVIDIA's capped heap: this base dropped ~115 draws a frame
+        // for want of them (Vertex 5a291f4d; 393216 first, 524288 if the log still says refused).
+        put("VICTORY_DYNAMIC_SLOTS", "393216");
+
         // --- Native KB/M Controls ---
         if self.native_controls {
             put("VICTORY_KEYBOARD_EVENTS", "1");
