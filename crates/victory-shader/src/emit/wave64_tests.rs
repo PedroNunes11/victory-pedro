@@ -12,6 +12,11 @@ use crate::native::{
 };
 use crate::{ShaderError, io, ir, resource, structure};
 
+#[allow(dead_code)]
+#[path = "wave_regression_helpers.rs"]
+mod wave_regression_helpers;
+use wave_regression_helpers::*;
+
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads
@@ -1023,6 +1028,60 @@ fn a_skip_whose_parked_scalar_an_inner_branch_changes_is_kept() {
     assert_eq!(branches_named(&p, "s_cbranch_execz"), 1);
     assert!(ir::without_skips(&p, false).is_none());
     assert!(ir::without_skips(&p, true).is_none());
+}
+
+#[test]
+fn writelane_ignores_exec_and_masks_lane_index() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+
+    // 1. Wave32 compute: narrow EXEC to even lanes (guarded, no branch), write to odd
+    // (inactive) lane 5 via unmasked index s1 = 37 (37 & 31 == 5), restore EXEC, read back
+    // with v_readlane_b32 at index s1 = 37.
+    let mut w32 = vec![
+        vop1(0x01, 6, v(0)),    // v_mov_b32 v6, v0
+        vop2(0x1B, 3, k(1), 0), // v_and_b32 v3, 1, v0
+        sop1(0x03, 12, EXEC),   // s_mov_b32 s12, exec_lo
+        vopc(0xD2, k(0), 3),    // v_cmpx_eq_u32 exec_lo, 0, v3 (even lanes active)
+    ];
+    w32.extend(vop3(0x361, 6, 0, 1)); // v_writelane_b32 v6, s0, s1
+    w32.push(sop1(0x03, EXEC, 12));   // s_mov_b32 exec_lo, s12
+    w32.extend(vop3(0x360, 14, v(6), 1)); // v_readlane_b32 s14, v6, s1
+    w32.push(vop1(0x01, 7, 14)); // v_mov_b32 v7, s14
+    w32.extend(stores([6, 7, 0, 0]));
+    let native32 = native_of(&w32, false, 32);
+    let p32 = ir::build(&native32.code, native32.wave64, native32.vgprs).expect("ir::build");
+    let shader32 = lowered(&native32, &p32, &HashSet::new()).expect("lower wave32");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader32.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let val32 = 0xDEAD_BEEF;
+    let want32: Vec<u32> = (0..32u32)
+        .flat_map(|t| [if t == 5 { val32 } else { t }, val32, t, t])
+        .collect();
+    let Some(got32) = run_lanes(&shader32, [val32, 37, 0, 0], 128) else { return };
+    same_as_console(&got32, &want32);
+
+    // 2. Split wave64 exchange on a 32-lane host: v_readlane_b32 and v_writelane_b32 with
+    // unmasked indices s0 = 104 (lane 40) and s1 = 69 (lane 5).
+    let mut wex = vop3(0x169, 6, v(0), k(3)).to_vec(); // v_mul_lo_u32 v6, v0, 3
+    wex.push(vop2(0x25, 6, k(1), 6));                  // v_add_nc_u32 v6, 1, v6
+    wex.extend(vop3(0x360, 14, v(6), 0));              // v_readlane_b32 s14, v6, s0 (lane 40)
+    wex.extend(vop3(0x360, 15, v(6), 1));              // v_readlane_b32 s15, v6, s1 (lane 5)
+    wex.extend(vop3(0x361, 6, 2, 0));                  // v_writelane_b32 v6, s2, s0 (lane 40)
+    wex.push(vop1(0x01, 7, 14));                       // v_mov_b32 v7, s14
+    wex.push(vop1(0x01, 8, 15));                       // v_mov_b32 v8, s15
+    wex.extend(stores([6, 7, 8, 0]));
+    let native_ex = native(&wex);
+    let pex = ir::build(&native_ex.code, native_ex.wave64, native_ex.vgprs).expect("ir::build");
+    let shader_ex = lowered(&native_ex, &pex, &HashSet::new()).expect("split wave64");
+    let val_ex = 0x1234_5678;
+    let want_ex: Vec<u32> = (0..64u32)
+        .flat_map(|t| [if t == 40 { val_ex } else { 3 * t + 1 }, 3 * 40 + 1, 3 * 5 + 1, t])
+        .collect();
+    let Some(got_ex) = run_lanes(&shader_ex, [104, 69, val_ex, 0], 256) else { return };
+    same_as_console(&got_ex, &want_ex);
+    eprintln!("ran on the hardware device: writelane ignored EXEC and readlane/writelane masked lane indices in wave32 and split wave64");
 }
 
 /// `v_writelane_b32 vN, sX, K`.
