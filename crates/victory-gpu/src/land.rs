@@ -255,6 +255,8 @@ impl Pool {
 
     fn help(&self) {
         let mut seen_batch = 0u64;
+        // (The thread that calls `each` waits for this one's share.)
+        let mut priority = crate::cores::Priority::new();
         let mut state = self.state();
         loop {
             while state.work.is_none() || state.batch == seen_batch || self.next.load(Ordering::Relaxed) >= state.count {
@@ -283,6 +285,7 @@ impl Pool {
                     break;
                 }
             }
+            priority.keep();
             state = self.state();
             state.running -= 1;
             state.panicked |= panicked;
