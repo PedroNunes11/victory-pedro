@@ -493,9 +493,10 @@ impl Profile {
             "6f225b641c5b0708,5dc3b25986622949,369cbe906ea72764,2cc4c197ee29e291",
         );
 
-        // --- Thread pools scaled to CPU (9950X3D 32 threads -> 12/8/6/8) ---
+        // --- Thread pools scaled to CPU (9950X3D 32 threads -> 12/8/8/8; AnyXboxX #469: 8 landing threads
+        // on 24+ logical CPUs, heavy scenes 17.1 -> 22.0 fps) ---
         let (thin, under, land, pipe) = if cpu_threads >= 24 {
-            ("12", "8", "6", "8")
+            ("12", "8", "8", "8")
         } else if cpu_threads >= 16 {
             ("10", "6", "5", "6")
         } else {
