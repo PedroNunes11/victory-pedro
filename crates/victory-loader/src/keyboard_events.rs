@@ -131,6 +131,41 @@ impl KeyMap {
 /// The action whose activity tells play from a menu: on foot and in vehicles it is active (+0x158
 /// bit 2); the pause menu and the like turn it off (seen 2026-11-27: 0x0a in play, 0x08 in a menu).
 const PLAY_ACTION: u32 = 0x8fd0_15d8; // INPUT_MOVE_UP_ONLY
+
+/// The title is in a menu (pause menu, map...): [`PLAY_ACTION`] inactive, looked at every 100 ms
+/// while native keys are on. The input layer then gives the mouse to the menus (left stick).
+pub static IN_MENU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keeps [`IN_MENU`] current.
+fn watch_menus(base: usize) {
+    let read32 = |at: usize| {
+        // SAFETY: the title's action array and its objects, read only.
+        unsafe { std::ptr::read_volatile(at as *const u32) }
+    };
+    let read = |at: usize| {
+        // SAFETY: as above.
+        unsafe { std::ptr::read_volatile(at as *const usize) }
+    };
+    let mut cached = 0usize;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let count = read32(base + ACTION_COUNT) as usize;
+        let array = read(base + ACTION_ARRAY);
+        if count == 0 || array == 0 {
+            continue;
+        }
+        if cached == 0 || read32(cached + 0x128) != PLAY_ACTION {
+            cached = (0..count).map(|i| array + i * 0x160).find(|&a| read32(a + 0x128) == PLAY_ACTION).unwrap_or(0);
+            if cached == 0 {
+                continue;
+            }
+        }
+        let menu = read32(cached + 0x158) & 2 == 0;
+        if IN_MENU.swap(menu, Ordering::Relaxed) != menu {
+            tracing::info!(target: "keyboard_events", menu, "the game is in a menu: the mouse moves the menu's cursor (left stick)");
+        }
+    }
+}
 /// Keys down and the pad source each was sent as (axis or button), to release the same one.
 static HELD: std::sync::Mutex<Vec<(u32, u32, bool)>> = std::sync::Mutex::new(Vec::new());
 
@@ -483,6 +518,7 @@ pub fn start(base: usize) {
         let mut map = KEY_MAP.lock().unwrap_or_else(|p| p.into_inner());
         map.file = Some(file.into());
         map.refresh();
+        let _ = std::thread::Builder::new().name("menu watch".into()).spawn(move || watch_menus(base));
     } else if let Ok(spec) = std::env::var("VICTORY_KEY_ACTIONS") {
         let entries = parse_key_actions(&spec);
         tracing::info!(target: "keyboard_events", keys = entries.len(), "keys stand for the title's actions (sent as each active action's pad source)");

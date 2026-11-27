@@ -632,6 +632,19 @@ impl State {
         let motion_only = Mouse { buttons: Vec::new(), stick: mouse.stick };
         let (pad_keys, pad_mouse): (Vec<KeyState>, &Mouse) =
             if *NATIVE { (Vec::new(), &motion_only) } else { (keys.clone(), mouse) };
+        // Native, in a menu (pause menu, map: told by the loader from the game's own actions): the
+        // mouse moves the menu's cursor, the left stick, instead of the camera.
+        #[cfg(windows)]
+        let in_menu = *NATIVE && victory_loader::keyboard_events::IN_MENU.load(Ordering::Relaxed);
+        #[cfg(not(windows))]
+        let in_menu = false;
+        let to_menu = |mut p: PadState| {
+            if in_menu {
+                (p.left_x, p.left_y) = (p.right_x, p.right_y);
+                (p.right_x, p.right_y) = (0.0, 0.0);
+            }
+            p
+        };
         // The keyboard device sees the native-only keys and (native) the mouse buttons too; the
         // stand-in pad does not.
         let with_native = |keys: Vec<KeyState>| {
@@ -651,7 +664,7 @@ impl State {
             // The keyboard and mouse by the player's binds, taps kept until the
             // title has looked, together with every host pad.
             let layout = binds::layout(|vk| pressed(&pad_keys, pad_mouse, vk));
-            let stand_in = self.unseen.add(fallback(&pad_keys, pad_mouse, &layout), now);
+            let stand_in = self.unseen.add(to_menu(fallback(&pad_keys, pad_mouse, &layout)), now);
             let pad = pads.into_iter().flatten().fold(stand_in, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(with_native(keys))), now, &mut events);
@@ -663,7 +676,7 @@ impl State {
         }
         let fallback = (!any_pad).then(|| {
             let layout = binds::layout(|vk| pressed(&pad_keys, pad_mouse, vk));
-            Value::Pad(self.unseen.add(fallback(&pad_keys, pad_mouse, &layout), now))
+            Value::Pad(self.unseen.add(to_menu(fallback(&pad_keys, pad_mouse, &layout)), now))
         });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(with_native(keys))), now, &mut events);
