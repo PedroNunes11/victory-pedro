@@ -284,6 +284,8 @@ pub fn run(
         unsafe { victory_loader::input_spy::apply(image.base(), size) };
         // Research: which title code reads the pad's state (VICTORY_INPUT_WATCH=1).
         victory_loader::input_watch::start(image.base());
+        // Research: the title's keyboard events reach its input buffer (VICTORY_KEYBOARD_EVENTS).
+        victory_loader::keyboard_events::start(image.base());
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");

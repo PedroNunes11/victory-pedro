@@ -107,6 +107,11 @@ trait Source: Send {
     /// Keys held down: the keyboard's only while the title's window has
     /// focus, scripted ones (`VICTORY_KEYS_FILE`, `VICTORY_KEYS`) always.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// Research (native keyboard): keys for the title's keyboard device only, never the
+    /// stand-in pad (`VICTORY_NATIVE_KEYS_FILE`): what the title does with them is its own.
+    fn native_keys(&mut self) -> Vec<KeyState> {
+        Vec::new()
+    }
     /// The mouse's share of the stand-in pad; `wanted` while no pad is
     /// connected. The title looks at the pad about every `window`.
     fn mouse(&mut self, _now: u64, _wanted: bool, _window: Duration) -> Mouse {
@@ -546,13 +551,13 @@ impl Hub {
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
         let window = self.state().pace.interval();
-        let (pads, keys, mouse) = {
+        let (pads, keys, native, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             let wanted = pads.iter().all(Option::is_none);
-            (pads, source.keys(), source.mouse(now(), wanted, window))
+            (pads, source.keys(), source.native_keys(), source.mouse(now(), wanted, window))
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, &mouse);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, native, &mouse);
         self.deliver(events);
     }
 
@@ -598,8 +603,15 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        native: Vec<KeyState>,
         mouse: &Mouse,
     ) -> Vec<Event> {
+        // The keyboard device sees the native-only keys too; the stand-in pad does not.
+        let with_native = |keys: Vec<KeyState>| {
+            let mut all = keys;
+            all.extend(native.iter().filter(|n| !all.iter().any(|k| k.virtual_key == n.virtual_key)).copied().collect::<Vec<_>>());
+            all
+        };
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
@@ -609,7 +621,7 @@ impl State {
             let stand_in = self.unseen.add(fallback(&keys, mouse, &layout), now);
             let pad = pads.into_iter().flatten().fold(stand_in, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
-            self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
+            self.update(devices, KEYBOARD, Some(Value::Keys(with_native(keys))), now, &mut events);
             return events;
         }
         let any_pad = pads.iter().any(Option::is_some);
@@ -621,7 +633,7 @@ impl State {
             Value::Pad(self.unseen.add(fallback(&keys, mouse, &layout), now))
         });
         self.update(devices, FALLBACK, fallback, now, &mut events);
-        self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
+        self.update(devices, KEYBOARD, Some(Value::Keys(with_native(keys))), now, &mut events);
         events
     }
 
@@ -1473,6 +1485,18 @@ mod host {
                 .collect()
         }
 
+        fn native_keys(&mut self) -> Vec<KeyState> {
+            native_asked()
+                .into_iter()
+                .map(|vk| KeyState {
+                    // SAFETY: plain query.
+                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+                    virtual_key: vk,
+                    ..Default::default()
+                })
+                .collect()
+        }
+
         fn mouse(&mut self, now: u64, wanted: bool, window: Duration) -> Mouse {
             self.mouse.poll(now, wanted, window)
         }
@@ -1500,6 +1524,10 @@ mod host {
             "Down" => 0x28,
             "Left" => 0x25,
             "Right" => 0x27,
+            "Space" => 0x20,
+            "LShift" => 0xA0,
+            "LCtrl" => 0xA2,
+            k if k.starts_with("0x") => u8::from_str_radix(&k[2..], 16).ok()?,
             k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
                 k.as_bytes()[0].to_ascii_uppercase()
             }
@@ -1537,6 +1565,34 @@ mod host {
             held.1 = Some(now);
             if let Some(text) = take(file, taken) {
                 held.0.extend(asked(&text, now));
+            }
+        }
+        held.0.retain(|&(until, _)| until > now);
+        held.0.iter().map(|&(_, vk)| vk).collect()
+    }
+
+    /// Research: `VICTORY_NATIVE_KEYS_FILE=<file>`, lines `<key> <seconds>` as in
+    /// [`asked_keys`] (a key may also be `0x..`, any virtual-key code), held for the title's
+    /// keyboard device only, never pressed on the stand-in pad.
+    fn native_asked() -> Vec<u8> {
+        static FILE: LazyLock<Option<(std::path::PathBuf, std::path::PathBuf)>> = LazyLock::new(|| {
+            let file = std::env::var_os("VICTORY_NATIVE_KEYS_FILE")?;
+            let mut taken = file.clone();
+            taken.push(".taken");
+            Some((file.into(), taken.into()))
+        });
+        static HELD: Mutex<(Vec<(Instant, u8)>, Option<Instant>)> = Mutex::new((Vec::new(), None));
+        let Some((file, taken)) = &*FILE else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+        if held.1.is_none_or(|last| now.duration_since(last) >= Duration::from_millis(50)) {
+            held.1 = Some(now);
+            if let Some(text) = take(file, taken) {
+                let keys = asked(&text, now);
+                tracing::info!(keys = keys.len(), "native-only keys asked");
+                held.0.extend(keys);
             }
         }
         held.0.retain(|&(until, _)| until > now);

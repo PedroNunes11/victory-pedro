@@ -33,6 +33,8 @@ pub mod frame_rate;
 pub mod input_spy;
 #[cfg(windows)]
 pub mod input_watch;
+#[cfg(windows)]
+pub mod keyboard_events;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolution;
