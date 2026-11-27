@@ -10,7 +10,8 @@
 //! (per-pixel alpha). While it is in front the title's window is not, so the title gets no keys
 //! and the mouse is given back (`mouse`, `focused`). F1 or Esc closes it.
 //!
-//! Off with `VICTORY_CONTROLS_MENU=0`.
+//! Off by default (the owner wants the controls in the title's own Settings instead);
+//! `VICTORY_CONTROLS_MENU=1` turns it on.
 
 use std::cell::RefCell;
 use std::sync::Once;
@@ -31,7 +32,7 @@ const VK_ESC: u8 = 0x1B;
 /// Starts the thread that watches for F1 while the title's window is in front.
 pub fn start() {
     static STARTED: Once = Once::new();
-    if std::env::var_os("VICTORY_CONTROLS_MENU").is_some_and(|v| v == "0") {
+    if std::env::var_os("VICTORY_CONTROLS_MENU").is_none_or(|v| v != "1") {
         return;
     }
     STARTED.call_once(|| {

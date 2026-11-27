@@ -756,7 +756,7 @@ pub(crate) mod stream_log {
         let ago = |t: Option<std::time::Instant>| now - t.map_or(0, |t| t.elapsed().as_millis() as u64);
         let r = &job.request;
         line(format_args!(
-            "R\t{}\t{}\t{:x}\t{}\t{}\t{}\t{:x}\t{}\t{}\t{}\t{now}\t{:x}",
+            "R\t{}\t{}\t{:x}\t{}\t{}\t{}\t{:x}\t{}\t{}\t{}\t{now}\t{:x}\t{}",
             job.lane,
             job.seq,
             r.source as usize,
@@ -767,7 +767,10 @@ pub(crate) mod stream_log {
             ago(job.note.enqueued),
             ago(job.note.submitted),
             ago(Some(started)),
-            result.err().unwrap_or(0)
+            result.err().unwrap_or(0),
+            // The request's own name as the title gives it: the resource it reads (the archive
+            // index the controls research builds from these lines).
+            text(r.name).replace(['\t', '\n'], " ")
         ));
     }
 }

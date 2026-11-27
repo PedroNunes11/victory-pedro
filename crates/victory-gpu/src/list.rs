@@ -868,6 +868,16 @@ pub fn upscale_stretch(
     done
 }
 
+/// The title's upscale dispatch on a list whose calls are written down (`VICTORY_THIN=1`): it goes
+/// into the list's stream and runs at its place there, by DLSS or else the stretch, on the list of
+/// ours that stream is translated onto. False if `this` is not such a list: then the dispatch is
+/// recorded at once ([`upscale_dlss`], [`upscale_stretch`]).
+#[cfg(windows)]
+pub fn upscale_later(this: *const std::ffi::c_void, d: &crate::dlss::Dispatch, t: &crate::dlss::Textures) -> bool {
+    let this: This = this.cast();
+    !this.is_null() && thin::on() && thin::upscale(this, d, t)
+}
+
 /// Upscales by DLSS on title list `this`, if a plugin was asked for
 /// ([`crate::dlss`]): `d` and `t` are the title's dispatch. False if it was
 /// not recorded, for [`upscale_stretch`] to do instead.
@@ -887,7 +897,9 @@ pub fn upscale_dlss(
     }
     let of = |p: *const std::ffi::c_void| p as This;
     let mut done = false;
+    let mut reached = false;
     with_state(this.cast(), |list, state| {
+        reached = true;
         let [colour, depth, motion, exposure, output] =
             [t.colour, t.depth, t.motion, t.exposure, t.output].map(of);
         let host = |r: This| {
@@ -930,6 +942,9 @@ pub fn upscale_dlss(
         }
         state.replay(list);
     });
+    if !reached {
+        crate::dlss::skipped("the title's list has no host list at the call (its calls written down?)");
+    }
     done
 }
 

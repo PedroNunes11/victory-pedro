@@ -536,9 +536,13 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
+    let research = archive_read::before(file, overlapped);
     let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
     );
+    if let Some(r) = research {
+        archive_read::after(r, buffer, len, done != 0);
+    }
     // The call's error is the title's to ask for.
     // SAFETY: plain calls.
     let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
@@ -761,6 +765,127 @@ pub(crate) fn module() -> HleModule {
                 address: fiopen_wide as *const () as usize,
             },
         ],
+    }
+}
+
+/// Research (the controls work): the title's synchronous reads of its `.rpf` archives, where it
+/// reads each archive's header and directory. `VICTORY_READ_LOG=1` logs each read (archive, offset,
+/// length, buffer); `VICTORY_READ_DUMP_DIR=<folder>` also saves the bytes as read and the same
+/// buffer two seconds later, after the title has decoded it in place (first reads of an archive
+/// only, the first 16 MiB). Nothing of this runs without the switches.
+pub(crate) mod archive_read {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    use windows_sys::Win32::Storage::FileSystem::{FILE_CURRENT, GetFinalPathNameByHandleW, SetFilePointerEx};
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    pub(crate) struct Before {
+        path: String,
+        offset: u64,
+    }
+
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("VICTORY_READ_LOG").is_some_and(|v| v == "1") || std::env::var_os("VICTORY_READ_DUMP_DIR").is_some()
+        })
+    }
+
+    /// The archive's path (cached by handle), if `file` is an `.rpf`.
+    fn archive(file: *mut c_void) -> Option<String> {
+        static PATHS: Mutex<Vec<(usize, Option<String>)>> = Mutex::new(Vec::new());
+        let mut paths = PATHS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, p)) = paths.iter().find(|(h, _)| *h == file as usize) {
+            return p.clone();
+        }
+        let mut buf = [0u16; 1024];
+        // SAFETY: the title's handle; our buffer.
+        let n = unsafe { GetFinalPathNameByHandleW(file, buf.as_mut_ptr(), buf.len() as u32, 0) } as usize;
+        let path = (n > 0 && n < buf.len()).then(|| String::from_utf16_lossy(&buf[..n]));
+        let rpf = path.filter(|p| p.to_ascii_lowercase().ends_with(".rpf"));
+        paths.push((file as usize, rpf.clone()));
+        rpf
+    }
+
+    pub(crate) fn before(file: *mut c_void, overlapped: *mut c_void) -> Option<Before> {
+        if !on() {
+            return None;
+        }
+        let path = archive(file)?;
+        let offset = if overlapped.is_null() {
+            let mut pos = 0i64;
+            // SAFETY: the title's handle; asks the position, moves nothing.
+            unsafe { SetFilePointerEx(file, 0, &mut pos, FILE_CURRENT) };
+            pos as u64
+        } else {
+            // SAFETY: an OVERLAPPED of the title's: Offset and OffsetHigh at +8 and +12.
+            unsafe {
+                let p = overlapped.cast::<u32>();
+                u64::from(*p.add(2)) | u64::from(*p.add(3)) << 32
+            }
+        };
+        Some(Before { path, offset })
+    }
+
+    fn read_own(address: usize, len: usize) -> Option<Vec<u8>> {
+        let mut out = vec![0u8; len];
+        let mut got = 0usize;
+        // SAFETY: our own process; the kernel checks the range.
+        let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), address as *const c_void, out.as_mut_ptr().cast(), len, &mut got) };
+        (ok != 0 && got == len).then_some(out)
+    }
+
+    pub(crate) fn after(b: Before, buffer: *mut u8, len: u32, done: bool) {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            target: "archive_read",
+            seq,
+            archive = %b.path,
+            offset = format_args!("{:#x}", b.offset),
+            len,
+            buffer = format_args!("{buffer:p}"),
+            done,
+            "rpf read"
+        );
+        let Some(dir) = std::env::var_os("VICTORY_READ_DUMP_DIR") else { return };
+        if !done {
+            return;
+        }
+        // The first reads of each archive only (header and directory), 16 MiB at most.
+        static SEEN: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+        {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let n = match seen.iter_mut().find(|(p, _)| *p == b.path) {
+                Some(e) => {
+                    e.1 += 1;
+                    e.1
+                }
+                None => {
+                    seen.push((b.path.clone(), 1));
+                    1
+                }
+            };
+            if n > 4 {
+                return;
+            }
+        }
+        let size = (len as usize).min(16 << 20);
+        let name = std::path::Path::new(&b.path).file_name().map_or("archive".into(), |n| n.to_string_lossy().into_owned());
+        let stem = std::path::Path::new(&dir).join(format!("{name}_{:#x}_{seq}", b.offset));
+        if let Some(bytes) = read_own(buffer as usize, size) {
+            let _ = std::fs::write(stem.with_extension("read.bin"), bytes);
+        }
+        let address = buffer as usize;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if let Some(bytes) = read_own(address, size) {
+                let _ = std::fs::write(stem.with_extension("after.bin"), bytes);
+            }
+        });
     }
 }
 

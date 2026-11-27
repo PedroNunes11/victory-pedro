@@ -469,6 +469,7 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const UPSCALE: u64 = after(17);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -779,10 +780,64 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     at(w, 2 + 2 * step, boxed),
                 );
             }
+            UPSCALE => {
+                // The title's upscale dispatch, at its place among the list's calls: DLSS if it
+                // takes it, else the stretch (`victory_hle::modules::ffx`).
+                let two = |x: u64| [f32::from_bits(x as u32), f32::from_bits((x >> 32) as u32)];
+                let pair = |x: u64| [x as u32, (x >> 32) as u32];
+                let d = crate::dlss::Dispatch {
+                    context: w[0] as usize,
+                    jitter: two(w[1]),
+                    motion_scale: two(w[2]),
+                    render: pair(w[3]),
+                    upscale: pair(w[4]),
+                    pre_exposure: f32::from_bits(w[5] as u32),
+                    reset: (w[5] >> 32) != 0,
+                };
+                let ptr = |x: u64| x as *const std::ffi::c_void;
+                let t = crate::dlss::Textures {
+                    colour: ptr(w[6]),
+                    depth: ptr(w[7]),
+                    motion: ptr(w[8]),
+                    exposure: ptr(w[9]),
+                    output: ptr(w[10]),
+                };
+                let list = list.cast::<std::ffi::c_void>();
+                if !super::upscale_dlss(list, &d, &t) && !super::upscale_stretch(list, t.colour, t.output, d.render) {
+                    static TOLD: std::sync::Once = std::sync::Once::new();
+                    TOLD.call_once(|| tracing::warn!("an upscale written down was neither DLSS nor stretched"));
+                }
+            }
             _ => {}
         }
     }
     (calls, closed)
+}
+
+/// The title's upscale dispatch on recording `list`, written down to run at its place among the
+/// list's calls (see [`translate`]). False if `list` is not being recorded this way.
+pub(crate) fn upscale(list: This, d: &crate::dlss::Dispatch, t: &crate::dlss::Textures) -> bool {
+    let f = front(list);
+    if f.recording.is_none() || f.closed {
+        return false;
+    }
+    let two = |a: [f32; 2]| u64::from(a[0].to_bits()) | u64::from(a[1].to_bits()) << 32;
+    let pair = |a: [u32; 2]| u64::from(a[0]) | u64::from(a[1]) << 32;
+    let words = [
+        d.context as u64,
+        two(d.jitter),
+        two(d.motion_scale),
+        pair(d.render),
+        pair(d.upscale),
+        u64::from(d.pre_exposure.to_bits()) | u64::from(d.reset) << 32,
+        t.colour as u64,
+        t.depth as u64,
+        t.motion as u64,
+        t.exposure as u64,
+        t.output as u64,
+    ];
+    f.put(UPSCALE, &words);
+    true
 }
 
 /// The table of a list whose calls are written down: that of the others with

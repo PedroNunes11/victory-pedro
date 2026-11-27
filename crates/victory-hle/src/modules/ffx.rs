@@ -210,6 +210,16 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                     "upscale dispatch"
                 );
             }
+            // A list whose calls are written down (VICTORY_THIN=1) has no host list to record
+            // into now: the upscale goes into its stream and runs at its place there.
+            #[cfg(windows)]
+            if dlss() || REAL.load(Ordering::Relaxed) == 0 {
+                let id = unsafe { context.as_ref() }.map_or(0, |&c| c as usize);
+                let (dispatch, textures) = for_dlss(id, d);
+                if victory_gpu::list::upscale_later(d.list, &dispatch, &textures) {
+                    return 0;
+                }
+            }
             #[cfg(windows)]
             if victory_gpu::dlss::loaded() {
                 // SAFETY: the title's context, if it passes one.
