@@ -876,15 +876,16 @@ pub(crate) mod archive_read {
         }
         let size = (len as usize).min(16 << 20);
         let name = std::path::Path::new(&b.path).file_name().map_or("archive".into(), |n| n.to_string_lossy().into_owned());
-        let stem = std::path::Path::new(&dir).join(format!("{name}_{:#x}_{seq}", b.offset));
+        let file = |kind: &str| std::path::Path::new(&dir).join(format!("{name}_{:#x}_{seq}.{kind}.bin", b.offset));
+        let (read_file, after_file) = (file("read"), file("after"));
         if let Some(bytes) = read_own(buffer as usize, size) {
-            let _ = std::fs::write(stem.with_extension("read.bin"), bytes);
+            let _ = std::fs::write(read_file, bytes);
         }
         let address = buffer as usize;
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(2));
             if let Some(bytes) = read_own(address, size) {
-                let _ = std::fs::write(stem.with_extension("after.bin"), bytes);
+                let _ = std::fs::write(after_file, bytes);
             }
         });
     }
