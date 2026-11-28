@@ -5,7 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -138,6 +138,10 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+    /// Wakes a table waiting for dynamic slots when a completed list gives
+    /// some back. This avoids polling and, when enabled, prefers a short
+    /// recording-thread wait over silently dropping the draw.
+    dynamic_available: Condvar,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -1717,6 +1721,7 @@ impl HostHeap {
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
+            dynamic_available: Condvar::new(),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
@@ -1821,6 +1826,44 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 impl HostHeap {
+    /// Milliseconds a table may wait for dynamic slots. Zero preserves the
+    /// old immediate-refusal behavior. Neptune uses 30 ms; keeping it
+    /// opt-in lets each title choose between latency and a missing draw.
+    fn dynamic_wait() -> std::time::Duration {
+        static WAIT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        *WAIT.get_or_init(|| {
+            let ms = std::env::var("VICTORY_DYNAMIC_WAIT_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+                .min(1_000);
+            if ms != 0 {
+                tracing::info!(ms, "descriptor tables wait for dynamic slots (VICTORY_DYNAMIC_WAIT_MS)");
+            }
+            std::time::Duration::from_millis(ms)
+        })
+    }
+
+    /// Finds `n` adjacent free slots in next-fit order. A run never wraps
+    /// around the end of the dynamic part of the heap.
+    fn dynamic_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+        let end = taken.len();
+        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+        let mut run = 0usize;
+        let mut last = usize::MAX;
+        for at in (cursor..end).chain(0..second_end) {
+            if at != last.wrapping_add(1) {
+                run = 0;
+            }
+            last = at;
+            run = if taken[at] { 0 } else { run + 1 };
+            if run == n {
+                return Some(at + 1 - n);
+            }
+        }
+        None
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
@@ -1831,42 +1874,48 @@ impl HostHeap {
         let started = crate::tick::Tick::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        let wait = Self::dynamic_wait();
+        let waiting = std::time::Instant::now();
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
-            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { self.dynamic as usize } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
+        let first = loop {
+            let (next, taken) = &mut *guard;
+            let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n as u32
+                && (n as u32) < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+            if enough
+                && let Some(first) = Self::dynamic_run(taken, *next as usize, n)
+            {
+                break first;
             }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::DynamicRefused, 1);
-                add(C::DynamicNs, started.ns());
+            let Some(left) = wait.checked_sub(waiting.elapsed()) else {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots after waiting: a table is not made"));
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::DynamicRefused, 1);
+                    add(C::DynamicNs, started.ns());
+                }
+                return None;
+            };
+            if left.is_zero() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::DynamicRefused, 1);
+                    add(C::DynamicNs, started.ns());
+                }
+                return None;
             }
-            return None;
+            let waited = self.dynamic_available.wait_timeout(guard, left).unwrap_or_else(|e| e.into_inner());
+            guard = waited.0;
         };
+        let (next, taken) = &mut *guard;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.ns());
         taken[first..first + n].fill(true);
@@ -2811,6 +2860,8 @@ impl HostHeap {
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
             slots.fill(false);
         }
+        drop(guard);
+        self.dynamic_available.notify_all();
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -4366,7 +4417,7 @@ fn buffer_uav(
     create_view(false, || unsafe {
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
-    };
+    });
     // The view's first byte in title memory, and a typed view's element
     // size: its writes' marks (`crate::marks`), for the slot this goes to.
     let bytes = if raw { 4 } else if stride > 0 { u64::from(stride) } else { element };
