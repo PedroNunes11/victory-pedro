@@ -760,6 +760,25 @@ impl State {
             all
         };
         let mut events = std::mem::take(&mut self.pending);
+        // Track active input device for `VICTORY_PROMPTS=auto` keyboard/controller prompt switching.
+        let host_pad_active = pads.iter().flatten().any(|p| {
+            p.buttons != 0
+                || p.left_trigger > 0.15
+                || p.right_trigger > 0.15
+                || p.left_x.abs() > 0.25
+                || p.left_y.abs() > 0.25
+                || p.right_x.abs() > 0.25
+                || p.right_y.abs() > 0.25
+        });
+        if host_pad_active {
+            victory_core::pad::note_gamepad();
+        } else if !keys.is_empty()
+            || !mouse.buttons.is_empty()
+            || mouse.raw != (0, 0)
+            || mouse.wheel != 0
+        {
+            victory_core::pad::note_keyboard_mouse();
+        }
         if one_pad {
             // The keyboard and mouse by the player's binds, taps kept until the
             // title has looked, together with every host pad.

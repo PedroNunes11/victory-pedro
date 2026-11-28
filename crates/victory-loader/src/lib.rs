@@ -72,7 +72,8 @@ pub use threads::{disable_thread_calls, set_before_thread_shutdown};
 pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
 #[cfg(windows)]
 pub use windows::{
-    BindReport, LoadedImage, MissingImport, WithTitleDlls, load, load_title_dll, load_title_dlls,
+    BindReport, LoadedImage, MissingImport, SlotError, WithTitleDlls, load, load_title_dll,
+    load_title_dlls,
 };
 
 /// `DLL_PROCESS_ATTACH`, for TLS callbacks.

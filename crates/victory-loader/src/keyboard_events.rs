@@ -88,9 +88,25 @@ const ACTION_ARRAY: usize = 0xab7_7bd8;
 /// The first pad's index in the device registry: the low byte of its events' source.
 const PAD_INDEX: u32 = 1;
 
-/// A key, the actions it stands for in play, and those it stands for in menus (in order of
+/// A key (optionally with modifier mask: bit 0 Ctrl, bit 1 Shift, bit 2 Alt),
+/// the actions it stands for in play, and those it stands for in menus (in order of
 /// preference; ids = joaat of their `INPUT_*` names).
-type KeyEntry = (u32, Vec<u32>, Vec<u32>);
+type KeyEntry = (u8, u32, Vec<u32>, Vec<u32>);
+
+/// Modifier bitmask currently held down on the title's keyboard device.
+const MOD_CTRL: u8 = 1 << 0;
+const MOD_SHIFT: u8 = 1 << 1;
+const MOD_ALT: u8 = 1 << 2;
+static MODS_DOWN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn modifier_bit(key: u32) -> u8 {
+    match key {
+        0x11 | 0xa2 | 0xa3 => MOD_CTRL,
+        0x10 | 0xa0 | 0xa1 => MOD_SHIFT,
+        0x12 | 0xa4 | 0xa5 => MOD_ALT,
+        _ => 0,
+    }
+}
 
 /// The keys' actions: from `VICTORY_NATIVE_KEYS` (read again when the file changes, looked at at
 /// most once a second) or `VICTORY_KEY_ACTIONS`.
@@ -99,8 +115,8 @@ struct KeyMap {
     modified: Option<std::time::SystemTime>,
     looked: Option<std::time::Instant>,
     entries: Vec<KeyEntry>,
-    /// `(key, action, value)`: axis actions written with a direction (`NAME-` / `NAME+`).
-    signs: Vec<(u32, u32, f32)>,
+    /// `(mods, key, action, value)`: axis actions written with a direction (`NAME-` / `NAME+`).
+    signs: Vec<(u8, u32, u32, f32)>,
 }
 
 static KEY_MAP: std::sync::Mutex<KeyMap> =
@@ -445,7 +461,7 @@ fn retranslate_held(base: usize, in_menu: bool) {
     let snapshot: Vec<HeldKey> = held.clone();
     let map = KEY_MAP.lock().unwrap_or_else(|p| p.into_inner());
     for old in snapshot {
-        let Some((_, play, menu)) = map.entries.iter().find(|(k, _, _)| *k == old.key) else { continue };
+        let Some((_, _, play, menu)) = map.entries.iter().find(|(m, k, _, _)| *m == 0 && *k == old.key) else { continue };
         let actions: Vec<u32> = if in_menu { menu.iter().chain(play.iter()).copied().collect() } else { play.clone() };
         let Some((_, source, axis, value)) = resolve_active_source(base, &actions) else { continue };
         if source != old.source || axis != old.axis || (value - old.value).abs() > 1e-4 {
@@ -462,7 +478,7 @@ fn parse_key_actions(spec: &str) -> Vec<KeyEntry> {
     spec.split(',')
         .filter_map(|b| {
             let (key, actions) = b.split_once('=')?;
-            Some((hex(key)?, actions.split('/').filter_map(hex).collect(), Vec::new()))
+            Some((0, hex(key)?, actions.split('/').filter_map(hex).collect(), Vec::new()))
         })
         .collect()
 }
@@ -498,6 +514,9 @@ fn key_code(name: &str) -> Option<u32> {
         "backslash" => 0xdc, "backquote" => 0xc0, "leftclick" => 0x7c, "rightclick" => 0x7d,
         "middleclick" => 0x7e, "mouse4" => 0x7f, "mouse5" => 0x80,
         "wheelup" => 0x81, "wheeldown" => 0x82,
+        "numpadmul" | "numpadmultiply" => 0x6a, "numpadadd" => 0x6b,
+        "numpadsub" | "numpadsubtract" => 0x6d, "numpaddecimal" => 0x6e,
+        "numpaddiv" | "numpaddivide" => 0x6f,
         _ => 0,
     };
     if named != 0 {
@@ -516,6 +535,33 @@ fn key_code(name: &str) -> Option<u32> {
     None
 }
 
+/// Parses a single key (`E`) or modifier combination (`Ctrl+E`, `Ctrl+Shift+Space`)
+/// into `(modifier_mask, key_code)`.
+fn parse_key_spec(name: &str) -> Option<(u8, u32)> {
+    let parts: Vec<&str> = name.split('+').map(str::trim).filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    if parts.len() == 1 {
+        return key_code(parts[0]).map(|k| (0, k));
+    }
+    let mut mods = 0u8;
+    for &m in &parts[..parts.len() - 1] {
+        let bit = match m.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" | "lctrl" | "rctrl" | "leftctrl" | "rightctrl" => MOD_CTRL,
+            "shift" | "lshift" | "rshift" | "leftshift" | "rightshift" => MOD_SHIFT,
+            "alt" | "lalt" | "ralt" | "leftalt" | "rightalt" => MOD_ALT,
+            _ => return None,
+        };
+        mods |= bit;
+    }
+    let key = key_code(parts[parts.len() - 1])?;
+    if modifier_bit(key) & mods != 0 {
+        return None;
+    }
+    Some((mods, key))
+}
+
 /// An action's name without a direction written after it (`INPUT_FRONTEND_MAP_MOVE_UD-`), and that
 /// direction.
 fn action_and_sign(name: &str) -> (&str, Option<f32>) {
@@ -530,8 +576,7 @@ fn action_and_sign(name: &str) -> (&str, Option<f32>) {
 }
 
 /// `native-keys.txt`: lines `KEY = INPUT_ACTION, ... | INPUT_MENU_ACTION, ...` ('#' comments);
-/// the actions after `|` are for menus only. An axis action may carry the direction the key pushes
-/// it (`INPUT_FRONTEND_MAP_MOVE_UD-`: up); without one, the direction of the title's binding.
+/// supports modifier combinations (`Ctrl+E`, `Shift+R`, `Alt+F1`).
 fn parse_native_keys(text: &str) -> Vec<KeyEntry> {
     let ids = |s: &str| -> Vec<u32> {
         s.split(',').map(str::trim).filter(|a| !a.is_empty()).map(|a| joaat(action_and_sign(a).0)).collect()
@@ -540,32 +585,49 @@ fn parse_native_keys(text: &str) -> Vec<KeyEntry> {
         .map(|l| l.split('#').next().unwrap_or(""))
         .filter_map(|l| {
             let (key, actions) = l.split_once('=')?;
-            let key = key_code(key)?;
+            let (mods, key) = parse_key_spec(key)?;
             let (play, menu) = actions.split_once('|').unwrap_or((actions, ""));
             let (play, menu) = (ids(play), ids(menu));
-            (!play.is_empty() || !menu.is_empty()).then_some((key, play, menu))
+            (!play.is_empty() || !menu.is_empty()).then_some((mods, key, play, menu))
         })
         .collect()
 }
 
-/// The directions written in `native-keys.txt`: `(key, action, value)` for each `NAME-` / `NAME+`.
-fn native_key_signs(text: &str) -> Vec<(u32, u32, f32)> {
+/// The directions written in `native-keys.txt`: `(mods, key, action, value)` for each `NAME-` / `NAME+`.
+fn native_key_signs(text: &str) -> Vec<(u8, u32, u32, f32)> {
     text.lines()
         .map(|l| l.split('#').next().unwrap_or(""))
         .filter_map(|l| {
             let (key, actions) = l.split_once('=')?;
-            Some((key_code(key)?, actions))
+            let (mods, key) = parse_key_spec(key)?;
+            Some((mods, key, actions))
         })
-        .flat_map(|(key, actions)| {
+        .flat_map(|(mods, key, actions)| {
             actions
                 .split([',', '|'])
                 .filter_map(move |a| match action_and_sign(a) {
-                    (name, Some(v)) if !name.is_empty() => Some((key, joaat(name), v)),
+                    (name, Some(v)) if !name.is_empty() => Some((mods, key, joaat(name), v)),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// Selects the matching binding entry for `(current_mods, key)`: prefers an exact
+/// modifier-combo match (`mods != 0 && (current_mods & mods) == mods`, picking the
+/// highest popcount specificity), falling back to a bare-key binding (`mods == 0`).
+fn lookup_entry<'a>(entries: &'a [KeyEntry], current_mods: u8, key: u32) -> Option<&'a KeyEntry> {
+    if current_mods != 0 {
+        let best_combo = entries
+            .iter()
+            .filter(|(m, k, _, _)| *k == key && *m != 0 && (current_mods & *m) == *m)
+            .max_by_key(|(m, _, _, _)| m.count_ones());
+        if best_combo.is_some() {
+            return best_combo;
+        }
+    }
+    entries.iter().find(|(m, k, _, _)| *m == 0 && *k == key)
 }
 
 /// A pad source that is an axis (sticks and triggers) rather than a button.
@@ -620,14 +682,40 @@ fn resolve_active_source(base: usize, actions: &[u32]) -> Option<(u32, u32, bool
 /// On the title's thread, inside the keyboard's event broadcast.
 unsafe fn translate(me: &Relay, e: &Event) {
     let key = e.source >> 8;
+    // Record keyboard/mouse activity for auto prompt switching.
+    if matches!(e.kind, 7 | 11) {
+        victory_core::pad::note_keyboard_mouse();
+    }
+    // Keep live modifier state current before looking up combinations.
+    let mbit = modifier_bit(key);
+    if mbit != 0 {
+        if e.kind == 7 {
+            MODS_DOWN.fetch_or(mbit, Ordering::Relaxed);
+        } else if e.kind == 11 {
+            MODS_DOWN.fetch_and(!mbit, Ordering::Relaxed);
+        }
+    }
+    let active_mods = MODS_DOWN.load(Ordering::Relaxed) & !mbit;
     let (play, menu, signs) = {
         let mut map = KEY_MAP.lock().unwrap_or_else(|p| p.into_inner());
         if e.kind == 7 {
             map.refresh();
         }
-        let Some((_, play, menu)) = map.entries.iter().find(|(k, _, _)| *k == key) else { return };
-        let signs: Vec<(u32, f32)> = map.signs.iter().filter(|(k, _, _)| *k == key).map(|&(_, a, v)| (a, v)).collect();
-        (play.clone(), menu.clone(), signs)
+        // On release (kind 11), always allow releasing whatever `key` held even if modifiers changed.
+        let found = lookup_entry(&map.entries, if e.kind == 7 { active_mods } else { 0 }, key);
+        match found {
+            Some(&(matched_mods, _, ref play, ref menu)) => {
+                let signs: Vec<(u32, f32)> = map
+                    .signs
+                    .iter()
+                    .filter(|(m, k, _, _)| *m == matched_mods && *k == key)
+                    .map(|&(_, _, a, v)| (a, v))
+                    .collect();
+                (play.clone(), menu.clone(), signs)
+            }
+            None if e.kind == 11 => (Vec::new(), Vec::new(), Vec::new()),
+            None => return,
+        }
     };
     let base = IMAGE.load(Ordering::Relaxed);
     // SAFETY (both): the title's action array and its objects, read only.
@@ -1055,22 +1143,38 @@ mod tests {
     #[test]
     fn native_keys_lines_parse() {
         let map = parse_native_keys("# c\nW = INPUT_VEH_ACCELERATE, INPUT_MOVE_UP_ONLY\nLeftClick = INPUT_ATTACK | INPUT_JUMP\nWheelUp = INPUT_GAME_MENU_UP\nWheelDown = INPUT_GAME_MENU_DOWN\nF5 = INPUT_X\nbad\n");
-        assert_eq!(map[0], (0x57, vec![0x5b9f_d4e2, 0x8fd0_15d8], vec![]));
-        assert_eq!(map[1], (0x7c, vec![joaat("INPUT_ATTACK")], vec![0xd9d0_e1c0]));
-        assert_eq!(map[2].0, 0x81);
-        assert_eq!(map[3].0, 0x82);
-        assert_eq!(map[4].0, 0x74);
+        assert_eq!(map[0], (0, 0x57, vec![0x5b9f_d4e2, 0x8fd0_15d8], vec![]));
+        assert_eq!(map[1], (0, 0x7c, vec![joaat("INPUT_ATTACK")], vec![0xd9d0_e1c0]));
+        assert_eq!(map[2].1, 0x81);
+        assert_eq!(map[3].1, 0x82);
+        assert_eq!(map[4].1, 0x74);
         assert_eq!(map.len(), 5);
         // Directions: the name hashes without them, and each key keeps its own.
         let text = "W = INPUT_MOVE_UP_ONLY | INPUT_FRONTEND_MAP_MOVE_UD-, INPUT_FRONTEND_UP
 S = | INPUT_FRONTEND_MAP_MOVE_UD +
 ";
         let map = parse_native_keys(text);
-        assert_eq!(map[0].2[0], joaat("INPUT_FRONTEND_MAP_MOVE_UD"));
-        assert_eq!(map[1].2, vec![joaat("INPUT_FRONTEND_MAP_MOVE_UD")]);
+        assert_eq!(map[0].3[0], joaat("INPUT_FRONTEND_MAP_MOVE_UD"));
+        assert_eq!(map[1].3, vec![joaat("INPUT_FRONTEND_MAP_MOVE_UD")]);
         let ud = joaat("INPUT_FRONTEND_MAP_MOVE_UD");
-        assert_eq!(native_key_signs(text), vec![(0x57, ud, -1.0), (0x53, ud, 1.0)]);
+        assert_eq!(native_key_signs(text), vec![(0, 0x57, ud, -1.0), (0, 0x53, ud, 1.0)]);
         assert_eq!(ud, 0xaea8_cf77, "the title's id for it");
+    }
+
+    #[test]
+    fn modifier_combinations_parse_and_take_precedence_over_bare_keys() {
+        let text = "E = INPUT_CONTEXT\nCtrl+E = INPUT_DETONATE\nCtrl+Shift+E = INPUT_RELOAD\nNumpadAdd = INPUT_JUMP\n";
+        let map = parse_native_keys(text);
+        assert_eq!(map.len(), 4);
+        assert_eq!(lookup_entry(&map, 0, b'E' as u32).unwrap().2, vec![joaat("INPUT_CONTEXT")]);
+        assert_eq!(lookup_entry(&map, MOD_CTRL, b'E' as u32).unwrap().2, vec![joaat("INPUT_DETONATE")]);
+        assert_eq!(
+            lookup_entry(&map, MOD_CTRL | MOD_SHIFT, b'E' as u32).unwrap().2,
+            vec![joaat("INPUT_RELOAD")]
+        );
+        // Unbound modifier held (e.g. Shift+E) falls back cleanly to bare E!
+        assert_eq!(lookup_entry(&map, MOD_SHIFT, b'E' as u32).unwrap().2, vec![joaat("INPUT_CONTEXT")]);
+        assert_eq!(lookup_entry(&map, 0, 0x6b).unwrap().2, vec![joaat("INPUT_JUMP")]);
     }
 
     #[test]
@@ -1137,7 +1241,7 @@ S = | INPUT_FRONTEND_MAP_MOVE_UD +
     #[test]
     fn walk_meta_actions_hash_consistently() {
         let map = parse_native_keys("N = VERTEX_WALK_TOGGLE\nRightAlt = VERTEX_WALK_HOLD\n");
-        assert_eq!(map[0], (0x4e, vec![WALK_TOGGLE], vec![]));
-        assert_eq!(map[1], (0xa5, vec![WALK_HOLD], vec![]));
+        assert_eq!(map[0], (0, 0x4e, vec![WALK_TOGGLE], vec![]));
+        assert_eq!(map[1], (0, 0xa5, vec![WALK_HOLD], vec![]));
     }
 }

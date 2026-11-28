@@ -674,6 +674,12 @@ name = "victory-game"
 version = "0.1.0"
 dependencies = [
  "memchr",
+ "thiserror",
+ "tracing",
+ "victory-core",
+ "victory-formats",
+ "victory-loader",
+ "windows-sys",
  "zlib-rs",
 ]
 
@@ -703,6 +709,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "victory-core",
  "victory-formats",
  "victory-gpu",
  "victory-loader",
