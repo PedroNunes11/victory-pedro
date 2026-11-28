@@ -122,7 +122,7 @@ wrong guess about jitter or motion gives a smeared picture and no error. This
 is not implemented.
 
 **By the title's own FidelityFX path** all of it comes with the dispatch, as on
-a Series S. `VICTORY_TITLE_PATCH` can already make both choice functions return
+a Series S. `VICTORY_UPSCALER=7` makes both choice functions return
 7 on a Series X. KLBF Lab (GPL-3.0, commit `b24cb52` and `run.rs`, `ffx.rs` of
 its main) went that way with AMD's upscaler and says what is in the way:
 

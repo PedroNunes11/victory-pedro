@@ -110,15 +110,15 @@ The modes' texture budgets (room percent, spares, partial frames, LOD bias) are 
 | VNV 082ebaf / 2983a71 (bake-source logging) | code differs on this base | diagnostics only |
 | VNV a7b8667 (lists left open), aec85ef (raw view clamp) | duplicates of AnyXboxX #520 / #526, already in | none |
 | VNV 826ba15 (violet probe filter) | overlaps AnyXboxX #527, already in | only if purple blotches remain |
-| AnyXboxX #517 `VICTORY_EARLY_HEAPS` | no longer applies after the descriptor changes | re-port by hand if heap waits show |
-| AnyXboxX #524 `VICTORY_WAVE_PAIRS`, #531 `VICTORY_THIN_FAST` | #524 experimental; #531 needs #519 first | wait for upstream |
-| DLSS Frame Generation | Streamline integration (2.14.16 downloaded, D:/sdk/streamline-dl) not started; costs 0.5-2 GB VRAM | after VRAM pressure is solved |
+| AnyXboxX #517 early heap allocation | no longer applies after the descriptor changes | re-port by hand if heap waits show |
+| AnyXboxX #524 wave-pair lowering, #531 fast thin-list path | #524 experimental; #531 needs #519 first | wait for upstream |
+| DLSS Frame Generation | Streamline integration not started; costs 0.5-2 GB VRAM | after VRAM pressure is solved |
 | Ray-traced reflections (BVH builder) | builder left out; `-Reflections` blows out | VNV's stand-in (`VICTORY_AMBIENT_SPECULAR`) as the interim |
 | Map cursor exact placement | the title only takes stick input; current tracker is distance-based | find the map cursor's position in memory for closed-loop control |
-| **Keyboard key icons instead of controller icons** | built on `vertex/glyphs`: plugin DLL + engine hook, off by default | one identification session (`docs/GLYPHS.md`) |
+| **Keyboard key icons instead of controller icons** | Scaleform GFx vector prompts integrated on `main` (`VICTORY_PROMPTS=auto|keys|gamepad`) | live-verified (`docs/integration/keyboard-glyph-integration.md`) |
 | Ultrawide | `resolution.rs` MODES is a 16:9 whitelist | relax `parse_output`, add the launcher option |
 | Pause-menu / settings mouse cursor | menus step by D-pad from mouse motion | the title's CURSOR actions have no bindings |
-| `VICTORY_NAN_SCRUB` (rorodev6 megafork) | not in our tree | recommended by the floor fix's author for banding rings and eyes |
+| NaN scrubbing (rorodev6 megafork) | not in our tree | candidate for banding rings and eyes |
 
 ### Keyboard icons (button prompts)
 The console build draws Xbox button glyphs; the title has no keyboard prompt path we know of (it only
