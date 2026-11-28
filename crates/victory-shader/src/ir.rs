@@ -869,16 +869,21 @@ fn ends_program(p: &Program, b: usize) -> bool {
         && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
 }
 
-/// Whether block `b` is the far jump of a console branch whose target is too far for the
-/// branch's 16-bit offset (`s_getpc_b64`, an address added to it, `s_setpc_b64`) to a block
-/// that only ends the program. Code that does any work on the way stays what it is.
-fn far_jump_to_end(p: &Program, b: usize) -> bool {
+/// If block `b` is the far jump of a console branch whose target is too far for
+/// the branch's 16-bit offset (`s_getpc_b64`, an address added to it,
+/// `s_setpc_b64`) to a block that only ends the program, returns that end block.
+/// Code that does any work on the way stays what it is.
+fn far_jump_to_end(p: &Program, b: usize) -> Option<usize> {
     let block = &p.blocks[b];
-    matches!(block.exit, Exit::Jump(target) if ends_program(p, target))
+    let Exit::Jump(target) = block.exit else {
+        return None;
+    };
+    (ends_program(p, target)
         && block
             .insts
             .iter()
-            .all(|i| matches!(i.name(), "s_getpc_b64" | "s_add_u32" | "s_addc_u32" | "s_setpc_b64"))
+            .all(|i| matches!(i.name(), "s_getpc_b64" | "s_add_u32" | "s_addc_u32" | "s_setpc_b64")))
+    .then_some(target)
 }
 
 /// Where the lanes that stay go (and the exit block skipped to) when block `b`
@@ -891,7 +896,7 @@ fn early_out_continuation(p: &Program, b: usize) -> Option<(usize, usize)> {
     };
     match p.blocks[b].insts.last()?.name() {
         "s_cbranch_execz" if ends_program(p, taken) => Some((not_taken, taken)),
-        "s_cbranch_execnz" if far_jump_to_end(p, not_taken) => Some((taken, not_taken)),
+        "s_cbranch_execnz" => far_jump_to_end(p, not_taken).map(|end| (taken, end)),
         _ => None,
     }
 }

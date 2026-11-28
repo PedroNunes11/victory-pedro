@@ -6085,19 +6085,28 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // DXIL has no atomic subtraction (its atomic operations are add,
-        // and, or, xor, min, max, unsigned min and max, and exchange): the
-        // value to subtract is added negated, and the old value returns as
-        // for the other operations.
-        let (rmw, v0) = match rmw {
-            Some(Rmw::Sub) => {
-                let zero = self.s.m.i32(0);
-                (Some(Rmw::Add), self.s.m.bin(self.cur, Bin::Sub, zero, v0))
-            }
-            other => (other, v0),
-        };
+        // DXIL has no atomic subtraction (`atomicrmw sub` causes DEVICE_REMOVED
+        // on WARP, and feeding a negated value into `atomicrmw add` triggers an
+        // internal compiler failure on NVIDIA's D3D12 driver). Lower `ds_sub`
+        // via a CAS loop (`cmpxchg`) like `lds_float_min_max`.
         let at = self.begin_guarded(guard);
         let r = match rmw {
+            Some(Rmw::Sub) => {
+                let i32t = self.s.t.i32;
+                let init = self.s.m.load(self.cur, p);
+                let pre = self.cur;
+                let lp = self.s.m.new_block();
+                let exit = self.s.m.new_block();
+                self.s.m.terminate(pre, Term::Br(lp));
+                let old = self.s.m.phi(lp, i32t);
+                let new = self.s.m.bin(lp, Bin::Sub, old, v0);
+                let prev = self.s.m.cmpxchg(lp, p, old, new);
+                let done = self.s.m.cmp(lp, pred::EQ, prev, old);
+                self.s.m.set_phi(old, vec![(init, pre), (prev, lp)]);
+                self.s.m.terminate(lp, Term::CondBr(done, exit, lp));
+                self.cur = exit;
+                old
+            }
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
             None => self
