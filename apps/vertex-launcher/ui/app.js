@@ -123,9 +123,11 @@
     hotkey: { spec: "Win+Alt+V", error: null },
     system: null,
     nativeControls: null,
+    nativeControlsSaved: null,
     controlsCategory: "All",
     controlsSearch: "",
     controlsBoundOnly: true,
+    controlsFocusIdx: -1,
     cacheInfo: null,
     lossless: null,
     tune: null,
@@ -568,24 +570,67 @@
     render();
   }
 
-  function closeSettings() {
-    if (st.ingameOverlay && isGameRunning()) {
-      invoke("resume_game");
+  function guardUnsavedControls(proceed) {
+    const dirty = controlsDirtyCount();
+    if (st.page !== "controls" || dirty === 0) {
+      proceed();
       return;
     }
-    st.settingsOpen = false;
-    $("#settings").classList.add("hidden");
-    hideTip();
-    render();
+    const C = S.controls;
+    showModal(
+      h(
+        "div",
+        { class: "modal-box", role: "dialog", "aria-modal": "true" },
+        h("h3", null, C.unsavedNavTitle),
+        h("p", { class: "muted" }, fmt(C.unsavedNavBody, { n: dirty })),
+        h(
+          "div",
+          { class: "actions" },
+          h("button", {
+            class: "btn primary",
+            onclick: async () => {
+              hideModal();
+              await applyNativeControls();
+              proceed();
+            },
+          }, C.apply),
+          h("button", {
+            class: "btn warn-btn",
+            onclick: () => {
+              hideModal();
+              cancelNativeControls(true);
+              proceed();
+            },
+          }, C.discard),
+          h("button", { class: "btn ghost", onclick: hideModal }, "Keep Editing"),
+        ),
+      ),
+    );
+  }
+
+  function closeSettings() {
+    guardUnsavedControls(() => {
+      if (st.ingameOverlay && isGameRunning()) {
+        invoke("resume_game");
+        return;
+      }
+      st.settingsOpen = false;
+      $("#settings").classList.add("hidden");
+      hideTip();
+      render();
+    });
   }
 
   function go(page) {
-    st.page = page;
-    $("#set-main").scrollTop = 0;
-    if (page === "controls") loadNativeControls();
-    if (page === "cache") refreshCache();
-    if (page === "advanced") refreshLossless();
-    render();
+    if (page === st.page) return;
+    guardUnsavedControls(() => {
+      st.page = page;
+      $("#set-main").scrollTop = 0;
+      if (page === "controls") loadNativeControls();
+      if (page === "cache") refreshCache();
+      if (page === "advanced") refreshLossless();
+      render();
+    });
   }
 
   // ------------------------------------------------------------- Graphics
@@ -664,26 +709,184 @@
 
   // ------------------------------------------------------------- Controls
 
+  function cloneControls(data) {
+    return data ? JSON.parse(JSON.stringify(data)) : null;
+  }
+
+  function keysEqual(a, b) {
+    if (!a && !b) return true;
+    if (!a || !b || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  function controlsDirtyCount() {
+    if (!st.nativeControls || !st.nativeControlsSaved) return 0;
+    const savedById = new Map(st.nativeControlsSaved.actions.map((a) => [a.id, a.keys]));
+    let n = 0;
+    for (const a of st.nativeControls.actions) {
+      if (!keysEqual(a.keys, savedById.get(a.id) || [])) n++;
+    }
+    if (Math.abs((st.nativeControls.mouse_sensitivity || 1) - (st.nativeControlsSaved.mouse_sensitivity || 1)) > 0.005) n++;
+    if (!!st.nativeControls.mouse_invert_y !== !!st.nativeControlsSaved.mouse_invert_y) n++;
+    return n;
+  }
+
   async function loadNativeControls() {
     try {
-      st.nativeControls = await invoke("read_native_keys");
+      const data = await invoke("read_native_keys");
+      st.nativeControls = cloneControls(data);
+      st.nativeControlsSaved = cloneControls(data);
+      st.controlsFocusIdx = -1;
     } catch (e) {
       toast(errText(e), true);
     }
     if (st.settingsOpen && st.page === "controls") render();
   }
 
-  async function saveNativeControlsLive() {
+  async function applyNativeControls() {
     if (!st.nativeControls) return;
     try {
       const path = await invoke("write_native_keys", { actions: st.nativeControls.actions });
+      await invoke("write_mouse_live", {
+        sensitivity: st.nativeControls.mouse_sensitivity,
+        invertY: !!st.nativeControls.mouse_invert_y,
+      });
       st.nativeControls.path = path;
       st.nativeControls.exists = true;
+      st.profile.mouse_sensitivity = st.nativeControls.mouse_sensitivity;
+      st.profile.mouse_invert_y = !!st.nativeControls.mouse_invert_y;
+      st.nativeControls.prompt_preview = await invoke("preview_prompt_glyphs", {
+        actions: st.nativeControls.actions,
+      });
+      st.nativeControlsSaved = cloneControls(st.nativeControls);
       toast(S.controls.savedLive);
       sound.sfx("success");
+      render();
     } catch (e) {
       toast(errText(e), true);
     }
+  }
+
+  function cancelNativeControls(silent = false) {
+    if (!st.nativeControlsSaved) return;
+    st.nativeControls = cloneControls(st.nativeControlsSaved);
+    if (!silent) toast(S.controls.discarded);
+    render();
+  }
+
+  function computeDraftPromptPreview(actions) {
+    const firstKey = (ids, fb) => {
+      for (const id of ids) {
+        const a = actions.find((x) => x.id === id);
+        if (a && a.keys && a.keys.length) return a.keys[0];
+      }
+      return fb;
+    };
+    const move = [
+      firstKey(["INPUT_MOVE_UP_ONLY"], "W"),
+      firstKey(["INPUT_MOVE_LEFT_ONLY"], "A"),
+      firstKey(["INPUT_MOVE_DOWN_ONLY"], "S"),
+      firstKey(["INPUT_MOVE_RIGHT_ONLY"], "D"),
+    ].join(" ");
+    return [
+      { control: "A", title: "Jump / Confirm", key: firstKey(["INPUT_JUMP", "INPUT_FRONTEND_ACCEPT"], "Space") },
+      { control: "B", title: "Crouch / Back", key: firstKey(["INPUT_DUCK", "INPUT_FRONTEND_CANCEL"], "Ctrl") },
+      { control: "X", title: "Reload / Melee", key: firstKey(["INPUT_RELOAD", "INPUT_MELEE_ATTACK_LIGHT"], "R") },
+      { control: "Y", title: "Enter / Exit", key: firstKey(["INPUT_ENTER", "INPUT_VEH_EXIT"], "F") },
+      { control: "LB", title: "Weapon Wheel", key: firstKey(["INPUT_OPEN_WHEEL_MENU"], "Tab") },
+      { control: "RB", title: "Take Cover", key: firstKey(["INPUT_COVER"], "Q") },
+      { control: "LT", title: "Aim", key: firstKey(["INPUT_AIM"], "RightClick") },
+      { control: "RT", title: "Shoot", key: firstKey(["INPUT_ATTACK"], "LeftClick") },
+      { control: "L3", title: "Sprint", key: firstKey(["INPUT_SPRINT"], "Shift") },
+      { control: "R3", title: "Look Behind", key: firstKey(["INPUT_LOOK_BEHIND"], "C") },
+      { control: "DRight", title: "Context", key: firstKey(["INPUT_CONTEXT"], "E") },
+      { control: "DUp", title: "Phone", key: firstKey(["INPUT_PHONE"], "ArrowUp") },
+      { control: "Menu", title: "Pause", key: firstKey(["INPUT_FRONTEND_PAUSE"], "Esc") },
+      { control: "View", title: "Map", key: firstKey(["INPUT_MAP", "INPUT_FRONTEND_SELECT"], "M") },
+      { control: "LS", title: "Move", key: move },
+      { control: "RS", title: "Camera", key: "Mouse" },
+    ];
+  }
+
+  // Contextual Keyboard & Mouse Visual Glyph Renderer (matches Scaleform vector key caps)
+  function mouseGlyphSvg(press) {
+    const svgNS = "http://www.w3.org/2000/svg";
+    const el = document.createElementNS(svgNS, "svg");
+    el.setAttribute("viewBox", "0 0 18 24");
+    el.setAttribute("aria-hidden", "true");
+    const add = (tag, attrs) => {
+      const n = document.createElementNS(svgNS, tag);
+      for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, String(v));
+      el.appendChild(n);
+    };
+    add("rect", { x: 2, y: 1.5, width: 14, height: 21, rx: 7, fill: "none", stroke: "#11131a", "stroke-width": 1.8 });
+    add("line", { x1: 2.5, y1: 10.5, x2: 15.5, y2: 10.5, stroke: "#11131a", "stroke-width": 1.4 });
+    add("line", { x1: 9, y1: 2, x2: 9, y2: 10.5, stroke: "#11131a", "stroke-width": 1.4 });
+    if (press === "left") add("path", { d: "M3 10V8.5A6 6 0 0 1 8.4 2.5V10Z", fill: "#11131a" });
+    if (press === "right") add("path", { d: "M9.6 2.5A6 6 0 0 1 15 8.5V10H9.6Z", fill: "#11131a" });
+    add("rect", {
+      x: 7.4, y: 4.3, width: 3.2, height: 4.6, rx: 1.6,
+      fill: (press === "wheel" || press === "wheelup" || press === "wheeldown") ? "#11131a" : "#f4f5f8",
+      stroke: "#11131a", "stroke-width": 1.2,
+    });
+    if (press === "wheelup") add("path", { d: "M9 13L12 17H6Z", fill: "#11131a" });
+    if (press === "wheeldown") add("path", { d: "M9 19L6 15H12Z", fill: "#11131a" });
+    return el;
+  }
+
+  const GLYPH_SHORT = {
+    Enter: "↵", Backspace: "⌫", Esc: "Esc", Tab: "Tab", Space: "Space", CapsLock: "Caps",
+    Shift: "Shift", RightShift: "RShf", Ctrl: "Ctrl", RightCtrl: "RCtrl", Alt: "Alt", RightAlt: "RAlt",
+    ArrowUp: "↑", ArrowDown: "↓", ArrowLeft: "←", ArrowRight: "→",
+    Insert: "Ins", Delete: "Del", Home: "Home", End: "End", PageUp: "PgUp", PageDown: "PgDn",
+    Comma: ",", Period: ".", Minus: "-", Equals: "=", LeftBracket: "[", RightBracket: "]",
+    Semicolon: ";", Quote: "'", Slash: "/", Backslash: "\\", Backquote: "`",
+    Mouse4: "MB4", Mouse5: "MB5",
+    NumpadAdd: "N+", NumpadSub: "N-", NumpadMul: "N*", NumpadDiv: "N/", NumpadDecimal: "N.",
+  };
+  for (let i = 0; i <= 9; i++) GLYPH_SHORT["Numpad" + i] = "N" + i;
+
+  function renderSingleGlyph(token, isMod = false) {
+    const low = token.toLowerCase();
+    if (low === "leftclick") return h("span", { class: "keycap-box mouse", title: "Left Click" }, mouseGlyphSvg("left"));
+    if (low === "rightclick") return h("span", { class: "keycap-box mouse", title: "Right Click" }, mouseGlyphSvg("right"));
+    if (low === "middleclick") return h("span", { class: "keycap-box mouse", title: "Middle Click" }, mouseGlyphSvg("wheel"));
+    if (low === "wheelup") return h("span", { class: "keycap-box mouse", title: "Wheel Up" }, mouseGlyphSvg("wheelup"));
+    if (low === "wheeldown") return h("span", { class: "keycap-box mouse", title: "Wheel Down" }, mouseGlyphSvg("wheeldown"));
+    if (low === "mouse") return h("span", { class: "keycap-box mouse", title: "Mouse Look" }, mouseGlyphSvg("move"));
+    const label = GLYPH_SHORT[token] || token;
+    return h("span", { class: "keycap-box" + (isMod ? " mod" : ""), title: token }, label);
+  }
+
+  function renderKeyGlyph(keySpec) {
+    if (!keySpec) return h("span", { class: "keycap-glyph" });
+    // Multi-cap cluster like "W A S D"
+    if (keySpec.includes(" ")) {
+      const caps = keySpec.split(/\s+/).filter(Boolean).map((k) => renderSingleGlyph(k));
+      return h("span", { class: "keycap-glyph" }, caps);
+    }
+    const parts = keySpec.split("+").filter(Boolean);
+    if (parts.length <= 1) {
+      return h("span", { class: "keycap-glyph" }, renderSingleGlyph(keySpec));
+    }
+    const nodes = [];
+    parts.forEach((p, idx) => {
+      if (idx > 0) nodes.push(h("span", { class: "keycap-plus" }, "+"));
+      nodes.push(renderSingleGlyph(p, idx < parts.length - 1));
+    });
+    return h("span", { class: "keycap-glyph", title: keySpec }, nodes);
+  }
+
+  function findConflictsForKey(actions, targetAction, keyName) {
+    return actions.filter(
+      (a) =>
+        a.id !== targetAction.id &&
+        a.category === targetAction.category &&
+        a.is_menu === targetAction.is_menu &&
+        a.label !== targetAction.label &&
+        a.keys.includes(keyName),
+    );
   }
 
   function findControlsConflicts(actions) {
@@ -691,7 +894,7 @@
     const byCatKey = new Map();
     for (const a of actions) {
       for (const k of a.keys) {
-        const ck = `${a.category}::${k}`;
+        const ck = `${a.category}::${a.is_menu ? "M" : "P"}::${k}`;
         if (!byCatKey.has(ck)) byCatKey.set(ck, []);
         byCatKey.get(ck).push(a);
       }
@@ -699,14 +902,13 @@
     const marked = new Set();
     for (const [ck, list] of byCatKey.entries()) {
       if (list.length > 1) {
-        // Ignore expected multi-vehicle/car aliases sharing the same key
         const distinct = list.filter((x, i, arr) => arr.findIndex((y) => y.label === x.label) === i);
         if (distinct.length > 1) {
           marked.add(ck);
           if (conflicts.length < 4) {
             conflicts.push(fmt(S.controls.conflict, {
               cat: distinct[0].category,
-              key: ck.split("::")[1],
+              key: ck.split("::")[2],
               a: distinct[0].label,
               b: distinct[1].label,
             }));
@@ -717,24 +919,32 @@
     return { conflicts, marked };
   }
 
+  const CONTROLS_CATEGORIES = [
+    "All", "On Foot", "Combat & Weapons", "Vehicle", "Aircraft",
+    "Boat / Sub", "Bicycle", "Parachute", "Phone", "Menus & Map", "Other",
+  ];
+
+  function getFilteredControls() {
+    if (!st.nativeControls) return [];
+    const q = st.controlsSearch.trim().toLowerCase();
+    return st.nativeControls.actions.filter((a) => {
+      if (st.controlsCategory !== "All" && a.category !== st.controlsCategory) return false;
+      if (st.controlsBoundOnly && a.keys.length === 0) return false;
+      if (q) {
+        const hay = `${a.label} ${a.id} ${a.category} ${a.keys.join(" ")}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }
+
   function pageControls() {
     const C = S.controls;
     const p = st.profile;
     const nc = st.nativeControls;
     const sens = nc ? nc.mouse_sensitivity : (p.mouse_sensitivity || 1.0);
     const invY = nc ? nc.mouse_invert_y : !!p.mouse_invert_y;
-
-    const saveMouseLive = async (newSens, newInv) => {
-      if (nc) { nc.mouse_sensitivity = newSens; nc.mouse_invert_y = newInv; }
-      p.mouse_sensitivity = newSens;
-      p.mouse_invert_y = newInv;
-      try {
-        await invoke("write_mouse_live", { sensitivity: newSens, invertY: newInv });
-        toast("Mouse updated live (reloads in game within 1 s).");
-      } catch (e) {
-        toast(errText(e), true);
-      }
-    };
+    const dirty = controlsDirtyCount();
 
     const hotkeyChoices = ["Win+Alt+V", "Win+Shift+V", "Win+F1", "Win+Backquote"];
     const hotkeySel = h(
@@ -757,6 +967,13 @@
     );
     hotkeySel.value = hotkeyChoices.includes(st.hotkey.spec) ? st.hotkey.spec : "Win+Alt+V";
 
+    const promptModeCur = p.prompt_glyphs || "auto";
+    const promptSeg = seg([
+      ["Auto (KB + Pad)", promptModeCur === "auto", () => { p.prompt_glyphs = "auto"; changed(true, true); render(); }],
+      ["Keyboard Caps", promptModeCur === "keys", () => { p.prompt_glyphs = "keys"; changed(true, true); render(); }],
+      ["Xbox Icons", promptModeCur === "gamepad", () => { p.prompt_glyphs = "gamepad"; changed(true, true); render(); }],
+    ]);
+
     const mouseCard = card(
       C.mouseCard,
       null,
@@ -769,9 +986,10 @@
         unit: "{v}x",
         badges: liveBadge(),
         onInput: (v) => { if (nc) nc.mouse_sensitivity = v; },
-        onCommit: (v) => saveMouseLive(v, invY),
+        onCommit: (v) => { if (nc) { nc.mouse_sensitivity = v; render(); } },
       }),
-      boolSetting(C.invertY, invY, (v) => { saveMouseLive(sens, v); render(); }, liveBadge()),
+      boolSetting(C.invertY, invY, (v) => { if (nc) { nc.mouse_invert_y = v; render(); } }, liveBadge()),
+      settingRow(C.promptMode, restartBadge(), promptSeg),
       settingRow(C.hotkey, liveBadge(), hotkeySel),
       st.hotkey.error && notice("warn", st.hotkey.error),
       boolSetting(C.nativeMode, p.native_controls, (v) => { p.native_controls = v; changed(true, true); }, restartBadge()),
@@ -781,19 +999,32 @@
       return h("div", { class: "page" }, head(S.nav.controls, C.lead, liveBadge()), mouseCard, card(C.bindingsCard, null, h("p", { class: "muted", text: "Loading native-keys.txt…" })));
     }
 
-    const categories = ["All", "On Foot", "Combat & Weapons", "Vehicle", "Aircraft", "Boat / Sub", "Bicycle", "Parachute", "Phone", "Menus & Map", "Other"];
-    const q = st.controlsSearch.trim().toLowerCase();
-    const filtered = nc.actions.filter((a) => {
-      if (st.controlsCategory !== "All" && a.category !== st.controlsCategory) return false;
-      if (st.controlsBoundOnly && a.keys.length === 0) return false;
-      if (q) {
-        const hay = `${a.label} ${a.id} ${a.category} ${a.keys.join(" ")}`.toLowerCase();
-        if (!hay.includes(q)) return false;
-      }
-      return true;
-    });
-
+    const filtered = getFilteredControls();
+    if (st.controlsFocusIdx >= filtered.length) st.controlsFocusIdx = filtered.length - 1;
     const { conflicts, marked } = findControlsConflicts(nc.actions);
+    const previewItems = computeDraftPromptPreview(nc.actions);
+
+    const promptPreviewCard = card(
+      C.promptPreviewTitle,
+      C.promptPreviewDesc,
+      h(
+        "div",
+        { class: "prompt-preview" },
+        previewItems.map((it) =>
+          h(
+            "div",
+            { class: "prompt-item" },
+            renderKeyGlyph(it.key),
+            h(
+              "div",
+              { class: "prompt-item-info" },
+              h("div", { class: "prompt-item-title" }, it.title),
+              h("div", { class: "prompt-item-pad" }, it.control + " → " + it.key),
+            ),
+          ),
+        ),
+      ),
+    );
 
     const searchInput = h("input", {
       class: "search-input",
@@ -802,7 +1033,7 @@
       value: st.controlsSearch,
       oninput: (e) => {
         st.controlsSearch = e.target.value;
-        // Re-render list smoothly without losing focus
+        st.controlsFocusIdx = 0;
         const pos = e.target.selectionStart;
         render();
         const again = document.querySelector(".search-input");
@@ -810,19 +1041,21 @@
       },
     });
 
-    const bindRows = filtered.map((a) => {
+    const bindRows = filtered.map((a, rowIdx) => {
+      const isModified = !keysEqual(a.keys, a.default_keys || []);
+      const isFocused = rowIdx === st.controlsFocusIdx;
       const chips = a.keys.length
         ? a.keys.map((k, idx) =>
             h(
               "span",
-              { class: "key" + (marked.has(`${a.category}::${k}`) ? " clash" : "") },
-              k,
+              { class: "key" + (marked.has(`${a.category}::${a.is_menu ? "M" : "P"}::${k}`) ? " clash" : "") },
+              renderKeyGlyph(k),
               h("button", {
                 class: "x",
                 title: `Remove ${k}`,
-                onclick: () => {
+                onclick: (ev) => {
+                  ev.stopPropagation();
                   a.keys.splice(idx, 1);
-                  saveNativeControlsLive();
                   render();
                 },
               }, "×"),
@@ -832,7 +1065,11 @@
 
       return h(
         "div",
-        { class: "bind" },
+        {
+          class: "bind" + (isFocused ? " focused" : "") + (isModified ? " modified" : ""),
+          "data-row-idx": String(rowIdx),
+          onclick: () => { st.controlsFocusIdx = rowIdx; render(); },
+        },
         h(
           "div",
           null,
@@ -843,11 +1080,29 @@
           "div",
           { class: "bind-keys" },
           chips,
-          h("button", { class: "link-btn", onclick: () => startCapture(a, "replace") }, C.change),
-          h("button", { class: "icon-btn", title: C.add, onclick: () => startCapture(a, "add") }, icon("plus", "2.4")),
+          h("button", { class: "link-btn", onclick: (ev) => { ev.stopPropagation(); startCapture(a, "replace"); } }, C.change),
+          h("button", { class: "icon-btn", title: C.add, onclick: (ev) => { ev.stopPropagation(); startCapture(a, "add"); } }, icon("plus", "2.4")),
+          isModified && h("button", {
+            class: "icon-btn",
+            title: C.resetOne,
+            onclick: (ev) => {
+              ev.stopPropagation();
+              a.keys = [...(a.default_keys || [])];
+              toast(`Reset "${a.label}" to default.`);
+              render();
+            },
+          }, "↺"),
         ),
       );
     });
+
+    const applyBar = dirty > 0 && h(
+      "div",
+      { class: "apply-bar" },
+      h("span", { class: "apply-bar-text" }, fmt(C.unsavedBanner, { n: dirty })),
+      h("button", { class: "btn ghost small", onclick: () => cancelNativeControls(false) }, C.discard),
+      h("button", { class: "btn primary small", onclick: applyNativeControls }, C.apply),
+    );
 
     const bindingsCard = card(
       C.bindingsCard,
@@ -857,33 +1112,53 @@
         { class: "controls-toolbar" },
         searchInput,
         h("label", { class: "row small muted", style: "cursor:pointer" },
-          toggle(st.controlsBoundOnly, (v) => { st.controlsBoundOnly = v; render(); }, C.boundOnly),
+          toggle(st.controlsBoundOnly, (v) => { st.controlsBoundOnly = v; st.controlsFocusIdx = -1; render(); }, C.boundOnly),
           C.boundOnly,
         ),
         h("button", {
           class: "btn small",
-          onclick: async () => {
-            try {
-              st.nativeControls = await invoke("reset_native_keys");
-              toast(C.resetDone);
-              sound.sfx("success");
-              render();
-            } catch (e) { toast(errText(e), true); }
+          onclick: () => {
+            showModal(
+              h(
+                "div",
+                { class: "modal-box", role: "dialog", "aria-modal": "true" },
+                h("h3", null, C.resetConfirmTitle),
+                h("p", { class: "muted" }, C.resetConfirmBody),
+                h(
+                  "div",
+                  { class: "actions" },
+                  h("button", {
+                    class: "btn warn-btn",
+                    onclick: () => {
+                      hideModal();
+                      for (const a of nc.actions) a.keys = [...(a.default_keys || [])];
+                      nc.mouse_sensitivity = 1.0;
+                      nc.mouse_invert_y = false;
+                      toast(C.resetDone);
+                      render();
+                    },
+                  }, C.reset),
+                  h("button", { class: "btn ghost", onclick: hideModal }, C.cancel),
+                ),
+              ),
+            );
           },
         }, C.reset),
       ),
       h(
         "div",
         { class: "cat-pills" },
-        categories.map((cat) =>
+        CONTROLS_CATEGORIES.map((cat) =>
           h("button", {
             class: "cat-pill" + (st.controlsCategory === cat ? " on" : ""),
-            onclick: () => { st.controlsCategory = cat; render(); },
+            onclick: () => { st.controlsCategory = cat; st.controlsFocusIdx = 0; render(); },
           }, cat),
         ),
       ),
+      h("div", { class: "nav-hint" }, C.navHint),
       conflicts.length > 0 && conflicts.map((c) => notice("warn", c)),
-      h("div", { class: "controls-list binds" }, bindRows.length ? bindRows : h("p", { class: "muted", text: "No actions match your filter. Turn off 'Bound only' to see all 460 actions." })),
+      h("div", { class: "controls-list binds", id: "controls-list" }, bindRows.length ? bindRows : h("p", { class: "muted", text: "No actions match your filter. Turn off 'Bound only' to see all actions." })),
+      applyBar,
       h(
         "div",
         { class: "row spacer-top" },
@@ -893,10 +1168,10 @@
       ),
     );
 
-    return h("div", { class: "page" }, head(S.nav.controls, C.lead, liveBadge()), mouseCard, bindingsCard);
+    return h("div", { class: "page" }, head(S.nav.controls, C.lead, liveBadge()), mouseCard, promptPreviewCard, bindingsCard);
   }
 
-  // Key / Mouse / Scroll Wheel Capture for Native Controls
+  // Key / Modifier Combo / Mouse / Scroll Wheel Capture for Native Controls
   const CODE_NAMES = {
     ShiftLeft: "Shift", ShiftRight: "RightShift", ControlLeft: "Ctrl", ControlRight: "RightCtrl",
     AltLeft: "Alt", AltRight: "RightAlt", Space: "Space", Enter: "Enter", NumpadEnter: "Enter",
@@ -906,21 +1181,61 @@
     Semicolon: "Semicolon", Quote: "Quote", Comma: "Comma", Minus: "Minus", Equal: "Equals",
     Period: "Period", Slash: "Slash", Backslash: "Backslash", Backquote: "Backquote",
     BracketLeft: "LeftBracket", BracketRight: "RightBracket",
+    NumpadAdd: "NumpadAdd", NumpadSubtract: "NumpadSub", NumpadMultiply: "NumpadMul",
+    NumpadDivide: "NumpadDiv", NumpadDecimal: "NumpadDecimal",
   };
   for (let i = 1; i <= 12; i++) CODE_NAMES["F" + i] = "F" + i;
   for (let i = 0; i <= 9; i++) CODE_NAMES["Numpad" + i] = "Numpad" + i;
   const MOUSE_NAMES = ["LeftClick", "MiddleClick", "RightClick", "Mouse4", "Mouse5"];
+  const MOD_CODES = new Set(["ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight"]);
 
   function nameOfKey(e) {
-    if (e.key && e.key.length === 1 && /[a-z]/i.test(e.key)) return e.key.toUpperCase();
-    const digit = /^Digit(\d)$/.exec(e.code);
-    if (digit) return digit[1];
+    if (e.code && /^Key([A-Z])$/.test(e.code)) return e.code.slice(3);
+    if (e.code && /^Digit(\d)$/.test(e.code)) return e.code.slice(5);
+    if (e.key && e.key.length === 1 && /[a-z0-9]/i.test(e.key)) return e.key.toUpperCase();
     return CODE_NAMES[e.code] || null;
   }
 
+  function buildComboName(mods, baseName) {
+    const parts = [];
+    if (mods.ctrl) parts.push("Ctrl");
+    if (mods.shift) parts.push("Shift");
+    if (mods.alt) parts.push("Alt");
+    parts.push(baseName);
+    return parts.join("+");
+  }
+
+  function updateCapturePreview() {
+    const c = st.capture;
+    if (!c || !c.preview) return;
+    c.preview.innerHTML = "";
+    const parts = [];
+    if (c.mods.ctrl) parts.push("Ctrl");
+    if (c.mods.shift) parts.push("Shift");
+    if (c.mods.alt) parts.push("Alt");
+    if (parts.length) {
+      parts.forEach((m, i) => {
+        if (i > 0) c.preview.appendChild(h("span", { class: "keycap-plus" }, "+"));
+        c.preview.appendChild(renderSingleGlyph(m, true));
+      });
+      c.preview.appendChild(h("span", { class: "keycap-plus" }, "+ …"));
+    } else {
+      c.preview.appendChild(h("span", { class: "faint" }, "Waiting for input…"));
+    }
+  }
+
   function startCapture(action, mode) {
-    st.capture = { action, mode };
     const msg = h("div", { class: "modal-msg" });
+    const preview = h("div", { class: "capture-preview" });
+    st.capture = {
+      action,
+      mode,
+      msg,
+      preview,
+      mods: { ctrl: false, shift: false, alt: false },
+      soloMod: null,
+      sawNonMod: false,
+    };
     showModal(
       h(
         "div",
@@ -928,12 +1243,13 @@
         h("div", { class: "pulse" }, icon("controls")),
         h("h3", null, S.controls.captureTitle),
         h("p", { class: "muted" }, fmt(S.controls.captureFor, { action: action.label })),
+        preview,
         h("p", { class: "faint" }, S.controls.captureNote),
         msg,
         h("button", { class: "btn cancel", onclick: endCapture }, S.controls.cancel),
       ),
     );
-    st.capture.msg = msg;
+    updateCapturePreview();
   }
 
   function endCapture() {
@@ -942,24 +1258,153 @@
     render();
   }
 
+  function applyBindingCommit(action, mode, keyName) {
+    if (mode === "replace") action.keys = [keyName];
+    else if (!action.keys.includes(keyName)) action.keys.push(keyName);
+    render();
+  }
+
   function commitCaptured(keyName) {
     const c = st.capture;
     if (!c) return;
-    if (c.mode === "replace") c.action.keys = [keyName];
-    else if (!c.action.keys.includes(keyName)) c.action.keys.push(keyName);
-    endCapture();
-    saveNativeControlsLive();
+    const { action, mode } = c;
+    const oldPrimary = action.keys[0] || null;
+    st.capture = null;
+    hideModal();
+
+    const clashes = st.nativeControls ? findConflictsForKey(st.nativeControls.actions, action, keyName) : [];
+    if (clashes.length === 0) {
+      applyBindingCommit(action, mode, keyName);
+      return;
+    }
+
+    // Interactive Conflict Resolution Modal
+    const C = S.controls;
+    const canSwap = mode === "replace" && oldPrimary && oldPrimary !== keyName;
+    showModal(
+      h(
+        "div",
+        { class: "modal-box", role: "dialog", "aria-modal": "true" },
+        h("h3", null, C.conflictTitle),
+        h("div", { class: "capture-preview" }, renderKeyGlyph(keyName)),
+        h("p", { class: "muted" }, fmt(C.conflictBody, {
+          key: keyName,
+          cat: action.category,
+          others: clashes.map((x) => x.label).join(", "),
+        })),
+        h(
+          "div",
+          { class: "actions" },
+          canSwap && h("button", {
+            class: "btn primary",
+            onclick: () => {
+              hideModal();
+              for (const other of clashes) {
+                other.keys = other.keys.map((k) => (k === keyName ? oldPrimary : k));
+              }
+              applyBindingCommit(action, mode, keyName);
+            },
+          }, `${C.conflictSwap} (${oldPrimary} ⇄ ${keyName})`),
+          h("button", {
+            class: canSwap ? "btn" : "btn primary",
+            onclick: () => {
+              hideModal();
+              for (const other of clashes) {
+                other.keys = other.keys.filter((k) => k !== keyName);
+              }
+              applyBindingCommit(action, mode, keyName);
+            },
+          }, C.conflictReplace),
+          h("button", {
+            class: "btn ghost",
+            onclick: () => {
+              hideModal();
+              applyBindingCommit(action, mode, keyName);
+            },
+          }, C.conflictKeepBoth),
+          h("button", { class: "btn ghost", onclick: () => { hideModal(); render(); } }, C.cancel),
+        ),
+      ),
+    );
   }
 
   window.addEventListener("keydown", (e) => {
     if (st.capture) {
       e.preventDefault(); e.stopPropagation();
       if (e.repeat) return;
-      const name = nameOfKey(e);
-      if (name) commitCaptured(name);
-      else st.capture.msg.textContent = "Unsupported key — try letters, digits, F1–F12, arrows, modifiers, mouse buttons, or scroll wheel.";
+      const c = st.capture;
+      if (e.code === "Escape" && !c.mods.ctrl && !c.mods.shift && !c.mods.alt) {
+        endCapture();
+        return;
+      }
+      if (MOD_CODES.has(e.code)) {
+        if (e.code.startsWith("Control")) c.mods.ctrl = true;
+        if (e.code.startsWith("Shift")) c.mods.shift = true;
+        if (e.code.startsWith("Alt")) c.mods.alt = true;
+        if (!c.sawNonMod) c.soloMod = CODE_NAMES[e.code];
+        updateCapturePreview();
+        return;
+      }
+      const base = nameOfKey(e);
+      if (base) {
+        c.sawNonMod = true;
+        const full = (c.mods.ctrl || c.mods.shift || c.mods.alt) ? buildComboName(c.mods, base) : base;
+        commitCaptured(full);
+      } else {
+        c.msg.textContent = "Unsupported key — try letters, digits, F1–F12, arrows, numpad, modifiers, mouse buttons, or wheel.";
+      }
       return;
     }
+
+    // Keyboard navigation on the Controls Settings page
+    if (st.settingsOpen && st.page === "controls" && !modalCancel) {
+      const inSearch = document.activeElement && document.activeElement.classList.contains("search-input");
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        if (controlsDirtyCount() > 0) applyNativeControls();
+        return;
+      }
+      if (!inSearch && st.nativeControls) {
+        const filtered = getFilteredControls();
+        if (e.key === "ArrowDown" && filtered.length) {
+          e.preventDefault();
+          st.controlsFocusIdx = Math.min(filtered.length - 1, st.controlsFocusIdx + 1);
+          render();
+          document.querySelector(`.bind[data-row-idx="${st.controlsFocusIdx}"]`)?.scrollIntoView({ block: "nearest" });
+          return;
+        }
+        if (e.key === "ArrowUp" && filtered.length) {
+          e.preventDefault();
+          st.controlsFocusIdx = Math.max(0, st.controlsFocusIdx <= 0 ? 0 : st.controlsFocusIdx - 1);
+          render();
+          document.querySelector(`.bind[data-row-idx="${st.controlsFocusIdx}"]`)?.scrollIntoView({ block: "nearest" });
+          return;
+        }
+        if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+          e.preventDefault();
+          const idx = CONTROLS_CATEGORIES.indexOf(st.controlsCategory);
+          const next = (idx + (e.key === "ArrowRight" ? 1 : -1) + CONTROLS_CATEGORIES.length) % CONTROLS_CATEGORIES.length;
+          st.controlsCategory = CONTROLS_CATEGORIES[next];
+          st.controlsFocusIdx = 0;
+          render();
+          return;
+        }
+        if (e.key === "Enter" && st.controlsFocusIdx >= 0 && filtered[st.controlsFocusIdx]) {
+          e.preventDefault();
+          startCapture(filtered[st.controlsFocusIdx], e.shiftKey ? "add" : "replace");
+          return;
+        }
+        if ((e.key === "Delete" || e.key === "Backspace") && st.controlsFocusIdx >= 0 && filtered[st.controlsFocusIdx]) {
+          e.preventDefault();
+          const a = filtered[st.controlsFocusIdx];
+          a.keys = [...(a.default_keys || [])];
+          toast(`Reset "${a.label}" to default.`);
+          render();
+          return;
+        }
+      }
+    }
+
     if (e.key === "Escape") {
       if (modalCancel) modalCancel();
       else if (st.settingsOpen) closeSettings();
@@ -967,19 +1412,43 @@
     if (e.key === "F5" || e.key === "F7" || ((e.ctrlKey || e.metaKey) && "rRpfgu".includes(e.key))) e.preventDefault();
   }, true);
 
+  window.addEventListener("keyup", (e) => {
+    const c = st.capture;
+    if (!c || !MOD_CODES.has(e.code)) return;
+    e.preventDefault(); e.stopPropagation();
+    if (!c.sawNonMod && c.soloMod) {
+      commitCaptured(c.soloMod);
+      return;
+    }
+    if (e.code.startsWith("Control")) c.mods.ctrl = false;
+    if (e.code.startsWith("Shift")) c.mods.shift = false;
+    if (e.code.startsWith("Alt")) c.mods.alt = false;
+    updateCapturePreview();
+  }, true);
+
   window.addEventListener("mousedown", (e) => {
     if (!st.capture) return;
     if (e.target.closest && e.target.closest(".cancel")) return;
     e.preventDefault();
     const name = MOUSE_NAMES[e.button];
-    if (name) commitCaptured(name);
+    if (name) {
+      const c = st.capture;
+      c.sawNonMod = true;
+      const full = (c.mods.ctrl || c.mods.shift || c.mods.alt) ? buildComboName(c.mods, name) : name;
+      commitCaptured(full);
+    }
   }, true);
 
   window.addEventListener("wheel", (e) => {
     if (!st.capture) return;
     e.preventDefault();
-    if (e.deltaY < 0) commitCaptured("WheelUp");
-    else if (e.deltaY > 0) commitCaptured("WheelDown");
+    const base = e.deltaY < 0 ? "WheelUp" : e.deltaY > 0 ? "WheelDown" : null;
+    if (base) {
+      const c = st.capture;
+      c.sawNonMod = true;
+      const full = (c.mods.ctrl || c.mods.shift || c.mods.alt) ? buildComboName(c.mods, base) : base;
+      commitCaptured(full);
+    }
   }, { passive: false, capture: true });
 
   window.addEventListener("contextmenu", (e) => {

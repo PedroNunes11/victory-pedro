@@ -71,6 +71,11 @@ pub const NATIVE_KEY_NAMES: &[&str] = &[
     "Numpad7",
     "Numpad8",
     "Numpad9",
+    "NumpadAdd",
+    "NumpadSub",
+    "NumpadMul",
+    "NumpadDiv",
+    "NumpadDecimal",
 ];
 
 /// Built-in GTA V Enhanced PC layout tuned for GTA VI (used if
@@ -141,6 +146,16 @@ pub struct NativeAction {
     pub category: String,
     pub is_menu: bool,
     pub keys: Vec<String>,
+    #[serde(default)]
+    pub default_keys: Vec<String>,
+}
+
+/// Live preview of what each GTA VI button prompt will display in-game.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptPreviewItem {
+    pub control: String,
+    pub title: String,
+    pub key: String,
 }
 
 /// Full payload read/written by the Controls UI.
@@ -149,6 +164,7 @@ pub struct NativeControlsData {
     pub path: String,
     pub exists: bool,
     pub actions: Vec<NativeAction>,
+    pub prompt_preview: Vec<PromptPreviewItem>,
     pub mouse_sensitivity: f32,
     pub mouse_invert_y: bool,
 }
@@ -523,16 +539,67 @@ pub fn write_mouse_to_keys_txt(data_dir: &Path, sensitivity: f32, invert_y: bool
     std::fs::rename(&temp, &path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Computes the live in-game button prompt preview for every primary GTA VI
+/// prompt slot from the given action list (matching `victory-game`'s derivation).
+pub fn compute_prompt_preview(actions: &[NativeAction]) -> Vec<PromptPreviewItem> {
+    let first_key = |candidates: &[&str], fallback: &str| -> String {
+        for id in candidates {
+            if let Some(a) = actions.iter().find(|a| a.id == *id)
+                && let Some(k) = a.keys.first()
+            {
+                return k.clone();
+            }
+        }
+        fallback.to_string()
+    };
+    let move_cluster = format!(
+        "{} {} {} {}",
+        first_key(&["INPUT_MOVE_UP_ONLY"], "W"),
+        first_key(&["INPUT_MOVE_LEFT_ONLY"], "A"),
+        first_key(&["INPUT_MOVE_DOWN_ONLY"], "S"),
+        first_key(&["INPUT_MOVE_RIGHT_ONLY"], "D"),
+    );
+    vec![
+        PromptPreviewItem { control: "A".into(), title: "Jump / Confirm".into(), key: first_key(&["INPUT_JUMP", "INPUT_FRONTEND_ACCEPT"], "Space") },
+        PromptPreviewItem { control: "B".into(), title: "Crouch / Back".into(), key: first_key(&["INPUT_DUCK", "INPUT_FRONTEND_CANCEL"], "Ctrl") },
+        PromptPreviewItem { control: "X".into(), title: "Reload / Melee".into(), key: first_key(&["INPUT_RELOAD", "INPUT_MELEE_ATTACK_LIGHT"], "R") },
+        PromptPreviewItem { control: "Y".into(), title: "Enter / Exit".into(), key: first_key(&["INPUT_ENTER", "INPUT_VEH_EXIT"], "F") },
+        PromptPreviewItem { control: "LB".into(), title: "Weapon Wheel".into(), key: first_key(&["INPUT_OPEN_WHEEL_MENU"], "Tab") },
+        PromptPreviewItem { control: "RB".into(), title: "Take Cover".into(), key: first_key(&["INPUT_COVER"], "Q") },
+        PromptPreviewItem { control: "LT".into(), title: "Aim".into(), key: first_key(&["INPUT_AIM"], "RightClick") },
+        PromptPreviewItem { control: "RT".into(), title: "Shoot / Attack".into(), key: first_key(&["INPUT_ATTACK"], "LeftClick") },
+        PromptPreviewItem { control: "L3".into(), title: "Sprint".into(), key: first_key(&["INPUT_SPRINT"], "Shift") },
+        PromptPreviewItem { control: "R3".into(), title: "Look Behind".into(), key: first_key(&["INPUT_LOOK_BEHIND"], "C") },
+        PromptPreviewItem { control: "DRight".into(), title: "Context Action".into(), key: first_key(&["INPUT_CONTEXT"], "E") },
+        PromptPreviewItem { control: "DUp".into(), title: "Phone".into(), key: first_key(&["INPUT_PHONE"], "ArrowUp") },
+        PromptPreviewItem { control: "Menu".into(), title: "Pause".into(), key: first_key(&["INPUT_FRONTEND_PAUSE"], "Esc") },
+        PromptPreviewItem { control: "View".into(), title: "Map / View".into(), key: first_key(&["INPUT_MAP", "INPUT_FRONTEND_SELECT"], "M") },
+        PromptPreviewItem { control: "LS".into(), title: "Move".into(), key: move_cluster },
+        PromptPreviewItem { control: "RS".into(), title: "Camera".into(), key: "Mouse".into() },
+    ]
+}
+
 pub fn load(data_dir: &Path) -> NativeControlsData {
     let path = native_keys_path(data_dir);
     let raw = std::fs::read_to_string(&path).ok();
     let exists = raw.is_some();
-    let text = raw
-        .or_else(|| std::fs::read_to_string(native_defaults_path(data_dir)).ok())
-        .unwrap_or_else(|| DEFAULT_NATIVE_KEYS.to_string());
+    let default_text = std::fs::read_to_string(native_defaults_path(data_dir))
+        .unwrap_or_else(|_| DEFAULT_NATIVE_KEYS.to_string());
+    let default_layout = parse_layout(&default_text);
+    let mut default_keys_by_action: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, entry) in &default_layout {
+        for a in entry.play.iter().chain(entry.menu.iter()) {
+            let list = default_keys_by_action.entry(a.clone()).or_default();
+            if !list.contains(key) {
+                list.push(key.clone());
+            }
+        }
+    }
+
+    let text = raw.unwrap_or(default_text);
     let layout = parse_layout(&text);
 
-    // Collect every action ID: all bound actions + catalog.
+    // Collect every action ID: all bound actions + defaults + catalog.
     let mut all_ids = BTreeSet::new();
     let mut keys_by_action: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (key, entry) in &layout {
@@ -544,6 +611,9 @@ pub fn load(data_dir: &Path) -> NativeControlsData {
             }
         }
     }
+    for a in default_keys_by_action.keys() {
+        all_ids.insert(a.clone());
+    }
     for a in read_catalog(data_dir) {
         all_ids.insert(a);
     }
@@ -552,6 +622,7 @@ pub fn load(data_dir: &Path) -> NativeControlsData {
         .into_iter()
         .map(|id| {
             let keys = keys_by_action.remove(&id).unwrap_or_default();
+            let default_keys = default_keys_by_action.remove(&id).unwrap_or_default();
             let label = pretty_label(&id);
             let category = category_of(&id).to_string();
             let is_menu = is_menu_action(&id);
@@ -561,6 +632,7 @@ pub fn load(data_dir: &Path) -> NativeControlsData {
                 category,
                 is_menu,
                 keys,
+                default_keys,
             }
         })
         .collect();
@@ -572,11 +644,13 @@ pub fn load(data_dir: &Path) -> NativeControlsData {
             .then_with(|| a.label.cmp(&b.label))
     });
 
+    let prompt_preview = compute_prompt_preview(&actions);
     let (mouse_sensitivity, mouse_invert_y) = read_mouse_from_keys_txt(data_dir);
     NativeControlsData {
         path: path.display().to_string(),
         exists,
         actions,
+        prompt_preview,
         mouse_sensitivity,
         mouse_invert_y,
     }
@@ -657,6 +731,24 @@ mod tests {
         let (s2, inv2) = read_mouse_from_keys_txt(&dir);
         assert!((s2 - 0.85).abs() < 0.01);
         assert!(!inv2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn modifier_combos_persist_and_update_prompt_preview() {
+        let dir = std::env::temp_dir().join(format!("vertex-nk-combo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut data = reset(&dir).unwrap();
+        let jump = data.actions.iter_mut().find(|a| a.id == "INPUT_JUMP").unwrap();
+        assert_eq!(jump.default_keys, vec!["Space".to_string()]);
+        jump.keys = vec!["Ctrl+Space".to_string()];
+        save(&dir, &data.actions).unwrap();
+        let reloaded = load(&dir);
+        let jump2 = reloaded.actions.iter().find(|a| a.id == "INPUT_JUMP").unwrap();
+        assert_eq!(jump2.keys, vec!["Ctrl+Space".to_string()]);
+        assert_eq!(jump2.default_keys, vec!["Space".to_string()]);
+        let a_preview = reloaded.prompt_preview.iter().find(|p| p.control == "A").unwrap();
+        assert_eq!(a_preview.key, "Ctrl+Space");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

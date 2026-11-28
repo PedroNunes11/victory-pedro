@@ -182,6 +182,8 @@ pub struct Profile {
     pub lod_bias: Option<f32>,
     /// Native GTA V-style keyboard & mouse controls (`native-keys.txt`).
     pub native_controls: bool,
+    /// In-game Scaleform prompt icons (`"auto"` follows active KB/M vs gamepad, `"keys"`, `"gamepad"`).
+    pub prompt_glyphs: String,
     /// Experimental ray-traced reflection passes (`VICTORY_BVH_MISS` + resolve).
     pub reflections: bool,
 
@@ -245,6 +247,7 @@ impl Default for Profile {
             dlss: DlssMode::Quality,
             lod_bias: None,
             native_controls: true,
+            prompt_glyphs: "auto".into(),
             reflections: false,
             texture_room_percent: 95,
             texture_pool_spares: 8,
@@ -435,6 +438,7 @@ impl Profile {
             "dlss": self.dlss,
             "lod_bias": self.lod_bias,
             "native_controls": self.native_controls,
+            "prompt_glyphs": self.prompt_glyphs,
             "reflections": self.reflections,
             "texture_room_percent": self.texture_room_percent,
             "texture_pool_spares": self.texture_pool_spares,
@@ -607,7 +611,13 @@ impl Profile {
             put("VICTORY_AMBIENT_REFLECT", "0.5");
         }
 
-        // --- Native KB/M Controls ---
+        // --- Native KB/M Controls & Scaleform Prompt Glyphs ---
+        let prompts_mode = match self.prompt_glyphs.trim().to_ascii_lowercase().as_str() {
+            "keys" => "keys",
+            "gamepad" => "gamepad",
+            _ => "auto",
+        };
+        put("VICTORY_PROMPTS", prompts_mode);
         if self.native_controls {
             put("VICTORY_KEYBOARD_EVENTS", "1");
             put("VICTORY_NATIVE_INPUT", "1");
