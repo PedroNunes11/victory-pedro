@@ -591,7 +591,10 @@
       "div",
       { class: "hotkey-pill" },
       icon("controls"),
-      h("span", null, "In-Game Menu: "),
+      h("span", null, "In-Game Controls: "),
+      h("kbd", null, "F1"),
+      h("span", { class: "sep" }, "·"),
+      h("span", null, "Vertex Menu: "),
       h("kbd", null, st.hotkey.spec || "Win+Alt+V"),
       st.hotkey.error && h("span", { class: "badge warn", title: st.hotkey.error }, "Hotkey conflict"),
     );

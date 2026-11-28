@@ -355,6 +355,8 @@ pub const MANAGED: &[&str] = &[
     "VICTORY_SEND_SPARE_MB",
     "VICTORY_STAGING_REST_MS",
     "VICTORY_STAGING_PACK",
+    "VICTORY_CONTROLS_MENU",
+    "VICTORY_DPI_AWARE",
 ];
 
 pub fn pick_dir(chosen: &str, found: &Path) -> Option<(PathBuf, &'static str)> {
@@ -513,6 +515,8 @@ pub fn find_xg_dll_in(root: &Path) -> Option<PathBuf> {
     }
     let direct_candidates = [
         root.join("xg_xs.dll"),
+        root.join("bin").join("Scarlett").join("xg_xs.dll"),
+        root.join("Microsoft GDK").join("bin").join("Scarlett").join("xg_xs.dll"),
         root.join("gxdk").join("bin").join("xg_xs.dll"),
         root.join("xbox").join("bin").join("x64").join("xg_xs.dll"),
         root.join("xbox").join("bin").join("xg_xs.dll"),
@@ -524,8 +528,8 @@ pub fn find_xg_dll_in(root: &Path) -> Option<PathBuf> {
             return Some(cand);
         }
     }
-    // Check 1-level versioned edition subdirectories (e.g. `261000\gxdk\bin\xg_xs.dll`),
-    // preferring the highest edition number first.
+    // Check 1-level versioned edition subdirectories (e.g. `261000\gxdk\bin\xg_xs.dll`
+    // or `261000\Microsoft GDK\bin\Scarlett\xg_xs.dll`), preferring the highest edition first.
     let mut subdirs: Vec<PathBuf> = std::fs::read_dir(root)
         .ok()?
         .flatten()
@@ -535,6 +539,8 @@ pub fn find_xg_dll_in(root: &Path) -> Option<PathBuf> {
     subdirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
     for sub in subdirs {
         for rel in [
+            PathBuf::from("bin").join("Scarlett").join("xg_xs.dll"),
+            PathBuf::from("Microsoft GDK").join("bin").join("Scarlett").join("xg_xs.dll"),
             PathBuf::from("gxdk").join("bin").join("xg_xs.dll"),
             PathBuf::from("xbox").join("bin").join("x64").join("xg_xs.dll"),
             PathBuf::from("xbox").join("bin").join("xg_xs.dll"),
@@ -767,6 +773,7 @@ impl Profile {
 
     /// Environment builder with an explicit DLSS plugin path (testable both with
     /// and without an installed `victory_dlss.dll`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn env_for_with_dlss(
         &self,
         victory_exe: Option<&Path>,
@@ -977,6 +984,8 @@ impl Profile {
             _ => "auto",
         };
         put("VICTORY_PROMPTS", prompts_mode);
+        put("VICTORY_CONTROLS_MENU", "1");
+        put("VICTORY_DPI_AWARE", "1");
         if self.native_controls {
             put("VICTORY_KEYBOARD_EVENTS", "1");
             put("VICTORY_NATIVE_INPUT", "1");

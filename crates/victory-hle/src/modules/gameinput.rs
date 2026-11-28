@@ -44,20 +44,13 @@ const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 const KEYBOARD_KIND: u32 = 0x10;
 const GAMEPAD_KIND: u32 = 0x4_0000;
 /// Device status of a connected device: connected, input enabled.
+///
+/// Note: GTA VI checks for `0x3` (`Connected | InputEnabled`) directly; setting
+/// additional bits such as `GameInputDeviceOutputEnabled` (`0x4`) causes it to
+/// report "Controller Disconnected". Rumble motors are already advertised via
+/// `DeviceInfo::rumble_motors`.
 const STATUS_CONNECTED: u32 = 0x3;
-/// `GameInputDeviceOutputEnabled` (`0x4`): rumble / haptics supported.
-const STATUS_OUTPUT_ENABLED: u32 = 0x4;
-/// Connected gamepad status: connected | input enabled | output enabled.
-const STATUS_GAMEPAD_CONNECTED: u32 = STATUS_CONNECTED | STATUS_OUTPUT_ENABLED;
 const ASYNC_ENUMERATION: u32 = 1;
-
-fn connected_status(index: usize) -> u32 {
-    if index == KEYBOARD {
-        STATUS_CONNECTED
-    } else {
-        STATUS_GAMEPAD_CONNECTED
-    }
-}
 
 /// Gamepad buttons; the title maps each bit to one of its pad buttons.
 const MENU: u32 = 0x1;
@@ -845,12 +838,15 @@ impl State {
         }
         if was != slot.connected {
             tracing::info!(device = index, connected = !was, "input device");
-            let mask = connected_status(index);
-            let (current, previous) = if was { (0, mask) } else { (mask, 0) };
+            let (current, previous) = if was {
+                (0, STATUS_CONNECTED)
+            } else {
+                (STATUS_CONNECTED, 0)
+            };
             events.extend(
                 self.callbacks
                     .iter()
-                    .filter(|r| r.matches(devices, index) && r.status & mask != 0)
+                    .filter(|r| r.matches(devices, index) && r.status & STATUS_CONNECTED != 0)
                     .map(|r| r.event(index, now, current, previous)),
             );
         }
@@ -1159,15 +1155,11 @@ extern "system" fn register_device(
     let mut found = Vec::new();
     {
         let mut state = hub.state();
-        if enumeration != 0 && status & STATUS_GAMEPAD_CONNECTED != 0 {
+        if enumeration != 0 && status & STATUS_CONNECTED != 0 {
             let now = now();
             found = (0..DEVICES)
-                .filter(|&i| {
-                    state.slots[i].connected
-                        && registration.matches(&hub.devices, i)
-                        && (status & connected_status(i)) != 0
-                })
-                .map(|i| registration.event(i, now, connected_status(i), 0))
+                .filter(|&i| state.slots[i].connected && registration.matches(&hub.devices, i))
+                .map(|i| registration.event(i, now, STATUS_CONNECTED, 0))
                 .collect();
         }
         tracing::info!(
@@ -1313,7 +1305,7 @@ extern "system" fn device_status(this: *const Device) -> u32 {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.hub().state().slots[device.index].connected {
-        connected_status(device.index)
+        STATUS_CONNECTED
     } else {
         0
     }
@@ -2135,8 +2127,8 @@ mod tests {
         register(hub, GAMEPAD_KIND, 2, &log);
         // Blocking enumeration ran before registration returned: with no
         // host pad the keyboard's stand-in is the only one.
-        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_GAMEPAD_CONNECTED, 0)]);
-        assert_eq!(device_status(&hub.devices[FALLBACK]), STATUS_GAMEPAD_CONNECTED);
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+        assert_eq!(device_status(&hub.devices[FALLBACK]), STATUS_CONNECTED);
         assert_eq!(device_status(&hub.devices[KEYBOARD]), STATUS_CONNECTED);
 
         host.lock().unwrap().pads[1] = Some(PadState {
@@ -2147,7 +2139,7 @@ mod tests {
         hub.poll();
         assert_eq!(
             log.lock().unwrap()[1..],
-            [(1, STATUS_GAMEPAD_CONNECTED, 0), (FALLBACK, 0, STATUS_GAMEPAD_CONNECTED)]
+            [(1, STATUS_CONNECTED, 0), (FALLBACK, 0, STATUS_CONNECTED)]
         );
 
         let first = current(hub, GAMEPAD_KIND, 1).unwrap();
@@ -2182,7 +2174,7 @@ mod tests {
         hub.poll();
         assert_eq!(
             log.lock().unwrap()[3..],
-            [(1, 0, STATUS_GAMEPAD_CONNECTED), (FALLBACK, STATUS_GAMEPAD_CONNECTED, 0)]
+            [(1, 0, STATUS_CONNECTED), (FALLBACK, STATUS_CONNECTED, 0)]
         );
         assert_eq!(current(hub, GAMEPAD_KIND, 1), Err(DEVICE_DISCONNECTED));
         // The stand-in is back, at rest.
@@ -2373,7 +2365,7 @@ mod tests {
         let (hub, host) = fake_with(true);
         let log = Log::default();
         register(hub, GAMEPAD_KIND, 2, &log);
-        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_GAMEPAD_CONNECTED, 0)]);
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
         let pad = |hub: &Hub| match &hub.state().slots[FALLBACK].history.back().unwrap().value {
             Value::Pad(p) => *p,
             Value::Keys(_) => unreachable!(),
@@ -2410,7 +2402,7 @@ mod tests {
         let token = register(hub, GAMEPAD_KIND, ASYNC_ENUMERATION, &log);
         assert!(log.lock().unwrap().is_empty());
         hub.poll();
-        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_GAMEPAD_CONNECTED, 0)]);
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
 
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
         assert!(unregister(&hub.object, token, 5000));

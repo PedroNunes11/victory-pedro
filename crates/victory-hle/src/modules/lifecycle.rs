@@ -20,6 +20,28 @@ use windows_sys::core::{PCSTR, PCWSTR, w};
 
 use crate::{HleModule, hle_export};
 
+/// Makes the process per-monitor DPI aware (v2) before any window is created,
+/// so Windows display scaling (125% / 150%) does not stretch the game window
+/// or oversize in-game menus (`VICTORY_DPI_AWARE=0` leaves it unaware).
+pub fn pixels_one_for_one() {
+    if std::env::var_os("VICTORY_DPI_AWARE").is_some_and(|v| v == "0") {
+        return;
+    }
+    use windows_sys::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, PROCESS_PER_MONITOR_DPI_AWARE,
+        SetProcessDpiAwareness, SetProcessDpiAwarenessContext,
+    };
+    // SAFETY: standard process-wide DPI awareness opt-in before window creation.
+    let ok = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } != 0;
+    if ok {
+        tracing::info!("process DPI awareness set to Per-Monitor Aware v2");
+    } else {
+        // SAFETY: fallback on older Windows 10 builds.
+        let _ = unsafe { SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE) };
+        tracing::info!("process DPI awareness set to Per-Monitor Aware");
+    }
+}
+
 /// A suspend routine (`quiesced`) or a constrained-change routine
 /// (`constrained`): both take a flag and the title's context.
 type Routine = extern "system" fn(flag: u8, context: *mut c_void);

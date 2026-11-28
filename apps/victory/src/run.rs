@@ -53,6 +53,9 @@ pub fn run(
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
+    // Per-monitor DPI aware before any window exists so Windows display scaling
+    // never stretches the game window or oversizes menus (VICTORY_DPI_AWARE=0 disables).
+    victory_hle::modules::lifecycle::pixels_one_for_one();
     let cfg = victory_core::Config::load()?;
     // `VICTORY_FRAMETIME_DUMP=1`: write beside the rest of Victory's cache.
     if std::env::var_os("VICTORY_FRAMETIME_DUMP").is_some_and(|v| v.to_str() == Some("1")) {
@@ -107,11 +110,14 @@ pub fn run(
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
     victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
-    // The player's keys (`keys.txt` in the data folder), read and written by the Controls menu (F1).
+    // The player's keys (`keys.txt` and `native-keys.txt` in the data folder), read and written by the Controls menu (F1).
     victory_hle::modules::gameinput::binds::use_file(cfg.data_dir.join("keys.txt"));
     victory_game::prompts::bindings::set_data_dir(cfg.data_dir.clone());
     #[cfg(windows)]
-    victory_hle::modules::gameinput::menu::start();
+    {
+        victory_hle::modules::gameinput::menu::use_native_file(cfg.data_dir.join("native-keys.txt"));
+        victory_hle::modules::gameinput::menu::start();
+    }
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
     victory_hle::console::set(match console {
