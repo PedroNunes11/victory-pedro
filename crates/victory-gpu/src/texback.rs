@@ -127,11 +127,54 @@ impl Target {
 /// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
     buffer: ID3D12Resource,
+    total: u64,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
+}
+
+/// Read-back buffer reuse (`VICTORY_TEXBACK_POOL=0` disables; on by default).
+/// Adapted from RECORD_LEAN (`04b90185`): reusing read-back buffers by exact
+/// byte size once their list has run and reset avoids per-copy
+/// `CreateCommittedResource` stalls (~3-4 ms/frame measured).
+fn pool_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXBACK_POOL").is_none_or(|v| v != "0"))
+}
+
+static POOL: Mutex<Option<std::collections::HashMap<u64, Vec<ID3D12Resource>>>> = Mutex::new(None);
+const POOL_PER_SIZE: usize = 16;
+const POOL_BYTES: u64 = 128 << 20;
+static POOL_HELD: AtomicU64 = AtomicU64::new(0);
+
+fn pooled(total: u64) -> Option<ID3D12Resource> {
+    if !pool_on() {
+        return None;
+    }
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let buffer = pool.as_mut()?.get_mut(&total)?.pop()?;
+    POOL_HELD.fetch_sub(total, Ordering::Relaxed);
+    Some(buffer)
+}
+
+/// Returns read-back buffers of a finished, reset list to the pool (bounded
+/// by `POOL_PER_SIZE` per size and `POOL_BYTES` total).
+pub(crate) fn recycle(backs: Vec<Back>) {
+    if backs.is_empty() || !pool_on() {
+        return;
+    }
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let pool = pool.get_or_insert_with(std::collections::HashMap::new);
+    for back in backs {
+        let held = POOL_HELD.load(Ordering::Relaxed);
+        let kept = pool.entry(back.total).or_default();
+        if kept.len() < POOL_PER_SIZE && held.saturating_add(back.total) <= POOL_BYTES {
+            POOL_HELD.fetch_add(back.total, Ordering::Relaxed);
+            kept.push(back.buffer);
+        }
+    }
 }
 
 impl Back {
@@ -177,7 +220,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    let buffer = pooled(total).or_else(|| host.read_back_buffer(total))?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -194,7 +237,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
+    Some(Back { buffer, total, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
 /// Whether texture read-backs are written into title memory by a thread of
@@ -314,41 +357,79 @@ fn write(landing: &Landing) {
     }
 }
 
+struct WriterQueue {
+    /// By title address: the newest landing for that allocation.
+    waiting: std::collections::HashMap<usize, Landing>,
+    /// Range currently being written into title memory by the writer thread.
+    active: Option<(usize, usize)>,
+}
+
 /// The thread that writes read-backs into title memory, and what waits for it.
 struct Writer {
-    /// By title address: the newest landing for that allocation.
-    waiting: Mutex<std::collections::HashMap<usize, Landing>>,
+    queue: Mutex<WriterQueue>,
     more: std::sync::Condvar,
+    done: std::sync::Condvar,
 }
 
 impl Writer {
     fn send(&self, landing: Landing) {
-        let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
-        if waiting.insert(landing.ticket.at, landing).is_some() {
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if q.waiting.insert(landing.ticket.at, landing).is_some() {
             crate::land::count(crate::land::stat::TB_REPLACED, 1);
         }
-        drop(waiting);
+        drop(q);
         self.more.notify_one();
     }
+
+    fn flush_all(&self) {
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        while !q.waiting.is_empty() || q.active.is_some() {
+            q = self.done.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
+
+/// Waits for any queued asynchronous texture read-backs to finish writing into
+/// title memory, ordering subsequent uploads that read those addresses.
+pub(crate) fn flush_async() {
+    if !asynchronous() {
+        return;
+    }
+    if let Some(w) = WRITER_INSTANCE.get().and_then(|o| *o) {
+        w.flush_all();
+    }
+}
+
+static WRITER_INSTANCE: OnceLock<Option<&'static Writer>> = OnceLock::new();
 
 /// The writer, if its thread could be started (if not, landings are written
 /// where they are made, as before).
 fn writer() -> Option<&'static Writer> {
-    static WRITER: OnceLock<Option<&'static Writer>> = OnceLock::new();
-    *WRITER.get_or_init(|| {
-        let writer: &'static Writer =
-            Box::leak(Box::new(Writer { waiting: Mutex::new(std::collections::HashMap::new()), more: std::sync::Condvar::new() }));
+    *WRITER_INSTANCE.get_or_init(|| {
+        let writer: &'static Writer = Box::leak(Box::new(Writer {
+            queue: Mutex::new(WriterQueue {
+                waiting: std::collections::HashMap::new(),
+                active: None,
+            }),
+            more: std::sync::Condvar::new(),
+            done: std::sync::Condvar::new(),
+        }));
         let started = std::thread::Builder::new().name("texture read-backs".into()).spawn(move || loop {
-            let batch: Vec<Landing> = {
-                let mut waiting = writer.waiting.lock().unwrap_or_else(|e| e.into_inner());
-                while waiting.is_empty() {
-                    waiting = writer.more.wait(waiting).unwrap_or_else(|e| e.into_inner());
+            let landing: Landing = {
+                let mut q = writer.queue.lock().unwrap_or_else(|e| e.into_inner());
+                while q.waiting.is_empty() {
+                    q = writer.more.wait(q).unwrap_or_else(|e| e.into_inner());
                 }
-                waiting.drain().map(|(_, landing)| landing).collect()
+                let key = *q.waiting.keys().next().expect("non-empty");
+                let landing = q.waiting.remove(&key).expect("present");
+                q.active = Some((landing.ticket.at, landing.ticket.end));
+                landing
             };
-            for landing in &batch {
-                write(landing);
+            write(&landing);
+            let mut q = writer.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.active = None;
+            if q.waiting.is_empty() {
+                writer.done.notify_all();
             }
         });
         match started {

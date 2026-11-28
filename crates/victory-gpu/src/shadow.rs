@@ -2576,6 +2576,59 @@ fn wc_no_back_min() -> u64 {
     })
 }
 
+/// Whether ranges under [`wc_no_back`] that another host copy also holds
+/// (a view's own copy, a window, or a nested buffer) are still copied back so
+/// those copies stay coherent (`VICTORY_WC_NO_BACK_SHARED=0` disables; on by
+/// default, ported from unify `66f41e05`).
+fn wc_no_back_shared() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK_SHARED").is_none_or(|v| v != "0"))
+}
+
+/// Every host copy of title memory alive now, as `(first, end, id)`.
+fn copies_now() -> Vec<(usize, usize, u64)> {
+    let span = |s: &Shadow| (s.start as usize, (s.start + s.len) as usize, s.id);
+    let mut out: Vec<(usize, usize, u64)> = buffers_read()
+        .values()
+        .filter_map(|e| e.shadow.as_deref())
+        .map(span)
+        .collect();
+    out.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().map(|s| span(s)));
+    out.extend(EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.values().map(|(s, _)| span(s)));
+    out
+}
+
+/// The parts of `ranges` (title addresses, `[from, to)`) that a copy of
+/// `copies` other than `own` holds as well, sorted and merged.
+pub(crate) fn held_elsewhere(
+    copies: &[(usize, usize, u64)],
+    own: u64,
+    ranges: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let mut parts = Vec::new();
+    for &(from, to) in ranges {
+        for &(a, b, id) in copies {
+            if id != own && a < to && b > from {
+                parts.push((a.max(from), b.min(to)));
+            }
+        }
+    }
+    joined(parts)
+}
+
+#[cfg(test)]
+mod held_elsewhere_tests {
+    use super::held_elsewhere;
+
+    #[test]
+    fn only_the_bytes_another_copy_holds_are_kept() {
+        let copies = [(0, 1000, 1), (100, 120, 2), (0, 40, 3), (110, 130, 4), (2000, 3000, 5)];
+        assert_eq!(held_elsewhere(&copies, 1, &[(20, 500)]), [(20, 40), (100, 130)]);
+        assert!(held_elsewhere(&copies, 1, &[(200, 500)]).is_empty());
+        assert_eq!(held_elsewhere(&copies, 2, &[(100, 120)]), [(100, 120)]);
+    }
+}
+
 /// Bytes shaders were declared to write in write-combined copies and that
 /// were left on the card ([`wc_no_back`]), since the last frame-rate line.
 pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
@@ -3860,12 +3913,25 @@ impl Shadow {
         // Write-combined title memory, which the title's CPU does not read
         // (`VICTORY_WC_NO_BACK`, and always for `VICTORY_WC_BAR`'s copies,
         // which the CPU would read through the bus): what shaders write stays
-        // on the card.
+        // on the card, except sub-ranges also held by another host copy
+        // (`held_elsewhere`), which are still copied back for coherence.
         if (self.card.is_some() && wc_no_back() && self.len >= wc_no_back_min() || self.mapped && !self.window)
             && self.write_combined()
         {
             self.written.store(true, Ordering::Relaxed);
-            WC_LEFT.fetch_add(len.min(self.left(address)), Ordering::Relaxed);
+            let span_len = len.min(self.left(address));
+            if self.card.is_some() && !self.mapped && wc_no_back_shared() && span_len > 0 {
+                let start = address as usize;
+                let shared = held_elsewhere(&copies_now(), self.id, &[(start, start + span_len as usize)]);
+                let mut shared_bytes = 0u64;
+                for (a, b) in shared {
+                    list.defer_gpu_write(self, a, b - a);
+                    shared_bytes += (b - a) as u64;
+                }
+                WC_LEFT.fetch_add(span_len.saturating_sub(shared_bytes), Ordering::Relaxed);
+            } else {
+                WC_LEFT.fetch_add(span_len, Ordering::Relaxed);
+            }
             return;
         }
         self.written.store(true, Ordering::Relaxed);

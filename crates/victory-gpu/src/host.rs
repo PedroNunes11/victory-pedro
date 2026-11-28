@@ -2540,6 +2540,7 @@ impl Deferred {
 impl Drop for Deferred {
     fn drop(&mut self) {
         give_chunks(std::mem::take(&mut self.plane_uploads));
+        crate::texback::recycle(std::mem::take(&mut self.texture_backs));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -5762,6 +5763,9 @@ impl Host {
             // comes here, so each still sees title memory, fences and
             // bottom-of-pipe values as after a settle.
             relay_wait(why, |line| line.line.is_empty() && !line.settling);
+            // Also wait for any queued asynchronous texture read-backs so a
+            // subsequent upload reading those addresses sees the finished bytes.
+            crate::texback::flush_async();
             return;
         }
         let was_working = working(true);
