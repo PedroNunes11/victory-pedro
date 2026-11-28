@@ -147,22 +147,33 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
 
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
-/// when free physical RAM is low. Never returns less than 2,000 ms.
+/// when free physical RAM is low.
+///
+/// `VICTORY_RAM_IDLE_MS` may lower or raise the automatic timeout (1,000 to
+/// 60,000 ms). Sweeps still require four unused title frames and that no
+/// command list, descriptor, or submission holds the object, so this only
+/// releases recreatable host shadows.
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
-    let Some(avail) = avail_phys else {
-        return NORMAL_MS;
-    };
-    if avail < 2 * GIB {
-        HIGH_MS
-    } else if avail < 4 * GIB {
-        MODERATE_MS
+    let automatic = if let Some(avail) = avail_phys {
+        if avail < 2 * GIB {
+            HIGH_MS
+        } else if avail < 4 * GIB {
+            MODERATE_MS
+        } else {
+            NORMAL_MS
+        }
     } else {
         NORMAL_MS
-    }
+    };
+    std::env::var("VICTORY_RAM_IDLE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|ms| ms.clamp(1_000, 60_000))
+        .unwrap_or(automatic)
 }
 
 /// How many references are held on a host object (its COM count): ours
