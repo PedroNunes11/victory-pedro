@@ -575,6 +575,71 @@ body.ingame-open .top { top: 48px; }
   border-color: var(--accent); color: #fff;
 }
 .bind-meta { font-size: 11px; color: var(--faint); font-family: "Cascadia Mono", Consolas, monospace; }
-.controls-list { max-height: 420px; overflow-y: auto; padding-right: 4px; }
+.controls-list { max-height: 400px; overflow-y: auto; padding-right: 4px; }
 .nav-item .nav-badge { margin-left: auto; font-size: 9.5px; padding: 1px 6px; }
 .home { max-width: 600px; }
+
+/* Contextual keycap glyphs, prompt preview strip, apply bar & keyboard nav */
+.keycap-glyph {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-family: "Segoe UI", system-ui, sans-serif;
+}
+.keycap-box {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 24px; height: 22px; padding: 0 6px; border-radius: 5px;
+  background: #f4f5f8; color: #11131a;
+  font-weight: 750; font-size: 11.5px; line-height: 1;
+  box-shadow: 0 2px 0 rgba(0, 0, 0, 0.45);
+  letter-spacing: -0.01em;
+}
+.keycap-box.mod {
+  background: #d8c8ff; color: #1c1038; font-size: 10.5px; padding: 0 5px;
+}
+.keycap-box.mouse {
+  padding: 0 4px; gap: 3px;
+}
+.keycap-box svg { width: 14px; height: 16px; display: block; }
+.keycap-plus { font-size: 11px; color: var(--muted); font-weight: 700; padding: 0 1px; }
+
+.prompt-preview {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(156px, 1fr));
+  gap: 8px; margin-bottom: 12px; padding: 10px;
+  border-radius: 12px; background: rgba(0, 0, 0, 0.28); border: 1px solid var(--line);
+}
+.prompt-item {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 5px;
+  padding: 8px 10px; border-radius: 9px;
+  background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.05);
+}
+.prompt-item-info { min-width: 0; width: 100%; }
+.prompt-item-title { font-size: 11.8px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.prompt-item-pad { font-size: 10px; color: var(--faint); font-family: "Cascadia Mono", Consolas, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.apply-bar {
+  position: sticky; bottom: 0; z-index: 5;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 12px; padding: 10px 14px; border-radius: 12px;
+  background: linear-gradient(135deg, rgba(46, 22, 92, 0.96), rgba(24, 14, 48, 0.96));
+  border: 1px solid var(--accent);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55);
+}
+.apply-bar-text { flex: 1; font-size: 12.8px; font-weight: 600; color: #ece6ff; }
+
+.bind.focused {
+  background: rgba(139, 92, 246, 0.14);
+  border-radius: 9px;
+  padding-left: 8px; padding-right: 8px;
+  box-shadow: inset 0 0 0 1px rgba(183, 148, 255, 0.45);
+}
+.bind.modified .bind-name::after {
+  content: " •"; color: var(--accent);
+}
+.capture-preview {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  min-height: 44px; margin: 12px 0 6px;
+  padding: 8px 14px; border-radius: 11px;
+  background: rgba(0, 0, 0, 0.35); border: 1px solid var(--line-strong);
+}
+.nav-hint {
+  font-size: 11.3px; color: var(--faint); margin: 4px 0 8px;
+}

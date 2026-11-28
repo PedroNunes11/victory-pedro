@@ -625,6 +625,13 @@ fn write_native_keys(
 }
 
 #[tauri::command]
+fn preview_prompt_glyphs(
+    actions: Vec<native_keys::NativeAction>,
+) -> Vec<native_keys::PromptPreviewItem> {
+    native_keys::compute_prompt_preview(&actions)
+}
+
+#[tauri::command]
 fn reset_native_keys(app: State<App>) -> R<native_keys::NativeControlsData> {
     native_keys::reset(&resolved_data_dir(&app))
 }
@@ -827,6 +834,7 @@ fn main() {
             doctor,
             read_native_keys,
             write_native_keys,
+            preview_prompt_glyphs,
             reset_native_keys,
             write_mouse_live,
             read_keys,

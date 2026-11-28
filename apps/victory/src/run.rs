@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::{Console, Unimplemented};
+use crate::{Console, Prompts, Unimplemented};
 
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
@@ -42,6 +42,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    prompts: Option<Prompts>,
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -60,7 +61,8 @@ pub fn run(
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    let label = match victory_game::identify(&hash) {
+    let build = victory_game::identify(&hash);
+    let label = match build {
         Some(build) => format!("{} ({hash})", build.label),
         None => format!("unknown ({hash})"),
     };
@@ -107,6 +109,7 @@ pub fn run(
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     // The player's keys (`keys.txt` in the data folder), read and written by the Controls menu (F1).
     victory_hle::modules::gameinput::binds::use_file(cfg.data_dir.join("keys.txt"));
+    victory_game::prompts::bindings::set_data_dir(cfg.data_dir.clone());
     #[cfg(windows)]
     victory_hle::modules::gameinput::menu::start();
     victory_hle::modules::files::mount_at('T', &temp);
@@ -223,6 +226,28 @@ pub fn run(
         }
     }
     show(&exe_name, image.bind_imports(&TakeDispatch(&with_dlls), policy)?);
+    let prompt_mode = match prompts {
+        Some(Prompts::Auto) => victory_core::pad::PromptMode::Auto,
+        Some(Prompts::Keys) => victory_core::pad::PromptMode::Keys,
+        Some(Prompts::Gamepad) => victory_core::pad::PromptMode::Gamepad,
+        None => std::env::var("VICTORY_PROMPTS")
+            .ok()
+            .and_then(|v| victory_core::pad::PromptMode::parse(&v))
+            .unwrap_or(victory_core::pad::PromptMode::Auto),
+    };
+    victory_core::pad::set_prompt_mode(prompt_mode);
+    match prompt_mode {
+        victory_core::pad::PromptMode::Gamepad => {
+            println!("prompts        gamepad icons (VICTORY_PROMPTS=gamepad)");
+        }
+        mode if execute => show_keys_in_prompts(&image, build, mode),
+        mode => {
+            println!(
+                "prompts        {} (hook placed only with --execute)",
+                mode.as_str()
+            );
+        }
+    }
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
@@ -710,7 +735,40 @@ mod cpu_check_tests {
     }
 }
 
+/// Places the Scaleform GFx icon-movie hook so the title shows keyboard key caps
+/// (or switches dynamically between keyboard caps and gamepad icons in `auto` mode).
+#[cfg(windows)]
+fn show_keys_in_prompts(
+    image: &victory_loader::LoadedImage,
+    build: Option<&victory_game::KnownBuild>,
+    mode: victory_core::pad::PromptMode,
+) {
+    let Some(build) = build else {
+        println!("prompts        gamepad pictures: keyboard prompts require a known build");
+        return;
+    };
+    let Some(offsets) = build.key_prompts else {
+        println!(
+            "prompts        gamepad pictures: no prompt hook offsets for {}",
+            build.label
+        );
+        return;
+    };
+    // SAFETY: image is mapped and bound for `build`, and no title thread is running yet.
+    match unsafe { victory_game::prompts::hook::install(image, offsets) } {
+        Ok(()) => println!("prompts        {} (Scaleform GFx hook placed)", mode.as_str()),
+        Err(refused) => println!("prompts        gamepad pictures: {refused}"),
+    }
+}
+
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(
+    _: &Path,
+    _: Unimplemented,
+    _: bool,
+    _: bool,
+    _: Console,
+    _: Option<Prompts>,
+) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

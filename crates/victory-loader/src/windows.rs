@@ -14,6 +14,7 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
 use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
 
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
+use crate::tls::SCN_MEM_EXECUTE;
 use crate::{
     DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, ImportResolver, PreparedImage, Provenance, Resolution,
     prepare,
@@ -182,6 +183,47 @@ impl ImportResolver for WithTitleDlls<'_> {
     }
 }
 
+/// Why an address in an image could not be used for a hook.
+#[derive(Debug, thiserror::Error)]
+pub enum SlotError {
+    #[error("{rva:#x} is outside the image")]
+    OutsideImage { rva: u32 },
+    #[error("the pointer slot at {rva:#x} is not 8-byte aligned")]
+    Misaligned { rva: u32 },
+    #[error("the pointer slot at {rva:#x} is not in a data section")]
+    NotData { rva: u32 },
+    #[error("{rva:#x} is not in a code section")]
+    NotCode { rva: u32 },
+    #[error("the page of the slot at {rva:#x} could not be made writable: {error}")]
+    Unwritable {
+        rva: u32,
+        error: std::io::Error,
+    },
+}
+
+/// Writes an 8-byte pointer at `slot` (at `rva` in the image), making its
+/// page writable for the write and restoring its protection afterward.
+///
+/// # Safety
+/// `slot` is an aligned 8-byte address inside a mapped image and no title
+/// thread is concurrently executing or modifying that page.
+unsafe fn write_slot(slot: *mut usize, rva: u32, value: usize) -> std::result::Result<(), SlotError> {
+    let mut old = 0;
+    // SAFETY: caller guarantees `slot` is 8 bytes inside the mapped image.
+    if unsafe { VirtualProtect(slot as *const c_void, 8, PAGE_READWRITE, &mut old) } == 0 {
+        return Err(SlotError::Unwritable {
+            rva,
+            error: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: page is now writable and slot is 8-byte aligned.
+    unsafe { slot.write_volatile(value) };
+    let mut ignored = 0;
+    // SAFETY: restoring previous page protection.
+    unsafe { VirtualProtect(slot as *const c_void, 8, old, &mut ignored) };
+    Ok(())
+}
+
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
     crate::publish::write_if_changed(path, bytes)
         .with_context(|| format!("publishing {}", path.display()))
@@ -279,24 +321,80 @@ impl LoadedImage {
         Ok(report)
     }
 
+    /// Whether the range `rva..rva + len` lies completely inside a section,
+    /// and if so whether that section is executable (`Some(true)` = code,
+    /// `Some(false)` = data).
+    fn in_code(&self, rva: u32, len: u32) -> Option<bool> {
+        let end = rva.checked_add(len)?;
+        self.info
+            .sections
+            .iter()
+            .find(|section| {
+                let size = section.virtual_size.max(section.file_size);
+                section.rva <= rva
+                    && section
+                        .rva
+                        .checked_add(size)
+                        .is_some_and(|section_end| end <= section_end)
+            })
+            .map(|section| section.characteristics & SCN_MEM_EXECUTE != 0)
+    }
+
+    /// The 8-byte pointer slot at `rva`: aligned, and in a data section.
+    fn pointer_slot(&self, rva: u32) -> std::result::Result<*mut usize, SlotError> {
+        if !rva
+            .checked_add(8)
+            .is_some_and(|end| end <= self.info.size_of_image)
+        {
+            return Err(SlotError::OutsideImage { rva });
+        }
+        if !rva.is_multiple_of(8) {
+            return Err(SlotError::Misaligned { rva });
+        }
+        if self.in_code(rva, 8) != Some(false) {
+            return Err(SlotError::NotData { rva });
+        }
+        Ok((self.base() + rva as usize) as *mut usize)
+    }
+
+    /// The address of the code at `rva`, in a code section.
+    pub fn code_address(&self, rva: u32) -> std::result::Result<usize, SlotError> {
+        if rva >= self.info.size_of_image {
+            return Err(SlotError::OutsideImage { rva });
+        }
+        if self.in_code(rva, 1) != Some(true) {
+            return Err(SlotError::NotCode { rva });
+        }
+        Ok(self.base() + rva as usize)
+    }
+
+    /// The pointer in the slot at `rva`, read before a hook is placed there.
+    ///
+    /// # Safety
+    /// No title thread runs yet, and the slot's page is readable.
+    pub unsafe fn read_pointer(&self, rva: u32) -> std::result::Result<usize, SlotError> {
+        let slot = self.pointer_slot(rva)?;
+        // SAFETY: eight aligned bytes inside the mapped image, checked by `pointer_slot`.
+        Ok(unsafe { slot.read_volatile() })
+    }
+
+    /// Puts `pointer` in the slot at `rva`, for a hook placed before the title runs.
+    ///
+    /// # Safety
+    /// No title thread runs yet: the slot's page is writable until the write is done.
+    pub unsafe fn write_pointer(&self, rva: u32, pointer: usize) -> std::result::Result<(), SlotError> {
+        let slot = self.pointer_slot(rva)?;
+        // SAFETY: aligned slot inside the image; caller guarantees no title thread runs yet.
+        unsafe { write_slot(slot, rva, pointer) }
+    }
+
     /// Protects and restores each slot on its own: import tables can sit in
     /// sections with different protections (delay-load tables in `.didat`).
     fn write_slots(&self, slots: &[(u32, usize)]) -> Result<()> {
         for &(rva, address) in slots {
-            let slot = (self.base() + rva as usize) as *mut u64;
-            let mut old = 0;
-            // SAFETY: the parser only yields slots inside the image.
-            if unsafe { VirtualProtect(slot as *const c_void, 8, PAGE_READWRITE, &mut old) } == 0 {
-                bail!(
-                    "VirtualProtect(IAT slot {rva:#x}) failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            // SAFETY: inside the image, now writable, 8-byte aligned by the PE format.
-            unsafe { slot.write_volatile(address as u64) };
-            let mut ignored = 0;
-            // SAFETY: restoring the protection we just changed.
-            unsafe { VirtualProtect(slot as *const c_void, 8, old, &mut ignored) };
+            let slot = (self.base() + rva as usize) as *mut usize;
+            // SAFETY: the parser only yields slots inside the image, 8-byte aligned by PE.
+            unsafe { write_slot(slot, rva, address) }?;
         }
         Ok(())
     }

@@ -155,10 +155,30 @@ enum Command {
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
+        /// Button prompts shown in the title's UI (`auto` follows active KB/M vs gamepad,
+        /// `keys` forces keyboard key caps, `gamepad` keeps Xbox icons). Overrides `VICTORY_PROMPTS`.
+        #[arg(long, value_enum)]
+        prompts: Option<Prompts>,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
         title_args: Vec<String>,
+    },
+    /// Render the vector keyboard key caps to PNG (dark + transparent), SVG,
+    /// and an HTML preview gallery.
+    #[cfg(windows)]
+    KeyCaps {
+        /// Destination folder (outside the repository).
+        folder: PathBuf,
+        /// Optional `native-keys.txt` to derive prompt bindings from.
+        #[arg(long)]
+        native_keys: Option<PathBuf>,
+        /// Export classic stand-in pad keys instead of PC layout.
+        #[arg(long)]
+        pad: bool,
+        /// Export the complete PC glyph matrix (all key categories & combos).
+        #[arg(long)]
+        all: bool,
     },
     /// Run a captured frame's GPU work again (diagnostics builds; see
     /// docs/replay.md).
@@ -178,6 +198,13 @@ enum Unimplemented {
 enum Console {
     SeriesX,
     SeriesS,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum Prompts {
+    Auto,
+    Keys,
+    Gamepad,
 }
 
 fn main() -> Result<()> {
@@ -240,10 +267,33 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
+            prompts,
             title_args,
         } => {
             victory_hle::runtime::set_title_args(title_args);
-            run::run(&exe, unimplemented, strict, execute, console)
+            run::run(&exe, unimplemented, strict, execute, console, prompts)
+        }
+        #[cfg(windows)]
+        Command::KeyCaps {
+            folder,
+            native_keys,
+            pad,
+            all,
+        } => {
+            victory_core::ensure_outside_repo(&folder)?;
+            let written = if all {
+                victory_game::prompts::export::write_all(&folder)?
+            } else {
+                let bindings = if let Some(path) = native_keys {
+                    let text = std::fs::read_to_string(&path)?;
+                    victory_game::prompts::bindings::PromptBindings::from_native_keys(&text)
+                } else {
+                    victory_game::prompts::bindings::PromptBindings::defaults(!pad)
+                };
+                victory_game::prompts::export::write(&folder, &bindings)?
+            };
+            println!("wrote {} key-cap files to {}", written.len(), folder.display());
+            Ok(())
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
