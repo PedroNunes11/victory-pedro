@@ -29,6 +29,13 @@ const ALLOWED_NAMES: &[&str] = &[
 ];
 // The benchmark documentation still goes through every content check below.
 const ALLOWED_DOCUMENTATION: &[&str] = &["docs/.nojekyll", "docs/index.html"];
+// The desktop launcher's handwritten UI files (text-only; every content check below still applies).
+const ALLOWED_LAUNCHER_UI: &[&str] = &[
+    "apps/vertex-launcher/ui/app.js",
+    "apps/vertex-launcher/ui/index.html",
+    "apps/vertex-launcher/ui/strings.js",
+    "apps/vertex-launcher/ui/style.css",
+];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
 const EXCEPTIONS: &[(&str, &str)] = &[(
@@ -152,6 +159,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     let allowed = ALLOWED_NAMES.contains(&name)
         || ALLOWED_DOCUMENTATION.contains(&path)
+        || ALLOWED_LAUNCHER_UI.contains(&path)
         || ext
             .as_deref()
             .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
