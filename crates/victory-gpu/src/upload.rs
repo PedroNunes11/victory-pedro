@@ -243,7 +243,24 @@ impl Upload {
         }
         let blocks = n.max(ARENA / BLOCK);
         let bytes = blocks.checked_mul(BLOCK)?;
-        let at = reserve(bytes)?;
+        let Some(at) = reserve(bytes) else {
+            // If [4 GiB, 2^37) is exhausted (e.g. NVIDIA DLSS/Streamline
+            // mappings), returning `None` makes the title abort with
+            // "D3D12 XDXR Error: Failed to allocate upload buffer". Fall back
+            // to process heap memory so execution continues.
+            static FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let k = FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if k <= 8 || k.is_power_of_two() {
+                tracing::warn!(
+                    bytes,
+                    fallbacks = k,
+                    error = %std::io::Error::last_os_error(),
+                    "no room for lists' upload memory below 2^37: falling back to process heap"
+                );
+            }
+            drop(_grow);
+            return Some(Upload(Kind::Heap(vec![0; len])));
+        };
         crate::shadow::register(at, at as u64, bytes as u64);
         tracing::info!(at = format_args!("{at:#x}"), bytes, "memory for lists' uploads, where shaders reach it by address");
         let mut slots = vec![Slot::FREE; blocks];

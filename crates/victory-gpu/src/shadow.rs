@@ -2585,35 +2585,130 @@ fn wc_no_back_shared() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK_SHARED").is_none_or(|v| v != "0"))
 }
 
-/// Every host copy of title memory alive now, as `(first, end, id)`.
-fn copies_now() -> Vec<(usize, usize, u64)> {
-    let span = |s: &Shadow| (s.start as usize, (s.start + s.len) as usize, s.id);
-    let mut out: Vec<(usize, usize, u64)> = buffers_read()
+/// Monotonic generation bumped (while holding the map's write lock) whenever
+/// a live host copy is added to or removed from [`BUFFERS`], [`LOOSE`], or
+/// [`EXACT`].
+static COPIES_GEN: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn copies_changed() {
+    COPIES_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Cached augmented interval tree of all live host copies, sorted by
+/// `(start, end, id)` with `entry.3 = subtree_max_end`.
+///
+/// Built lazily when [`COPIES_GEN`] advances; hot-path queries in
+/// [`Shadow::gpu_writes`] take only a shared read lock, touch zero mutexes,
+/// and perform an `O(log N + K)` lookup with zero heap allocations when no
+/// other copy overlaps.
+struct CopiesTree {
+    epoch: u64,
+    entries: Vec<(usize, usize, u64, usize)>,
+}
+
+static COPIES_SNAP: std::sync::RwLock<CopiesTree> = std::sync::RwLock::new(CopiesTree {
+    epoch: 0,
+    entries: Vec::new(),
+});
+
+fn build_max_end(entries: &mut [(usize, usize, u64, usize)]) -> usize {
+    if entries.is_empty() {
+        return 0;
+    }
+    let mid = entries.len() / 2;
+    let left_max = build_max_end(&mut entries[..mid]);
+    let right_max = build_max_end(&mut entries[mid + 1..]);
+    let max_end = entries[mid].1.max(left_max).max(right_max);
+    entries[mid].3 = max_end;
+    max_end
+}
+
+fn query_overlaps(
+    entries: &[(usize, usize, u64, usize)],
+    own: u64,
+    from: usize,
+    to: usize,
+    out: &mut Vec<(usize, usize)>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let mid = entries.len() / 2;
+    let (a, b, id, max_end) = entries[mid];
+    if max_end <= from {
+        return;
+    }
+    query_overlaps(&entries[..mid], own, from, to, out);
+    if id != own && a < to && b > from {
+        out.push((a.max(from), b.min(to)));
+    }
+    if a < to {
+        query_overlaps(&entries[mid + 1..], own, from, to, out);
+    }
+}
+
+/// Every host copy of title memory alive now, as an augmented interval tree.
+fn rebuild_copies_tree() -> CopiesTree {
+    let epoch = COPIES_GEN.load(Ordering::SeqCst);
+    let span = |s: &Shadow| (s.start as usize, (s.start + s.len) as usize, s.id, 0usize);
+    let mut entries: Vec<(usize, usize, u64, usize)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref())
         .map(span)
         .collect();
-    out.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().map(|s| span(s)));
-    out.extend(EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.values().map(|(s, _)| span(s)));
-    out
+    entries.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().map(|s| span(s)));
+    entries.extend(EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.values().map(|(s, _)| span(s)));
+    entries.sort_unstable_by_key(|&(a, b, id, _)| (a, b, id));
+    build_max_end(&mut entries);
+    CopiesTree { epoch, entries }
+}
+
+/// The parts of `[from, to)` that another live host copy (with `id != own`)
+/// holds as well, sorted and merged. Fast path uses the cached [`COPIES_SNAP`]
+/// interval tree under a shared read lock without heap allocation on misses.
+fn held_elsewhere_now(own: u64, from: usize, to: usize) -> Vec<(usize, usize)> {
+    if from >= to {
+        return Vec::new();
+    }
+    let current_epoch = COPIES_GEN.load(Ordering::SeqCst);
+    {
+        let snap = COPIES_SNAP.read().unwrap_or_else(|e| e.into_inner());
+        if snap.epoch == current_epoch {
+            let mut parts = Vec::new();
+            query_overlaps(&snap.entries, own, from, to, &mut parts);
+            return if parts.len() <= 1 { parts } else { joined(parts) };
+        }
+    }
+    let built = rebuild_copies_tree();
+    let mut parts = Vec::new();
+    query_overlaps(&built.entries, own, from, to, &mut parts);
+    let mut snap = COPIES_SNAP.write().unwrap_or_else(|e| e.into_inner());
+    if built.epoch > snap.epoch {
+        *snap = built;
+    }
+    if parts.len() <= 1 { parts } else { joined(parts) }
 }
 
 /// The parts of `ranges` (title addresses, `[from, to)`) that a copy of
 /// `copies` other than `own` holds as well, sorted and merged.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn held_elsewhere(
     copies: &[(usize, usize, u64)],
     own: u64,
     ranges: &[(usize, usize)],
 ) -> Vec<(usize, usize)> {
+    let mut entries: Vec<(usize, usize, u64, usize)> =
+        copies.iter().map(|&(a, b, id)| (a, b, id, 0)).collect();
+    entries.sort_unstable_by_key(|&(a, b, id, _)| (a, b, id));
+    build_max_end(&mut entries);
     let mut parts = Vec::new();
     for &(from, to) in ranges {
-        for &(a, b, id) in copies {
-            if id != own && a < to && b > from {
-                parts.push((a.max(from), b.min(to)));
-            }
+        if from < to {
+            query_overlaps(&entries, own, from, to, &mut parts);
         }
     }
-    joined(parts)
+    if parts.len() <= 1 { parts } else { joined(parts) }
 }
 
 #[cfg(test)]
@@ -2626,6 +2721,33 @@ mod held_elsewhere_tests {
         assert_eq!(held_elsewhere(&copies, 1, &[(20, 500)]), [(20, 40), (100, 130)]);
         assert!(held_elsewhere(&copies, 1, &[(200, 500)]).is_empty());
         assert_eq!(held_elsewhere(&copies, 2, &[(100, 120)]), [(100, 120)]);
+    }
+
+    #[test]
+    fn nested_large_heap_and_many_copies_match_linear_scan() {
+        // One giant 1 GiB heap + hundreds of nested/adjacent buffers.
+        let mut copies = vec![(0x1_0000_0000usize, 0x1_4000_0000usize, 1u64)];
+        for i in 0..500usize {
+            let a = 0x1_0000_0000 + i * 0x10_0000;
+            copies.push((a, a + 0x4_0000, (i + 2) as u64));
+        }
+        // Query inside the giant heap covering a sub-range overlapping 3 small copies.
+        let got = held_elsewhere(&copies, 1, &[(0x1_0022_0000, 0x1_0045_0000)]);
+        assert_eq!(
+            got,
+            [
+                (0x1_0022_0000, 0x1_0024_0000),
+                (0x1_0030_0000, 0x1_0034_0000),
+                (0x1_0040_0000, 0x1_0044_0000),
+            ]
+        );
+        // Query completely outside all small copies (only `own = 1` covers it).
+        assert!(held_elsewhere(&copies, 1, &[(0x1_0025_0000, 0x1_002f_0000)]).is_empty());
+        // Query for a small copy sees the enclosing giant heap.
+        assert_eq!(
+            held_elsewhere(&copies, 2, &[(0x1_0000_0000, 0x1_0004_0000)]),
+            [(0x1_0000_0000, 0x1_0004_0000)]
+        );
     }
 }
 
@@ -3678,38 +3800,42 @@ pub(crate) fn let_go_idle() {
             }
         }
     }
-    let gone: Vec<Arc<Shadow>> = {
-        // Held from the look to the removal: `loose` hands a copy out
-        // under the same lock, so none is handed out in between.
-        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-        if map.is_empty() {
-            return;
-        }
-        let mut eligible: Vec<(u64, (u64, u64), usize, u64, bool)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(&key, s)| {
-                let used = s.used.load(Ordering::Relaxed);
-                let due = crate::host::long_ago(used, due_ms, IDLE_FRAMES);
-                (used, key, Arc::as_ptr(s) as usize, copy_bytes(s), due)
-            })
-            .collect();
-        eligible.sort_unstable_by_key(|&(used, ..)| used);
-        let victims = if keep == u64::MAX {
-            (0..eligible.len()).collect()
-        } else {
-            let entries: Vec<(u64, usize, bool)> = eligible
+        let gone: Vec<Arc<Shadow>> = {
+            // Held from the look to the removal: `loose` hands a copy out
+            // under the same lock, so none is handed out in between.
+            let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+            if map.is_empty() {
+                return;
+            }
+            let mut eligible: Vec<(u64, (u64, u64), usize, u64, bool)> = map
                 .iter()
-                .map(|&(_, _, id, bytes, due)| (bytes, id, due))
+                .filter(|(_, s)| {
+                    Arc::strong_count(s) == 1
+                        && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                        && crate::host::references(&s.buffer) == 1
+                })
+                .map(|(&key, s)| {
+                    let used = s.used.load(Ordering::Relaxed);
+                    let due = crate::host::long_ago(used, due_ms, IDLE_FRAMES);
+                    (used, key, Arc::as_ptr(s) as usize, copy_bytes(s), due)
+                })
                 .collect();
-            window_victims(&entries, loose_bytes(map.values()), keep)
+            eligible.sort_unstable_by_key(|&(used, ..)| used);
+            let victims = if keep == u64::MAX {
+                (0..eligible.len()).collect()
+            } else {
+                let entries: Vec<(u64, usize, bool)> = eligible
+                    .iter()
+                    .map(|&(_, _, id, bytes, due)| (bytes, id, due))
+                    .collect();
+                window_victims(&entries, loose_bytes(map.values()), keep)
+            };
+            let removed: Vec<Arc<Shadow>> = victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect();
+            if !removed.is_empty() {
+                copies_changed();
+            }
+            removed
         };
-        victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
-    };
     if !gone.is_empty() {
         let [went, span, owned] = let_go_tally(gone.iter().map(|s| (s.len, copy_bytes(s))));
         for (counter, value) in LET_GO.iter().zip([went, span, owned]) {
@@ -3922,7 +4048,7 @@ impl Shadow {
             let span_len = len.min(self.left(address));
             if self.card.is_some() && !self.mapped && wc_no_back_shared() && span_len > 0 {
                 let start = address as usize;
-                let shared = held_elsewhere(&copies_now(), self.id, &[(start, start + span_len as usize)]);
+                let shared = held_elsewhere_now(self.id, start, start + span_len as usize);
                 let mut shared_bytes = 0u64;
                 for (a, b) in shared {
                     list.defer_gpu_write(self, a, b - a);
@@ -5764,6 +5890,7 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
     let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
     // What threads remember of it ([`FOUND`]) is of before.
     BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+    copies_changed();
     map
 }
 
@@ -5867,6 +5994,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .map(|(key, _)| *key)
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        if !gone.is_empty() {
+            copies_changed();
+        }
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
@@ -6325,6 +6455,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        copies_changed();
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
@@ -6338,6 +6469,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        copies_changed();
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -6376,6 +6508,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    copies_changed();
     Some(shadow)
 }
 
@@ -6424,11 +6557,15 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return Some(shadow.clone());
     }
     if map.len() >= MANY {
+        let before = map.len();
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
         map.retain(|_, (shadow, used)| {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
+        if map.len() != before {
+            copies_changed();
+        }
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
@@ -6436,6 +6573,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     map.insert((address, len), (shadow.clone(), now));
+    copies_changed();
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)

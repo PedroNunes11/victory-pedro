@@ -887,10 +887,10 @@ pub fn format(dxgi: u32) -> Option<Format> {
         1..=4 => (16, 1, false),
         9..=18 => (8, 1, false),
         19..=22 | 44..=47 => (4, 1, true),
-        23..=43 | 67 | 87..=93 | 116 | 117 => (4, 1, false),
+        23..=43 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1, false),
         48..=59 | 85 | 86 | 115 => (2, 1, false),
         118..=120 => (2, 1, true),
-        60..=65 => (1, 1, false),
+        60..=65 | 190 => (1, 1, false),
         70..=72 | 79..=81 => (8, 4, false),
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
         _ => return None,
@@ -1949,6 +1949,13 @@ mod tests {
         let l = Layout::new(&desc(64, 64, 1, 4, Swizzle::SW_4KB_R_X)).unwrap();
         assert!(!l.addressable());
         assert_eq!(l.offset(0, 0, 0, 0), Err(Error::Unsupported));
+    }
+
+    #[test]
+    fn xbox_extended_dxgi_formats_have_layouts() {
+        assert_eq!(format(189), Some(Format { bytes: 4, block: 1, stencil: false }));
+        assert_eq!(format(190), Some(Format { bytes: 1, block: 1, stencil: false }));
+        assert_eq!(format(191), Some(Format { bytes: 4, block: 1, stencil: false }));
     }
 
     /// Detile speed per mode on one core:

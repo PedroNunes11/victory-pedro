@@ -247,7 +247,8 @@ pub extern "system" fn XDspSubmitCommand(
         let (input, output) = unsafe {
             (std::slice::from_raw_parts(command.input, samples), std::slice::from_raw_parts_mut(command.output, samples))
         };
-        convolver.process(input, output, command.gains[0] * gain());
+        let scale = gain();
+        convolver.process(input, output, command.gains[0] * scale, command.gains[1] * scale);
     } else if !command.output.is_null() {
         // SAFETY: the title's output buffer holds one block of the stream.
         unsafe { std::ptr::write_bytes(command.output, 0, samples) };

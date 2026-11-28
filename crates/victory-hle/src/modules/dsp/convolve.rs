@@ -125,8 +125,10 @@ impl Convolver {
         })
     }
 
-    /// One block: 1024 input samples in, 1024 output samples out, times `gain`.
-    pub(super) fn process(&mut self, input: &[f32], output: &mut [f32], gain: f32) {
+    /// One block: 1024 input samples in, 1024 output samples out, linearly
+    /// ramped from `begin_gain` at sample 0 to `end_gain` at sample 1024
+    /// (matching `XDSP_CONVOLUTION_COMMAND`'s `beginScale` / `endScale`).
+    pub(super) fn process(&mut self, input: &[f32], output: &mut [f32], begin_gain: f32, end_gain: f32) {
         let silent = input.iter().all(|&v| v == 0.0 || !v.is_finite());
         self.quiet = if silent { self.quiet.saturating_add(1) } else { 0 };
         self.head = (self.head + 1) % self.parts;
@@ -168,9 +170,17 @@ impl Convolver {
         }
         yi[0] = 0.0;
         fft().run(&mut yr, &mut yi, true);
-        let scale = gain / N as f32;
-        for (o, &v) in output.iter_mut().zip(&yr[B..]) {
-            *o = v * scale;
+        let inv_n = 1.0 / N as f32;
+        if (end_gain - begin_gain).abs() <= f32::EPSILON {
+            let scale = begin_gain * inv_n;
+            for (o, &v) in output.iter_mut().zip(&yr[B..]) {
+                *o = v * scale;
+            }
+        } else {
+            let step = (end_gain - begin_gain) / output.len().max(1) as f32;
+            for (i, (o, &v)) in output.iter_mut().zip(&yr[B..]).enumerate() {
+                *o = v * (begin_gain + step * i as f32) * inv_n;
+            }
         }
     }
 }
@@ -212,7 +222,7 @@ mod tests {
         let input: Vec<f32> = (0..B * 5).map(|i| ((i * 13 % 29) as f32 - 14.0) / 20.0).collect();
         let mut got = vec![0f32; B * 5];
         for (i, o) in input.chunks(B).zip(got.chunks_mut(B)) {
-            c.process(i, o, 1.0);
+            c.process(i, o, 1.0, 1.0);
         }
         for n in 0..B * 5 {
             let want: f32 = (0..=n).filter(|&m| n - m < ir.len()).map(|m| input[m] * ir[n - m]).sum();
@@ -221,11 +231,25 @@ mod tests {
     }
 
     #[test]
+    fn ramps_gain_linearly_from_begin_to_end() {
+        let mut ir = vec![0.0f32; B];
+        ir[0] = 1.0;
+        let mut c = Convolver::new(&layout(&ir)).unwrap();
+        let input = vec![1.0f32; B];
+        let mut out = vec![0.0f32; B];
+        c.process(&input, &mut out, 0.25, 0.75);
+        for (i, &v) in out.iter().enumerate() {
+            let expected = 0.25 + (0.75 - 0.25) * (i as f32 / B as f32);
+            assert!((v - expected).abs() < 2e-3, "sample {i}: {v} vs {expected}");
+        }
+    }
+
+    #[test]
     fn a_silent_ring_gives_silence() {
         let mut c = Convolver::new(&layout(&[1.0, 0.5])).unwrap();
         let mut out = vec![1f32; B];
         for _ in 0..4 {
-            c.process(&[0.0; B], &mut out, 1.0);
+            c.process(&[0.0; B], &mut out, 1.0, 1.0);
         }
         assert!(out.iter().all(|&v| v == 0.0));
     }

@@ -119,8 +119,20 @@ unsafe impl Send for Memory {}
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
+/// `VICTORY_SEND_SPARE_MB=<n>` caps kept spare upload buffers in MiB
+/// (unset: 256 MiB with [`on_card`], else 768 MiB).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    static MOST: OnceLock<Option<u64>> = OnceLock::new();
+    let most = *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_SEND_SPARE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if let Some(mb) = mb {
+            tracing::info!(mb, "send buffers: at most {mb} MiB kept spare (VICTORY_SEND_SPARE_MB)");
+        }
+        mb.map(|mb| mb << 20)
+    });
+    most.unwrap_or(if on_card() { 256 << 20 } else { 768 << 20 })
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through

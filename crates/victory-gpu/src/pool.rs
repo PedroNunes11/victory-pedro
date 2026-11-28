@@ -191,6 +191,8 @@ pub(crate) struct Piece {
 struct Block<B> {
     memory: B,
     free: Ranges,
+    /// Bytes currently free in `free` (used by `pack` to prefer the fullest block).
+    room: u64,
     /// The end of the highest piece ever taken: above it the memory is as
     /// it was made (zeros).
     used_to: u64,
@@ -210,11 +212,25 @@ struct Pool<B> {
     spare: usize,
     most: usize,
     retry_growth_at: u64,
+    /// When true, prefer the fullest block that fits so sparse blocks empty
+    /// and can be returned to the OS (`VICTORY_STAGING_PACK=1`).
+    pack: bool,
+    /// Milliseconds a returned piece rests before reuse (`REST`, or
+    /// `VICTORY_STAGING_REST_MS` for the staging pool).
+    rest: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool {
+            blocks: Vec::new(),
+            resting: VecDeque::new(),
+            spare: 0,
+            most,
+            retry_growth_at: 0,
+            pack: false,
+            rest: REST,
+        }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -240,13 +256,37 @@ impl<B: Clone> Pool<B> {
         }
         self.rested(now);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
+        if self.pack {
+            // Pick the fullest ripe block that has room so sparse blocks drain.
+            let mut order: Vec<(u64, usize)> = self
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| {
+                    let b = b.as_ref()?;
+                    (ripe.is(b) && b.room >= len).then_some((b.room, i))
+                })
+                .collect();
+            order.sort_unstable();
+            for (_, i) in order {
+                if let Some(block) = self.blocks[i].as_mut()
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    block.room = block.room.saturating_sub(len);
+                    found = Some((i, start));
+                    break;
+                }
+            }
+        } else {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    block.room = block.room.saturating_sub(len);
+                    found = Some((i, start));
+                    break;
+                }
             }
         }
         if found.is_none() && ripe.ahead > 0 {
@@ -254,7 +294,12 @@ impl<B: Clone> Pool<B> {
             let mut unripe: Vec<(u64, usize)> =
                 self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
             unripe.sort_unstable();
-            found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
+            found = unripe.into_iter().find_map(|(_, i)| {
+                let block = self.blocks[i].as_mut()?;
+                let start = block.free.take(len, align)?;
+                block.room = block.room.saturating_sub(len);
+                Some((i, start))
+            });
         }
         // A failed 64 MiB block must not trigger another driver call for each
         // small texture. Existing free ranges remain usable during backoff.
@@ -263,7 +308,10 @@ impl<B: Clone> Pool<B> {
             None => {
                 let memory = self.grow(now, &mut make)?;
                 let i = self.add(memory, ripe.started);
-                (i, self.blocks[i].as_mut()?.free.take(len, align)?)
+                let block = self.blocks[i].as_mut()?;
+                let start = block.free.take(len, align)?;
+                block.room = block.room.saturating_sub(len);
+                (i, start)
             }
         };
         if ripe.ahead > 0 {
@@ -305,12 +353,12 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), room: BLOCK, used_to: 0, made, since: crate::host::now_ms() });
         i
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
-        self.resting.push_back((now + REST, piece));
+        self.resting.push_back((now + self.rest, piece));
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
@@ -327,6 +375,7 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
+                block.room = block.room.saturating_add(piece.len).min(BLOCK);
                 any |= block.free.whole(BLOCK);
             }
         }
@@ -388,6 +437,21 @@ impl Drop for StagingPiece {
     }
 }
 
+fn staging_rest() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_REST_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(REST, |ms| ms.clamp(50, 10_000))
+    })
+}
+
+fn staging_pack() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_PACK").is_some_and(|v| v == "1"))
+}
+
 /// `bytes` of upload memory, all zeros: the buffer it lies in, where in
 /// that buffer, and its mapping. `None`: not pooled.
 pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
@@ -396,7 +460,12 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let mut pool = lock(&STAGING);
+    pool.rest = staging_rest();
+    if staging_pack() {
+        pool.pack = true;
+    }
+    let taken = pool.take(bytes, 512, now(), || {
         // Only gate speculative bindless prefetch on staging-pool growth
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
@@ -407,7 +476,9 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         let (buffer, data) = host.upload_buffer(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
-    })?;
+    });
+    drop(pool);
+    let (piece, memory, again) = taken?;
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
@@ -831,6 +902,36 @@ mod tests {
         assert!(pool.take(BLOCK, 65536, 30, make).is_none());
         let mut none: Pool<u32> = Pool::new(SPARE);
         assert!(none.take(65536, 65536, 0, || None).is_none());
+    }
+
+    #[test]
+    fn shorter_rest_and_packing_drain_sparse_staging_blocks() {
+        let mut pool: Pool<u32> = Pool::new(0);
+        pool.rest = 250;
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let (a, _, _) = pool.take(BLOCK / 2, 512, 0, make).unwrap();
+        let (b, _, _) = pool.take(BLOCK / 2, 512, 0, make).unwrap();
+        let (c, _, _) = pool.take(BLOCK / 4, 512, 0, make).unwrap();
+        assert_eq!((a.block, b.block, c.block), (0, 0, 1));
+        pool.give(a, 100);
+        // Still resting at +249 ms -> takes from block 1; ready at +250 ms -> reuses block 0.
+        let (d, _, _) = pool.take(BLOCK / 4, 512, 349, make).unwrap();
+        assert_eq!(d.block, 1);
+        let (e, _, again) = pool.take(BLOCK / 4, 512, 350, make).unwrap();
+        assert_eq!((e.block, e.start, again), (0, 0, true));
+        // With packing enabled, block 0 (3/4 full) is preferred over block 1 (1/2 full).
+        pool.pack = true;
+        let (f, _, _) = pool.take(BLOCK / 8, 512, 400, make).unwrap();
+        assert_eq!(f.block, 0);
+        // Once block 1's pieces return and rest, it is freed.
+        pool.give(c, 500);
+        pool.give(d, 500);
+        pool.rested(750);
+        assert_eq!(pool.blocks(), 1);
     }
 
     #[test]

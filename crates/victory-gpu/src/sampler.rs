@@ -134,10 +134,16 @@ pub(crate) fn aniso_point_mip(device: &ID3D12Device) -> bool {
     })
 }
 
-/// Maps a console address mode (`1..=5`) to host D3D12, falling back to `CLAMP`.
+/// Maps a console address mode (`1..=8`) to host D3D12, falling back to `CLAMP`.
+///
+/// Xbox extends standard D3D12 address modes `1..=5` with:
+/// - `6` (`HALF_BORDER`) -> `BORDER` (nearest host equivalent),
+/// - `7` (`MIRROR_ONCE_BORDER`) and `8` (`MIRROR_ONCE_HALF_BORDER`) -> `MIRROR_ONCE`.
 fn address_mode(mode: u32) -> D3D12_TEXTURE_ADDRESS_MODE {
     match mode {
         1..=5 => D3D12_TEXTURE_ADDRESS_MODE(mode as i32),
+        6 => D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+        7 | 8 => D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
         _ => D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
     }
 }
@@ -199,6 +205,13 @@ mod tests {
         );
         w[16] = 1;
         assert_eq!(console(&w, true).Filter.0, 0x5);
+
+        // Xbox extended address modes 6 (HALF_BORDER), 7 (MIRROR_ONCE_BORDER), 8 (MIRROR_ONCE_HALF_BORDER).
+        w[6..9].copy_from_slice(&[6, 7, 8]);
+        let ext = console(&w, true);
+        assert_eq!(ext.AddressU, D3D12_TEXTURE_ADDRESS_MODE_BORDER);
+        assert_eq!(ext.AddressV, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE);
+        assert_eq!(ext.AddressW, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE);
     }
 
     /// Anisotropic samplers keep their mip filter: point mips where the
