@@ -1,5 +1,6 @@
-//! Vertex Launcher v3: streamlined UI for Vertex-AXX with working Graphics
-//! modes, GTA V-style Native Controls editor, shader cache warmer, and a
+//! Vertex Launcher: unified desktop frontend for the Vertex engine with
+//! Performance / Balanced / High Quality / 4K Native modes, GTA VI PC
+//! Controls & Scaleform vector prompt glyphs, shader cache warmer, and a
 //! global `Win+Alt+V` (customizable) In-Game Menu overlay.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -485,6 +486,7 @@ fn warm_signature(p: &Profile, victory: &std::path::Path) -> String {
         "preset": p.preset,
         "output_resolution": p.output_resolution,
         "dlss": p.dlss,
+        "render_scale": p.render_scale,
         "console": p.console,
         "reflections": p.reflections,
     })
@@ -578,7 +580,7 @@ fn command_preview(app: State<App>) -> R<String> {
     let profile = app.profile();
     let victory = app
         .victory()
-        .unwrap_or_else(|_| PathBuf::from("vertex-axx.exe"));
+        .unwrap_or_else(|_| PathBuf::from("victory.exe"));
     let data_dir = resolved_data_dir(&app);
     let game = PathBuf::from(if profile.game_exe.trim().is_empty() {
         "master.exe"

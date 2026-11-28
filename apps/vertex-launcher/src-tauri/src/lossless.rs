@@ -16,7 +16,7 @@ use crate::settings::Lossless;
 
 pub const STEAM_APP: &str = "993090";
 pub const EXE: &str = "LosslessScaling.exe";
-const DEFAULT_FOLDER: &str = r"D:\SteamLibrary\steamapps\common\Lossless Scaling";
+const DEFAULT_FOLDER: &str = r"C:\Program Files (x86)\Steam\steamapps\common\Lossless Scaling";
 /// The name a new profile gets.
 const TITLE: &str = "Vertex";
 

@@ -1,6 +1,6 @@
-//! Runs `vertex-axx.exe` / `vertex.exe` / `victory.exe` for Play, Pipeline
-//! Warming (`warm --used`), Shader Pre-Translation (`shaders`), and Config
-//! check (`config`).
+//! Runs the unified Vertex engine (`vertex.exe` / `victory.exe` / `vertex-axx.exe`)
+//! for Play, Pipeline Warming (`warm --used`), Shader Pre-Translation (`shaders`),
+//! and Config check (`config`).
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::process::CommandExt;
@@ -16,11 +16,6 @@ use crate::settings::Profile;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const TAIL_LINES: usize = 200;
 const TAIL_BYTES: u64 = 48 * 1024;
-const FALLBACK_DIRS: &[&str] = &[
-    r"D:\dev\Vertex-AXX\bin",
-    r"D:\dev\unify\target-integ\diag",
-    r"D:\dev\unify\target\release",
-];
 pub const WARM_PIPELINES_MB: u64 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -54,7 +49,7 @@ pub struct Found {
     pub how: &'static str,
 }
 
-pub const ENGINE_EXES: [&str; 3] = ["vertex-axx.exe", "vertex.exe", "victory.exe"];
+pub const ENGINE_EXES: [&str; 3] = ["vertex.exe", "victory.exe", "vertex-axx.exe"];
 
 /// The engine in `dir`: the first of [`ENGINE_EXES`] there, by that order alone. Not the newest
 /// file: a test build copied beside the engine (or a touched backup) must never take over a run.
@@ -89,17 +84,15 @@ fn search_victory(here: Option<&Path>) -> Found {
             return found(p, "beside");
         }
         for dir in here.ancestors() {
-            if let Some(p) = engine_in(&dir.join("target-integ").join("diag")) {
-                return found(p, "release");
+            if let Some(p) = engine_in(&dir.join("target").join("diag")) {
+                return found(p, "diag");
             }
             if let Some(p) = engine_in(&dir.join("target").join("release")) {
                 return found(p, "release");
             }
-        }
-    }
-    for dir in FALLBACK_DIRS {
-        if let Some(p) = engine_in(Path::new(dir)) {
-            return found(p, "fallback");
+            if let Some(p) = engine_in(&dir.join("bin")) {
+                return found(p, "beside");
+            }
         }
     }
     Found {
@@ -109,7 +102,7 @@ fn search_victory(here: Option<&Path>) -> Found {
 }
 
 pub fn workdir(victory: &Path) -> PathBuf {
-    // If inside `Vertex-AXX\bin\vertex-axx.exe`, workdir is `Vertex-AXX`.
+    // If inside `<install>\bin\vertex.exe` (or `victory.exe` / `vertex-axx.exe`), workdir is `<install>`.
     if let Some(parent) = victory.parent()
         && parent.file_name().is_some_and(|n| n.eq_ignore_ascii_case("bin"))
         && let Some(root) = parent.parent()

@@ -1,6 +1,6 @@
-// Vertex Launcher v3 (Vertex-AXX Edition)
-// - Real Performance / Balanced / High Quality modes
-// - GTA V-style Native Controls Menu (live reload in <=1 s)
+// Vertex Launcher
+// - Working Performance / Balanced / High Quality / 4K Native modes (DLSS & native fallback)
+// - GTA VI PC Native Controls Menu + Scaleform vector keyboard glyphs (live reload in <=1 s)
 // - Win+Alt+V global In-Game Menu with Live vs Requires-Restart enforcement
 "use strict";
 
@@ -664,6 +664,8 @@
     }));
 
     const biasVal = p.lod_bias != null ? p.lod_bias : (p.dlss === "quality" ? -0.58 : p.dlss === "balanced" ? -0.79 : p.dlss === "performance" ? -1.0 : 0.0);
+    const scaleVal = p.render_scale != null ? p.render_scale : (p.preset === "high-quality" || p.preset === "native-4k" ? 1.0 : 0.6667);
+    const dlssActive = p.dlss !== "off" && st.dlssAvailable;
 
     return h(
       "div",
@@ -677,6 +679,16 @@
         G.dlssTip,
         !st.dlssAvailable && notice("warn", G.dlssMissing),
         tiles(dlssOpts, p.dlss, (v) => { p.dlss = v; p.lod_bias = null; changed(true, true); }),
+        !dlssActive && settingRow(
+          G.renderScale,
+          rb,
+          seg([
+            ["58%", Math.abs(scaleVal - 0.58) < 0.02, () => { p.render_scale = 0.58; changed(true, true); }],
+            ["67% (Default)", Math.abs(scaleVal - 0.6667) < 0.02, () => { p.render_scale = 0.6667; changed(true, true); }],
+            ["85%", Math.abs(scaleVal - 0.85) < 0.02, () => { p.render_scale = 0.85; changed(true, true); }],
+            ["100% Native", scaleVal >= 0.99, () => { p.render_scale = 1.0; changed(true, true); }],
+          ]),
+        ),
         sliderRow({
           triple: G.lodBias,
           value: biasVal,
@@ -1480,6 +1492,14 @@
           onCommit: (v) => { p.texture_partial_frames = v; changed(true, true); },
         }),
         sliderRow({
+          triple: E.stageMs,
+          value: p.texture_stage_ms || 16,
+          min: 4, max: 40, step: 2, unit: S.common.ms,
+          badges: rb,
+          onInput: (v) => { p.texture_stage_ms = v; },
+          onCommit: (v) => { p.texture_stage_ms = v; changed(true, true); },
+        }),
+        sliderRow({
           triple: E.poolSpares,
           value: p.texture_pool_spares,
           min: 2, max: 32, step: 2, unit: "{v} blocks",
@@ -1504,8 +1524,10 @@
           [h("span", { class: "badge ok" }, "-10 ms stall"), rb],
           seg([1, 2, 3].map((n) => [String(n), p.submit_frames === n, () => { p.submit_frames = n; changed(true, true); }])),
         ),
+        boolSetting(E.joinBarriers, p.join_barriers !== false, (v) => { p.join_barriers = v; changed(true, true); }, [h("span", { class: "badge ok" }, "-2.4 ms"), rb]),
         boolSetting(E.wideCopy, p.wide_copy, (v) => { p.wide_copy = v; changed(true, true); }, rb),
         boolSetting(E.portJournal, p.port_journal, (v) => { p.port_journal = v; changed(true, true); }, rb),
+        boolSetting(E.dredLight, p.dred_light !== false, (v) => { p.dred_light = v; changed(true, true); }, rb),
       ),
       card(
         E.vramCard,

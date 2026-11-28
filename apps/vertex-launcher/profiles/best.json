@@ -1,6 +1,6 @@
 {
-  "updated": "2026-11-27",
-  "about": "Measured Vertex-AXX profiles (AnyXboxX + Vertex + Victory-NVIDIA). Modes set real VICTORY_OUTPUT, DLSS SR, LOD bias, honest title memory reporting, wide copies, 64-shard journal, and SUBMIT_FRAMES=2.",
+  "updated": "2026-11-28",
+  "about": "Measured Vertex profiles for the unified engine. Modes set real VICTORY_OUTPUT, DLSS SR or native VICTORY_RENDER_SCALE, LOD bias, honest title memory reporting, barrier coalescing, wide copies, 64-shard journal, and SUBMIT_FRAMES=2.",
   "entries": [
     {
       "id": "rtx5070-12gb-9950x3d",
@@ -19,13 +19,13 @@
         "VICTORY_TEXTURE_ROOM_PERCENT": "95",
         "VICTORY_TEXTURE_POOL_SPARES": "8",
         "VICTORY_TEXTURE_PARTIAL_FRAMES": "6",
+        "VICTORY_TEXTURE_STAGE_MS": "16",
         "VICTORY_TITLE_USED_MB": "title",
         "VICTORY_WIDE_COPY": "1",
         "VICTORY_PORT_JOURNAL": "1",
+        "VICTORY_JOIN_BARRIERS": "1",
         "VICTORY_SUBMIT_FRAMES": "2"
       },
-      "cache_dir": "D:\\dev\\Vertex-AXX\\cache",
-      "data_dir": "D:\\dev\\Vertex-AXX\\data",
       "lossless": {
         "multiplier": 2,
         "flow_scale": 75,
@@ -38,12 +38,12 @@
         "run": 47,
         "fps_median": 22.0,
         "pc": "RTX 5070 12 GB, Ryzen 9 9950X3D, 32 GB RAM",
-        "note": "Vertex-AXX 1440p DLSS Quality + streaming & submission upgrades (25-30 fps in Performance 1080p)"
+        "note": "Balanced 1440p DLSS Quality (25-30 fps in Performance 1080p)"
       }
     },
     {
-      "id": "rtx5070-12gb-generic",
-      "pc": "12 GB NVIDIA GPU, 32 GB RAM",
+      "id": "gpu-12gb-balanced",
+      "pc": "12 GB GPU, 32 GB RAM (Balanced 1440p)",
       "match": {
         "vram_gb": 12,
         "ram_gb": 32
@@ -56,13 +56,13 @@
         "VICTORY_TEXTURE_ROOM_PERCENT": "95",
         "VICTORY_TEXTURE_POOL_SPARES": "8",
         "VICTORY_TEXTURE_PARTIAL_FRAMES": "6",
+        "VICTORY_TEXTURE_STAGE_MS": "16",
         "VICTORY_TITLE_USED_MB": "title",
         "VICTORY_WIDE_COPY": "1",
         "VICTORY_PORT_JOURNAL": "1",
+        "VICTORY_JOIN_BARRIERS": "1",
         "VICTORY_SUBMIT_FRAMES": "2"
       },
-      "cache_dir": "D:\\dev\\Vertex-AXX\\cache",
-      "data_dir": "D:\\dev\\Vertex-AXX\\data",
       "lossless": {
         "multiplier": 2,
         "flow_scale": 75,
@@ -74,8 +74,81 @@
       "measured": {
         "run": 47,
         "fps_median": 22.0,
-        "pc": "12 GB NVIDIA GPU, 32 GB RAM",
-        "note": "Vertex-AXX Balanced 1440p DLSS Quality"
+        "pc": "12 GB GPU, 32 GB RAM",
+        "note": "Balanced 1440p (1707x960 internal)"
+      }
+    },
+    {
+      "id": "gpu-8gb-performance",
+      "pc": "8 GB GPU (Performance 1080p)",
+      "match": {
+        "vram_gb": 8
+      },
+      "console": "series-x",
+      "work": "balanced",
+      "preset": "performance",
+      "env": {
+        "VICTORY_OUTPUT": "1920x1080",
+        "VICTORY_TEXTURE_ROOM_PERCENT": "90",
+        "VICTORY_TEXTURE_POOL_SPARES": "6",
+        "VICTORY_TEXTURE_PARTIAL_FRAMES": "12",
+        "VICTORY_TEXTURE_STAGE_MS": "12",
+        "VICTORY_TITLE_USED_MB": "title",
+        "VICTORY_WIDE_COPY": "1",
+        "VICTORY_PORT_JOURNAL": "1",
+        "VICTORY_JOIN_BARRIERS": "1",
+        "VICTORY_D3D12_DRED": "0",
+        "VICTORY_SUBMIT_FRAMES": "2"
+      },
+      "lossless": {
+        "multiplier": 2,
+        "flow_scale": 75,
+        "max_frame_latency": 1,
+        "auto_scale": true,
+        "auto_scale_delay": 10,
+        "draw_fps": true
+      },
+      "measured": {
+        "run": 47,
+        "fps_median": 26.0,
+        "pc": "8-10 GB GPU (Performance 1080p)",
+        "note": "Performance 1080p with lighter VRAM budgets and DRED off"
+      }
+    },
+    {
+      "id": "gpu-16gb-high-quality",
+      "pc": "16+ GB GPU (High Quality Native 1440p)",
+      "match": {
+        "vram_gb": 16
+      },
+      "console": "series-x",
+      "work": "balanced",
+      "preset": "high-quality",
+      "env": {
+        "VICTORY_OUTPUT": "2560x1440",
+        "VICTORY_TEXTURE_ROOM_PERCENT": "96",
+        "VICTORY_TEXTURE_POOL_SPARES": "12",
+        "VICTORY_TEXTURE_PARTIAL_FRAMES": "4",
+        "VICTORY_TEXTURE_STAGE_MS": "20",
+        "VICTORY_TITLE_USED_MB": "title",
+        "VICTORY_WIDE_COPY": "1",
+        "VICTORY_PORT_JOURNAL": "1",
+        "VICTORY_JOIN_BARRIERS": "1",
+        "VICTORY_SUBMIT_FRAMES": "2"
+      },
+      "lossless": {
+        "multiplier": 2,
+        "flow_scale": 75,
+        "max_frame_latency": 1,
+        "auto_scale": true,
+        "auto_scale_delay": 10,
+        "draw_fps": true
+      },
+      "measured": {
+        "run": 47,
+        "fps_median": 20.0,
+        "pc": "16+ GB GPU",
+        "note": "High Quality 1440p Native (1.0x render scale / DLAA)"
       }
     }
   ]

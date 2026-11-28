@@ -1,6 +1,6 @@
-//! Hardware-aware Auto Tune for Vertex-AXX: picks real resolution, DLSS mode,
-//! VRAM pool limits, and texture sharpness based on the detected GPU, VRAM,
-//! RAM, CPU threads, and monitor resolution.
+//! Hardware-aware Auto Tune for Vertex: picks real resolution, render scale,
+//! DLSS mode, VRAM pool limits, and texture sharpness based on the detected
+//! GPU, VRAM, RAM, CPU threads, and monitor resolution.
 
 use serde::Serialize;
 use serde_json::{Map, Value};
