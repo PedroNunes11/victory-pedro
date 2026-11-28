@@ -472,6 +472,9 @@ pub(crate) fn behind_line(frames: f64) {
     if behind::on() {
         crate::list::thin::line(frames);
         behind::line(frames);
+    } else {
+        crate::overlay::set_pool_off(crate::overlay::Pool::Submit);
+        crate::overlay::set_pool_off(crate::overlay::Pool::Thin);
     }
 }
 

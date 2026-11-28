@@ -34,6 +34,8 @@ mod copystat;
 mod faultbook;
 #[cfg(windows)]
 mod cores;
+#[cfg(windows)]
+mod cpucores;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]

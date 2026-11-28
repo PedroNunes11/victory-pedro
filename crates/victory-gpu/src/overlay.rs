@@ -21,7 +21,12 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcess
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+use crate::cpucores::CpuMeter;
 use crate::pixels::{Bitmap, short_cpu, short_gpu};
+
+mod pools;
+use pools::PoolFigures;
+pub(crate) use pools::{Pool, set_pool, set_pool_off, set_pool_threads};
 
 /// Frames per second and ms per frame, times 100, from the present path's one-second meter.
 static FPS_X100: AtomicU64 = AtomicU64::new(0);
@@ -53,6 +58,11 @@ pub(crate) struct Stats {
     /// Of the last thirty seconds of that meter's frame rates: the highest, the lowest and the
     /// mean (none before there are two).
     half_minute: Option<(f64, f64, f64)>,
+    /// Each logical CPU's busy percent (empty before the second sample).
+    cores: Vec<f32>,
+    /// Our worker pools (`pools::POOLS` order) and the pipelines being made now.
+    pools: [PoolFigures; 4],
+    making: u64,
 }
 
 /// Draws per frame, times 100, and the meter's last thirty frame rates (one a second).
@@ -91,6 +101,11 @@ pub(crate) fn snapshot() -> Option<Stats> {
     (s.fps, s.ms) = frame_figures();
     (s.draws, s.half_minute) = more_figures();
     Some(s)
+}
+
+/// Milliseconds per frame, from the present path's meter (0 before the first second).
+pub(crate) fn frame_ms() -> f64 {
+    MS_X100.load(Ordering::Relaxed) as f64 / 100.0
 }
 
 fn frame_figures() -> (f64, f64) {
@@ -235,7 +250,7 @@ fn cpu_name() -> String {
 const MB: f64 = 1024.0 * 1024.0;
 const GB: f64 = MB * 1024.0;
 
-fn sample(cpu: &mut Cpu, gpu: Option<&mut Gpu3d>, adapter: Option<&IDXGIAdapter3>, names: &(String, String)) -> Stats {
+fn sample(cpu: &mut Cpu, cores: &mut CpuMeter, gpu: Option<&mut Gpu3d>, adapter: Option<&IDXGIAdapter3>, names: &(String, String)) -> Stats {
     // SAFETY: plain structs filled by the calls.
     let (working, used, total) = unsafe {
         let mut pm = std::mem::zeroed::<PROCESS_MEMORY_COUNTERS_EX>();
@@ -254,7 +269,11 @@ fn sample(cpu: &mut Cpu, gpu: Option<&mut Gpu3d>, adapter: Option<&IDXGIAdapter3
     };
     let (fps, ms) = frame_figures();
     let (draws, half_minute) = more_figures();
+    cores.sample();
     Stats {
+        cores: cores.cores_pct.clone(),
+        pools: pools::read_all(),
+        making: crate::pipeline::making(),
         draws,
         half_minute,
         fps,
@@ -451,6 +470,51 @@ fn fps_colour(fps: f64) -> [u8; 3] {
     }
 }
 
+/// One line of the panel's body.
+enum Item {
+    Row(&'static str, String),
+    /// One thin bar per logical CPU, as tall as its busy percent.
+    Cores,
+    /// A small heading over a group of rows.
+    Header(&'static str),
+}
+
+/// A bar's colour by load.
+fn load_colour(pct: f32) -> [u8; 3] {
+    if pct < 50.0 {
+        [96, 220, 130]
+    } else if pct < 80.0 {
+        [250, 204, 70]
+    } else {
+        [255, 98, 88]
+    }
+}
+
+/// The bar's filled height in pixels out of `h`: at least one pixel for any load above zero.
+fn bar_height(pct: f32, h: i32) -> i32 {
+    if pct <= 0.0 || h <= 0 {
+        return 0;
+    }
+    ((pct.min(100.0) / 100.0 * h as f32).round() as i32).clamp(1, h)
+}
+
+/// The panel's rows, in order: the figures, the per-core bars under CPU, then the pools.
+fn body_items(stats: &Stats, figures: Vec<(&'static str, String)>) -> Vec<Item> {
+    let mut items = Vec::new();
+    for (label, value) in figures {
+        items.push(Item::Row(label, value));
+        if label == "CPU" && !stats.cores.is_empty() {
+            items.push(Item::Cores);
+        }
+    }
+    items.push(Item::Header("Threads"));
+    for pool in pools::POOLS {
+        let figures = stats.pools[pool as usize];
+        items.push(Item::Row(pools::pool_label(pool), pools::pool_value(pool, figures, stats.making)));
+    }
+    items
+}
+
 /// Draws the panel for a frame `frame_h` pixels tall: a premultiplied RGBA bitmap, sized to its
 /// content. The overlay window and the screenshot both call this, so they look alike.
 pub(crate) fn render(stats: &Stats, frame_h: usize) -> Option<Bitmap> {
@@ -460,7 +524,7 @@ pub(crate) fn render(stats: &Stats, frame_h: usize) -> Option<Bitmap> {
     let (pad, gap) = (px(12.0), px(10.0));
     let pct = |p: f64| format!("{p:.0}%");
     let rate = |r: f64| if r < 10.0 { format!("{r:.1} fps") } else { format!("{r:.0} fps") };
-    let rows: Vec<(&str, String)> = vec![
+    let figures: Vec<(&'static str, String)> = vec![
         ("30 s high", stats.half_minute.map_or("...".into(), |(high, _, _)| rate(high))),
         ("30 s low", stats.half_minute.map_or("...".into(), |(_, low, _)| rate(low))),
         ("30 s avg", stats.half_minute.map_or("...".into(), |(_, _, mean)| format!("{mean:.1} fps"))),
@@ -470,6 +534,7 @@ pub(crate) fn render(stats: &Stats, frame_h: usize) -> Option<Bitmap> {
         ("RAM", format!("{:.1} GB  \u{b7}  {:.1} / {:.0} GB", stats.ram.0, stats.ram.1, stats.ram.2)),
         ("VRAM", stats.vram.map_or("n/a".into(), |(u, b)| format!("{u:.1} / {b:.1} GB"))),
     ];
+    let items = body_items(stats, figures);
     let hardware = [
         short_cpu(&stats.cpu_name),
         short_gpu(&stats.gpu_name),
@@ -479,14 +544,29 @@ pub(crate) fn render(stats: &Stats, frame_h: usize) -> Option<Bitmap> {
     let ms_text = format!("{:.1} ms", stats.ms);
     // Width: the widest line, with at least a comfortable minimum.
     let top = g.measure(BIG, &fps_text).0 + px(6.0) + g.measure(SMALL, "FPS").0 + gap * 2 + g.measure(VALUE, &ms_text).0;
-    let body = rows.iter().map(|(l, v)| g.measure(ROW, l).0 + gap * 2 + g.measure(ROW, v).0);
+    let (bar_min, bar_gap) = (px(3.0), px(2.0));
+    let cores_min = stats.cores.len() as i32 * (bar_min + bar_gap);
+    let body = items.iter().filter_map(|it| match it {
+        Item::Row(l, v) => Some(g.measure(ROW, l).0 + gap * 2 + g.measure(ROW, v).0),
+        Item::Cores => Some(cores_min),
+        Item::Header(_) => None,
+    });
     let foot = hardware.iter().map(|t| g.measure(SMALL, t).0);
     let inner = body.chain(foot).chain([top]).max().unwrap_or(0).max(px(190.0));
     let (w, row_h) = (inner + 2 * pad, g.measure(ROW, "Ag").1 + px(3.0));
     let big_h = g.measure(BIG, "0").1;
     let small_h = g.measure(SMALL, "Ag").1 + px(1.0);
     let sep = px(9.0);
-    let h = pad + big_h + sep + rows.len() as i32 * row_h + sep + hardware.len() as i32 * small_h + pad - px(1.0);
+    let (bars_h, header_h) = (px(18.0) + px(4.0), small_h + px(7.0));
+    let body_h: i32 = items
+        .iter()
+        .map(|it| match it {
+            Item::Row(..) => row_h,
+            Item::Cores => bars_h,
+            Item::Header(_) => header_h,
+        })
+        .sum();
+    let h = pad + big_h + sep + body_h + sep + hardware.len() as i32 * small_h + pad - px(1.0);
     let mut bm = Bitmap::new(w as usize, h as usize);
     bm.fill_round((0, 0, w as usize, h as usize), 10.0 * s, BG, 218);
 
@@ -505,10 +585,23 @@ pub(crate) fn render(stats: &Stats, frame_h: usize) -> Option<Bitmap> {
     };
     line(&mut bm, y);
     y += sep - sep / 2;
-    for (label, value) in &rows {
-        g.draw(&mut bm, ROW, label, pad, y, DIM);
-        g.draw(&mut bm, ROW, value, right(ROW, value), y, WHITE);
-        y += row_h;
+    for item in &items {
+        match item {
+            Item::Row(label, value) => {
+                g.draw(&mut bm, ROW, label, pad, y, DIM);
+                g.draw(&mut bm, ROW, value, right(ROW, value), y, WHITE);
+                y += row_h;
+            }
+            Item::Cores => {
+                draw_cores(&mut bm, &stats.cores, (pad, y + px(2.0)), (inner, px(18.0)), (bar_min, bar_gap));
+                y += bars_h;
+            }
+            Item::Header(text) => {
+                line(&mut bm, y + px(3.0));
+                g.draw(&mut bm, SMALL, text, pad, y + px(5.0), DIMMER);
+                y += header_h;
+            }
+        }
     }
     y += sep / 2 - 1;
     line(&mut bm, y);
@@ -518,6 +611,29 @@ pub(crate) fn render(stats: &Stats, frame_h: usize) -> Option<Bitmap> {
         y += small_h;
     }
     Some(bm)
+}
+
+/// Draws one thin vertical bar per core in a `(width, height)` box at `(x, y)`: a faint track and
+/// the load filled from the bottom. Bars are as wide as fit (at least `min_w`), `gap` apart.
+fn draw_cores(bm: &mut Bitmap, cores: &[f32], (x, y): (i32, i32), (w, h): (i32, i32), (min_w, gap): (i32, i32)) {
+    let n = cores.len() as i32;
+    if n == 0 {
+        return;
+    }
+    let bar_w = ((w - gap * (n - 1)) / n).max(min_w).max(1);
+    for (i, &pct) in cores.iter().enumerate() {
+        let bx = x + i as i32 * (bar_w + gap);
+        let filled = bar_height(pct, h);
+        for dy in 0..h {
+            let (rgb, a) = if dy >= h - filled { (load_colour(pct), 255) } else { ([255, 255, 255], 22) };
+            for dx in 0..bar_w {
+                let (px, py) = (bx + dx, y + dy);
+                if px >= 0 && py >= 0 && (px as usize) < bm.w && (py as usize) < bm.h {
+                    bm.over(px as usize, py as usize, rgb, a);
+                }
+            }
+        }
+    }
 }
 
 /// Sets the layered window's picture and position in one go.
@@ -624,24 +740,27 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
         let mut cpu = Cpu(0, 0);
         cpu.percent();
         let mut gpu = Gpu3d::new();
+        let mut cores = CpuMeter::default();
+        cores.sample();
         let (mut f10, mut f12) = (false, false);
         SetTimer(window, REFRESH, 500, None);
         SetTimer(window, KEYS, 40, None);
-        let refresh = |cpu: &mut Cpu, gpu: &mut Option<Gpu3d>| {
-            let stats = sample(cpu, gpu.as_mut(), adapter.as_ref(), &names);
+        let refresh = |cpu: &mut Cpu, cores: &mut CpuMeter, gpu: &mut Option<Gpu3d>| {
+            let stats = sample(cpu, cores, gpu.as_mut(), adapter.as_ref(), &names);
             *STATS.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats.clone());
             // (local) The panel's figures in the log every 5 s, so they can be read without the screen.
             static TICKS: AtomicU64 = AtomicU64::new(0);
             if TICKS.fetch_add(1, Ordering::Relaxed) % 10 == 0 {
                 let s = &stats;
                 tracing::info!(
-                    "overlay: {:.1} fps {:.1} ms, cpu {:.0}%, gpu {}, ram {:.1}/{:.1} GB (process {:.1}), vram {}, {:.0} draws, 30 s {}",
+                    "overlay: {:.1} fps {:.1} ms, cpu {:.0}%, gpu {}, ram {:.1}/{:.1} GB (process {:.1}), vram {}, {:.0} draws, 30 s {}, threads: {}",
                     s.fps, s.ms, s.cpu,
                     s.gpu.map_or("?".into(), |g| format!("{g:.0}%")),
                     s.ram.1, s.ram.2, s.ram.0,
                     s.vram.map_or("?".into(), |(u, b)| format!("{u:.1}/{b:.1} GB")),
                     s.draws,
                     s.half_minute.map_or("...".into(), |(h, l, m)| format!("high {h:.1} low {l:.1} avg {m:.1}")),
+                    pools::threads_summary(&s.pools, s.making, &s.cores),
                 );
             }
             let mut client = std::mem::zeroed::<RECT>();
@@ -662,12 +781,12 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
             present(window, &bm, at);
             SetWindowPos(window, HWND_TOPMOST, at.x, at.y, bm.w as i32, bm.h as i32, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         };
-        refresh(&mut cpu, &mut gpu);
+        refresh(&mut cpu, &mut cores, &mut gpu);
         let mut msg = std::mem::zeroed::<MSG>();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
             if msg.message == WM_TIMER && msg.hwnd == window {
                 if msg.wParam == REFRESH {
-                    refresh(&mut cpu, &mut gpu);
+                    refresh(&mut cpu, &mut cores, &mut gpu);
                 } else {
                     // Edge-triggered: acts on the press, not the hold.
                     let down = |vk| GetAsyncKeyState(vk) < 0;
@@ -675,7 +794,7 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
                     let front = ours_in_front();
                     if front && d10 && !f10 {
                         VISIBLE.fetch_xor(true, Ordering::Relaxed);
-                        refresh(&mut cpu, &mut gpu);
+                        refresh(&mut cpu, &mut cores, &mut gpu);
                     }
                     if front && d12 && !f12 {
                         crate::screenshot::request();
@@ -693,6 +812,53 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bar_height_is_proportional_with_a_one_pixel_floor() {
+        assert_eq!(bar_height(0.0, 18), 0);
+        assert_eq!(bar_height(0.4, 18), 1);
+        assert_eq!(bar_height(50.0, 18), 9);
+        assert_eq!(bar_height(100.0, 18), 18);
+        assert_eq!(bar_height(250.0, 18), 18);
+        assert_eq!(bar_height(50.0, 0), 0);
+    }
+
+    #[test]
+    fn bars_are_coloured_by_load() {
+        assert_eq!(load_colour(10.0), [96, 220, 130]);
+        assert_eq!(load_colour(60.0), [250, 204, 70]);
+        assert_eq!(load_colour(95.0), [255, 98, 88]);
+    }
+
+    #[test]
+    fn cores_row_sits_under_cpu_and_threads_rows_follow() {
+        let stats = Stats { cores: vec![10.0; 24], ..Stats::default() };
+        let figures = vec![("CPU", "5%".to_owned()), ("GPU", "n/a".to_owned())];
+        let items = body_items(&stats, figures);
+        assert!(matches!(items[0], Item::Row("CPU", _)));
+        assert!(matches!(items[1], Item::Cores));
+        assert!(matches!(items[2], Item::Row("GPU", _)));
+        assert!(matches!(items[3], Item::Header("Threads")));
+        assert_eq!(items.len(), 4 + pools::POOLS.len());
+    }
+
+    #[test]
+    fn no_core_sample_means_no_bars_row() {
+        let items = body_items(&Stats::default(), vec![("CPU", "5%".to_owned())]);
+        assert!(!items.iter().any(|i| matches!(i, Item::Cores)));
+    }
+
+    #[test]
+    fn draw_cores_fills_from_the_bottom() {
+        let mut bm = Bitmap::new(20, 10);
+        draw_cores(&mut bm, &[100.0, 0.0], (0, 0), (20, 10), (3, 2));
+        let alpha = |x: usize, y: usize| bm.px[(y * bm.w + x) * 4 + 3];
+        assert_eq!(alpha(0, 0), 255);
+        assert_eq!(alpha(0, 9), 255);
+        // The second bar is only a faint track.
+        let second = alpha(9 + 2, 9);
+        assert!(second > 0 && second < 100, "{second}");
+    }
 
     #[test]
     fn with_utf16_matches_encode_utf16_for_stack_and_heap_paths() {

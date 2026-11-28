@@ -941,6 +941,8 @@ pub(super) fn present(
 pub(super) fn line(frames: f64) {
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64).collect();
     let ms = |i: usize| s[i] / 1000.0 / frames;
+    // The overlay: what the one submission thread worked, of the frame's time.
+    crate::overlay::set_pool(crate::overlay::Pool::Submit, ms(BUSY), crate::overlay::frame_ms(), 1);
     tracing::info!(
         "submissions prepared by a thread of ours, per frame (VICTORY_ASYNC_SUBMIT): {:.1} in {:.1} presents, {:.1} in the line \
          when one was added (at most {:.0}); that thread worked {:.1} ms; threads of the title waited {:.1} ms for room in the \

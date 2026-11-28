@@ -163,6 +163,14 @@ pub(crate) fn log(frames: f64) {
         );
     }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    // The overlay: merging's time on all threads over the time until its last job was done (a
+    // second without merging has no figure).
+    if on() {
+        let (all, wall) = if s[stat::JOBS] > 0.0 { (s[stat::CARD_ALL] / 1000.0, s[stat::CARD] / 1000.0) } else { (0.0, 0.0) };
+        crate::overlay::set_pool(crate::overlay::Pool::Land, all, wall, threads());
+    } else {
+        crate::overlay::set_pool_off(crate::overlay::Pool::Land);
+    }
     if s[stat::PIECES] == 0.0 && s[stat::REST] == 0.0 {
         return;
     }

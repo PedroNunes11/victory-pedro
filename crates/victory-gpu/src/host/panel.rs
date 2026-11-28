@@ -17,6 +17,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::{Host, HostList, transition};
+use crate::cpucores::CpuMeter;
 
 mod gpu_load;
 
@@ -351,71 +352,6 @@ fn system_memory() -> (u64, u64, u64, u64) {
         m.ullTotalPageFile.saturating_sub(m.ullAvailPageFile),
         m.ullTotalPageFile,
     )
-}
-
-/// Per-logical-CPU utilization tracker via `NtQuerySystemInformation(8)`.
-#[derive(Default)]
-struct CpuMeter {
-    prev: Vec<(i64, i64)>,
-    total_pct: f32,
-    cores_pct: Vec<f32>,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct SysProcPerfInfo {
-    idle: i64,
-    kernel: i64,
-    user: i64,
-    dpc: i64,
-    interrupt: i64,
-    interrupt_count: u32,
-    _pad: u32,
-}
-
-impl CpuMeter {
-    fn sample(&mut self) {
-        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-        type NtQuery = unsafe extern "system" fn(u32, *mut u8, u32, *mut u32) -> i32;
-        static FN: OnceLock<Option<NtQuery>> = OnceLock::new();
-        let query = *FN.get_or_init(|| unsafe {
-            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
-            if ntdll.is_null() {
-                return None;
-            }
-            let p = GetProcAddress(ntdll, c"NtQuerySystemInformation".as_ptr().cast())?;
-            Some(std::mem::transmute::<unsafe extern "system" fn() -> isize, NtQuery>(p))
-        });
-        let Some(query) = query else { return };
-        let n = std::thread::available_parallelism().map_or(8, |n| n.get()).min(64);
-        let mut buf = vec![SysProcPerfInfo::default(); n];
-        let mut ret = 0u32;
-        // SystemProcessorPerformanceInformation = 8.
-        let status = unsafe {
-            query(8, buf.as_mut_ptr().cast(), (buf.len() * size_of::<SysProcPerfInfo>()) as u32, &mut ret)
-        };
-        if status < 0 {
-            return;
-        }
-        let count = (ret as usize / size_of::<SysProcPerfInfo>()).min(buf.len());
-        if count == 0 {
-            return;
-        }
-        let now: Vec<(i64, i64)> = buf[..count].iter().map(|p| (p.idle, p.kernel + p.user)).collect();
-        if self.prev.len() == count {
-            self.cores_pct.clear();
-            let mut sum = 0.0f32;
-            for (&(pi, pt), &(ni, nt)) in self.prev.iter().zip(&now) {
-                let dt = (nt - pt).max(1);
-                let di = (ni - pi).clamp(0, dt);
-                let busy = ((1.0 - di as f32 / dt as f32) * 100.0).clamp(0.0, 100.0);
-                self.cores_pct.push(busy);
-                sum += busy;
-            }
-            self.total_pct = sum / count as f32;
-        }
-        self.prev = now;
-    }
 }
 
 /// The counters read for it. They grow, and go back to 0 with the frame-rate

@@ -183,6 +183,8 @@ static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// the microseconds that took (all threads), recordings translated, and
 /// recordings let go of in the middle.
 static CHUNKS: AtomicU64 = AtomicU64::new(0);
+/// How many translating threads were started.
+static THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -379,6 +381,8 @@ fn start() {
             tracing::warn!(error = %e, "a thread less to translate lists");
         }
     }
+    THREADS.store(threads, Relaxed);
+    crate::overlay::set_pool_threads(crate::overlay::Pool::Thin, threads);
     tracing::info!(threads, "list calls are written down and translated by threads of ours (VICTORY_THIN=1)");
 }
 
@@ -401,9 +405,12 @@ pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
 /// For the frame-rate line.
 pub(crate) fn line(frames: f64) {
     if !wanted() || !on() {
+        crate::overlay::set_pool_off(crate::overlay::Pool::Thin);
         return;
     }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    // The overlay: the work of all threads over the frame's time.
+    crate::overlay::set_pool(crate::overlay::Pool::Thin, s[1] / 1000.0, crate::overlay::frame_ms(), THREADS.load(Relaxed));
     tracing::info!(
         "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}",
         s[0],
