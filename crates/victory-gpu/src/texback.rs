@@ -301,7 +301,7 @@ fn write(landing: &Landing) {
         let linear = &landing.data[from..from + pitch * rows as usize * f.Depth as usize];
         if let Err(e) = landing.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+            ONCE.call_once(|| tracing::warn!(?e, mip, slice, swizzle = landing.layout.desc.swizzle.0, "a texture copied back could not be tiled"));
             return;
         }
     }
