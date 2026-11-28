@@ -119,6 +119,7 @@
     restartPromptShownForThisChange: false,
     victory: null,
     dlssAvailable: false,
+    gdkx: { installed: false, xg_dll: null, version: null, source: "none" },
     paths: null,
     hotkey: { spec: "Win+Alt+V", error: null },
     system: null,
@@ -151,6 +152,8 @@
     const r = await invoke("save_profile", { profile: st.profile });
     st.victory = r.victory;
     st.dlssAvailable = r.dlss_available;
+    st.gdkx = r.gdkx || st.gdkx;
+    if (!st.gdkx.installed) st.profile.use_gdkx = false;
     st.paths = r.paths;
     st.restartNeeded = r.restart_needed;
     updateIngameBar();
@@ -489,6 +492,85 @@
       ),
     );
 
+    const consoleField = h(
+      "div",
+      { class: "field" },
+      h("div", { class: "label" }, H.console, tip(H.consoleTip), restartBadge()),
+      h(
+        "div",
+        { class: "console-pick", role: "group", "aria-label": H.console },
+        ["series-x", "series-s"].map((ck) => {
+          const opt = H.consoleOpts[ck];
+          const on = p.console === ck;
+          return h(
+            "button",
+            {
+              class: "console-opt" + (on ? " on" : ""),
+              "aria-pressed": on ? "true" : "false",
+              onclick: () => {
+                if (p.console === ck) return;
+                p.console = ck;
+                changed(true, true);
+                if (!isGameRunning()) toast(`${opt.title} profile selected.`);
+              },
+            },
+            h("div", { class: "t" }, opt.title, on && h("span", { class: "badge ok" }, "Active")),
+            h("div", { class: "s", text: opt.desc }),
+          );
+        }),
+      ),
+    );
+
+    const gdkx = st.gdkx || { installed: false, xg_dll: null, version: null, source: "none" };
+    const gdkxOn = !!(p.use_gdkx && gdkx.installed);
+    const gdkxBadgeText = gdkx.installed
+      ? (gdkx.version ? `${H.gdkxInstalled} · ${gdkx.version}` : H.gdkxInstalled)
+      : H.gdkxNotInstalled;
+    const gdkxSub = gdkx.installed
+      ? fmt(gdkxOn ? H.gdkxActiveDesc : H.gdkxReadyDesc, { path: gdkx.xg_dll })
+      : H.gdkxMissingDesc;
+
+    const gdkxField = h(
+      "div",
+      { class: "field" },
+      h(
+        "div",
+        { class: "gdkx-row" + (gdkx.installed ? (gdkxOn ? " on" : "") : " missing") },
+        h(
+          "div",
+          { class: "gdkx-info" },
+          h(
+            "div",
+            { class: "gdkx-head" },
+            h("span", { class: "gdkx-title" }, H.gdkx),
+            tip(H.gdkxTip),
+            h("span", { class: "badge " + (gdkx.installed ? "ok" : "warn") }, gdkxBadgeText),
+          ),
+          h("div", { class: "gdkx-desc selectable", title: gdkx.xg_dll || "" }, gdkxSub),
+        ),
+        h(
+          "div",
+          { class: "gdkx-actions" },
+          h("button", { class: "btn glass small", disabled: running, onclick: pickGdkxFolder }, icon("folder"), H.gdkxLocate),
+          h("button", { class: "btn ghost small", disabled: running, onclick: recheckGdkx }, H.gdkxRecheck),
+          toggle(
+            gdkxOn,
+            (next) => {
+              if (!gdkx.installed) {
+                toast(H.gdkxNeedInstall, true);
+                return;
+              }
+              p.use_gdkx = next;
+              changed(true, true);
+              if (!isGameRunning()) toast(next ? "GDKX (xg_xs.dll) enabled." : "GDKX disabled (using built-in tiling).");
+            },
+            H.gdkx,
+            !gdkx.installed,
+          ),
+        ),
+      ),
+    );
+
     let startBtn;
     if (running) {
       startBtn = h("button", { class: "start stop", onclick: stopRun }, icon("stop"), run.kind === "play" ? H.stop : H.stopPrebuild);
@@ -541,7 +623,7 @@
       log = h("div", { class: "log-toggle" }, h("button", { class: "link-btn", onclick: () => showLog(true) }, H.showLog));
     }
 
-    $("#home").replaceChildren(game, modeField, startBtn, status, hotkeyPill, engine, log || "");
+    $("#home").replaceChildren(game, modeField, consoleField, gdkxField, startBtn, status, hotkeyPill, engine, log || "");
     updateLive();
   }
 
@@ -556,6 +638,45 @@
     st.profile.victory_exe = f;
     await saveNow(true).catch((e) => toast(errText(e), true));
     render();
+  }
+
+  async function pickGdkxFolder() {
+    const dir = await invoke("pick_folder");
+    if (!dir) return;
+    st.profile.gdkx_path = dir;
+    const r = await saveNow(true).catch((e) => { toast(errText(e), true); return null; });
+    if (r && r.gdkx) {
+      if (r.gdkx.installed) toast(`GDKX verified: ${r.gdkx.xg_dll}`);
+      else toast("No xg_xs.dll found in that folder. Select an installed GDKX root or gxdk\\bin folder.", true);
+    }
+    render();
+  }
+
+  async function pickGdkxDll() {
+    const file = await invoke("pick_dll", { label: S.common.dllFilter });
+    if (!file) return;
+    st.profile.gdkx_path = file;
+    const r = await saveNow(true).catch((e) => { toast(errText(e), true); return null; });
+    if (r && r.gdkx) {
+      if (r.gdkx.installed) toast(`GDKX verified: ${r.gdkx.xg_dll}`);
+      else toast("Selected file is not xg_xs.dll.", true);
+    }
+    render();
+  }
+
+  async function recheckGdkx() {
+    try {
+      st.gdkx = await invoke("check_gdkx");
+      if (!st.gdkx.installed && st.profile.use_gdkx) {
+        st.profile.use_gdkx = false;
+        await saveNow(false);
+      }
+      if (st.gdkx.installed) toast(`GDKX detected: ${st.gdkx.xg_dll}`);
+      else toast(S.home.gdkxNeedInstall, true);
+      render();
+    } catch (e) {
+      toast(errText(e), true);
+    }
   }
 
   // ------------------------------------------------------------- settings
@@ -1671,6 +1792,40 @@
           p.victory_exe && h("button", { class: "btn ghost small", onclick: async () => { p.victory_exe = ""; await saveNow(true); render(); } }, A.victoryAuto),
         ),
       ),
+      (() => {
+        const gdkx = st.gdkx || { installed: false, xg_dll: null, version: null, source: "none" };
+        const badgeText = gdkx.installed
+          ? (gdkx.version ? `${S.home.gdkxInstalled} · ${gdkx.version} (${gdkx.source})` : `${S.home.gdkxInstalled} (${gdkx.source})`)
+          : S.home.gdkxNotInstalled;
+        return card(
+          A.gdkxTitle,
+          A.gdkxTip,
+          h("div", { class: "row" },
+            h("span", { class: "badge " + (gdkx.installed ? "ok" : "warn") }, badgeText),
+            h("div", { class: "path selectable" + (gdkx.xg_dll ? "" : " empty"), title: gdkx.xg_dll || "" }, gdkx.xg_dll || S.home.gdkxMissingDesc),
+          ),
+          h("div", { class: "row spacer-top" },
+            h("button", { class: "btn small", onclick: pickGdkxFolder }, icon("folder"), A.gdkxFolder),
+            h("button", { class: "btn small", onclick: pickGdkxDll }, icon("folder"), A.gdkxDll),
+            h("button", { class: "btn ghost small", onclick: recheckGdkx }, A.gdkxRecheck),
+            p.gdkx_path && h("button", { class: "btn ghost small", onclick: async () => { p.gdkx_path = ""; await saveNow(true); render(); } }, A.gdkxAuto),
+          ),
+          settingRow(
+            A.gdkxToggle,
+            restartBadge(),
+            h("div", { class: "row end" }, toggle(
+              !!(p.use_gdkx && gdkx.installed),
+              (next) => {
+                if (!gdkx.installed) { toast(S.home.gdkxNeedInstall, true); return; }
+                p.use_gdkx = next;
+                changed(true, true);
+              },
+              A.gdkxToggle[0],
+              !gdkx.installed,
+            )),
+          ),
+        );
+      })(),
       card(A.foldersTitle, null, folderRow(A.cache, "cache_dir", paths.cache), folderRow(A.data, "data_dir", paths.data)),
       card(
         A.losslessTitle,
@@ -1930,7 +2085,7 @@
     if (l.error) { toast(fmt(S.launch.error, { e: l.error }), true); return true; }
     if (l.applied) {
       const s = await invoke("get_start");
-      st.start = s; st.profile = s.profile; st.victory = s.victory; st.paths = s.paths; st.dlssAvailable = s.dlss_available;
+      st.start = s; st.profile = s.profile; st.victory = s.victory; st.paths = s.paths; st.dlssAvailable = s.dlss_available; st.gdkx = s.gdkx || st.gdkx;
       toast(fmt(S.launch.applied, { list: l.notes.join(", ") }));
     }
     if (l.no_music) { st.sessionMute = true; sound.setLevel(); renderAudio(); }
@@ -2008,6 +2163,7 @@
       st.profile = st.start.profile;
       st.victory = st.start.victory;
       st.dlssAvailable = st.start.dlss_available;
+      st.gdkx = st.start.gdkx || st.gdkx;
       st.paths = st.start.paths;
       st.hotkey = st.start.hotkey || st.hotkey;
     } catch (e) {

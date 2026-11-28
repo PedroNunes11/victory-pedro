@@ -233,6 +233,11 @@ pub struct Profile {
     pub cache_dir: String,
     pub data_dir: String,
     pub dlss_sdk_dir: String,
+    /// Enable PC-side Microsoft GDKX `xg_xs.dll` for exact Scarlett texture tiling
+    /// (`VICTORY_XG_DLL` + `VICTORY_XG_MODE=real`). Only emitted when GDKX is detected installed.
+    pub use_gdkx: bool,
+    /// Optional user-specified GDKX install directory or direct `xg_xs.dll` path.
+    pub gdkx_path: String,
     pub extra_env: BTreeMap<String, String>,
     pub best_seen: String,
     pub lossless: Lossless,
@@ -281,6 +286,8 @@ impl Default for Profile {
             cache_dir: String::new(),
             data_dir: String::new(),
             dlss_sdk_dir: String::new(),
+            use_gdkx: false,
+            gdkx_path: String::new(),
             extra_env: BTreeMap::new(),
             best_seen: String::new(),
             lossless: Lossless::default(),
@@ -343,6 +350,11 @@ pub const MANAGED: &[&str] = &[
     "VICTORY_MOUSE_SENSITIVITY",
     "VICTORY_CACHE_DIR",
     "VICTORY_DATA_DIR",
+    "VICTORY_XG_DLL",
+    "VICTORY_XG_MODE",
+    "VICTORY_SEND_SPARE_MB",
+    "VICTORY_STAGING_REST_MS",
+    "VICTORY_STAGING_PACK",
 ];
 
 pub fn pick_dir(chosen: &str, found: &Path) -> Option<(PathBuf, &'static str)> {
@@ -477,6 +489,217 @@ pub fn find_dlss_sdk(configured: &str, victory_exe: Option<&Path>) -> Option<Pat
     None
 }
 
+/// Detection result for a user-installed Microsoft GDKX (`xg_xs.dll`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct GdkxStatus {
+    pub installed: bool,
+    pub xg_dll: Option<String>,
+    pub version: Option<String>,
+    pub source: &'static str,
+}
+
+/// Locates `xg_xs.dll` inside `root` (either a direct DLL path, a GDKX edition
+/// directory, or a Microsoft GDK parent folder containing versioned editions).
+pub fn find_xg_dll_in(root: &Path) -> Option<PathBuf> {
+    if root.is_file() {
+        let is_xg = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("xg_xs.dll"));
+        return is_xg.then(|| root.to_path_buf());
+    }
+    if !root.is_dir() {
+        return None;
+    }
+    let direct_candidates = [
+        root.join("xg_xs.dll"),
+        root.join("gxdk").join("bin").join("xg_xs.dll"),
+        root.join("xbox").join("bin").join("x64").join("xg_xs.dll"),
+        root.join("xbox").join("bin").join("xg_xs.dll"),
+        root.join("bin").join("x64").join("xg_xs.dll"),
+        root.join("bin").join("xg_xs.dll"),
+    ];
+    for cand in direct_candidates {
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    // Check 1-level versioned edition subdirectories (e.g. `261000\gxdk\bin\xg_xs.dll`),
+    // preferring the highest edition number first.
+    let mut subdirs: Vec<PathBuf> = std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    subdirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    for sub in subdirs {
+        for rel in [
+            PathBuf::from("gxdk").join("bin").join("xg_xs.dll"),
+            PathBuf::from("xbox").join("bin").join("x64").join("xg_xs.dll"),
+            PathBuf::from("xbox").join("bin").join("xg_xs.dll"),
+            PathBuf::from("bin").join("xg_xs.dll"),
+            PathBuf::from("xg_xs.dll"),
+        ] {
+            let cand = sub.join(rel);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+fn extract_gdkx_version(dll: &Path) -> Option<String> {
+    for comp in dll.components() {
+        let s = comp.as_os_str().to_str()?;
+        let looks_like_edition = (s.len() == 6 && s.chars().all(|c| c.is_ascii_digit()))
+            || s.starts_with("10.0.")
+            || (s.len() >= 6 && s.starts_with("202") && s.contains('.'));
+        if looks_like_edition {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(all(windows, not(test)))]
+fn registry_gdk_paths() -> Vec<PathBuf> {
+    use windows::Win32::System::Registry::{
+        HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW,
+    };
+    use windows::core::PCWSTR;
+
+    fn read_sz(subkey: &str, value: &str) -> Option<PathBuf> {
+        let subkey_w: Vec<u16> = subkey.encode_utf16().chain(Some(0)).collect();
+        let value_w: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+        let mut bytes: u32 = 0;
+        // SAFETY: querying required buffer size for a registry string value.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(subkey_w.as_ptr()),
+                PCWSTR(value_w.as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                None,
+                Some(&mut bytes),
+            )
+        };
+        if status.is_err() || bytes < 2 {
+            return None;
+        }
+        let mut buf = vec![0u16; (bytes as usize).div_ceil(2)];
+        // SAFETY: `buf` is sized to at least `bytes`.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(subkey_w.as_ptr()),
+                PCWSTR(value_w.as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                Some(buf.as_mut_ptr().cast()),
+                Some(&mut bytes),
+            )
+        };
+        if status.is_err() {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        let s = String::from_utf16_lossy(&buf[..len]).trim().to_string();
+        (!s.is_empty()).then(|| PathBuf::from(s))
+    }
+
+    let mut out = Vec::new();
+    for key in [
+        r"SOFTWARE\Microsoft\GDK",
+        r"SOFTWARE\WOW6432Node\Microsoft\GDK",
+    ] {
+        for val in ["Latest", "InstallPath", "GameDK", "GameDKLatest"] {
+            if let Some(p) = read_sz(key, val) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(all(not(windows), not(test)))]
+fn registry_gdk_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Checks whether Microsoft GDKX (`xg_xs.dll`) is installed on this PC.
+/// Never bundles or ships any Microsoft binary; only detects a user's own install.
+pub fn detect_gdkx(configured: &str, victory_exe: Option<&Path>) -> GdkxStatus {
+    let found = |dll: PathBuf, source: &'static str| GdkxStatus {
+        installed: true,
+        version: extract_gdkx_version(&dll),
+        xg_dll: Some(dll.display().to_string()),
+        source,
+    };
+
+    let trimmed = configured.trim();
+    if !trimmed.is_empty()
+        && let Some(dll) = find_xg_dll_in(Path::new(trimmed))
+    {
+        return found(dll, "configured");
+    }
+
+    #[cfg(not(test))]
+    {
+        for var in ["VICTORY_XG_DLL", "GameDKLatest", "GameDK"] {
+            if let Some(val) = std::env::var_os(var)
+                && let Some(dll) = find_xg_dll_in(Path::new(&val))
+            {
+                return found(dll, "env");
+            }
+        }
+        for reg_path in registry_gdk_paths() {
+            if let Some(dll) = find_xg_dll_in(&reg_path) {
+                return found(dll, "registry");
+            }
+        }
+        for std_dir in [
+            r"C:\Program Files (x86)\Microsoft GDK",
+            r"C:\Program Files\Microsoft GDK",
+            r"D:\Microsoft GDK",
+        ] {
+            if let Some(dll) = find_xg_dll_in(Path::new(std_dir)) {
+                return found(dll, "standard");
+            }
+        }
+    }
+
+    for base in [
+        victory_exe.map(crate::runner::workdir),
+        portable_root(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for cand in [
+            base.join("sdk").join("gdkx"),
+            base.parent()
+                .map(|p| p.join("sdk").join("gdkx"))
+                .unwrap_or_default(),
+        ] {
+            if !cand.as_os_str().is_empty()
+                && let Some(dll) = find_xg_dll_in(&cand)
+            {
+                return found(dll, "portable");
+            }
+        }
+    }
+
+    GdkxStatus {
+        installed: false,
+        xg_dll: None,
+        version: None,
+        source: "none",
+    }
+}
+
 fn format_scale(s: f32) -> String {
     let clamped = s.clamp(0.5, 1.0);
     if (clamped - 1.0).abs() < 0.001 {
@@ -522,6 +745,8 @@ impl Profile {
             "cache_dir": self.cache_dir,
             "data_dir": self.data_dir,
             "dlss_sdk_dir": self.dlss_sdk_dir,
+            "use_gdkx": self.use_gdkx,
+            "gdkx_path": self.gdkx_path,
             "extra_env": self.extra_env,
         })
         .to_string()
@@ -535,7 +760,9 @@ impl Profile {
         cpu_threads: u32,
     ) -> Vec<(String, String)> {
         let plugin = find_dlss_plugin(victory_exe);
-        self.env_for_with_dlss(victory_exe, data_dir, cpu_threads, plugin.as_deref())
+        let gdkx = detect_gdkx(&self.gdkx_path, victory_exe);
+        let gdkx_path = gdkx.xg_dll.as_deref().map(Path::new);
+        self.env_for_with_plugins(victory_exe, data_dir, cpu_threads, plugin.as_deref(), gdkx_path)
     }
 
     /// Environment builder with an explicit DLSS plugin path (testable both with
@@ -546,6 +773,20 @@ impl Profile {
         data_dir: Option<&Path>,
         cpu_threads: u32,
         dlss_plugin: Option<&Path>,
+    ) -> Vec<(String, String)> {
+        let gdkx = detect_gdkx(&self.gdkx_path, victory_exe);
+        let gdkx_path = gdkx.xg_dll.as_deref().map(Path::new);
+        self.env_for_with_plugins(victory_exe, data_dir, cpu_threads, dlss_plugin, gdkx_path)
+    }
+
+    /// Environment builder with explicit DLSS and GDKX (`xg_xs.dll`) paths.
+    pub fn env_for_with_plugins(
+        &self,
+        victory_exe: Option<&Path>,
+        data_dir: Option<&Path>,
+        cpu_threads: u32,
+        dlss_plugin: Option<&Path>,
+        gdkx_dll: Option<&Path>,
     ) -> Vec<(String, String)> {
         let mut map: BTreeMap<String, String> = BTreeMap::new();
         let mut put = |k: &str, v: &str| {
@@ -642,14 +883,16 @@ impl Profile {
                 put("VICTORY_LOD_BIAS", def_bias);
             }
         } else {
-            if self.console == Console::SeriesX {
-                let scale = self.render_scale.unwrap_or(match self.preset {
-                    Preset::Performance | Preset::Balanced => 0.6667,
-                    Preset::HighQuality | Preset::Native4k => 1.0,
-                });
-                let s = format_scale(scale);
-                put("VICTORY_RENDER_SCALE", &s);
+            let mut scale = self.render_scale.unwrap_or(match self.preset {
+                Preset::Performance | Preset::Balanced => 0.6667,
+                Preset::HighQuality | Preset::Native4k => 1.0,
+            });
+            // Series S divides by zero below ~0.58 internal scale; clamp safely.
+            if self.console == Console::SeriesS {
+                scale = scale.max(0.58);
             }
+            let s = format_scale(scale);
+            put("VICTORY_RENDER_SCALE", &s);
             if let Some(bias) = self.lod_bias {
                 let s = format!("{:.2}", bias.clamp(-3.0, 2.0));
                 put("VICTORY_LOD_BIAS", &s);
@@ -694,14 +937,37 @@ impl Profile {
         put("VICTORY_SOFT_VIEWS", "copies");
         put("VICTORY_RIPE_BLOCKS", "0");
         put("VICTORY_TEXTURE_CATCHUP", "0");
-        put("VICTORY_CARD_AWAKE", "1");
+        // Keep compute queue idle when menus/CPU are bottlenecked (CARD_AWAKE=1
+        // pinned compute at 97-99% in menus with zero FPS gain).
+        put("VICTORY_CARD_AWAKE", "0");
         put("VICTORY_SYNC_FINE", "1");
+        // Pack texture staging blocks and trim idle send buffers per preset so
+        // Performance/Balanced hold substantially less RAM & VRAM.
+        put("VICTORY_STAGING_PACK", "1");
+        let (send_spare_mb, staging_rest_ms) = match self.preset {
+            Preset::Performance => ("128", "250"),
+            Preset::Balanced => ("256", "350"),
+            Preset::HighQuality | Preset::Native4k => ("512", "500"),
+        };
+        put("VICTORY_SEND_SPARE_MB", send_spare_mb);
+        put("VICTORY_STAGING_REST_MS", staging_rest_ms);
         // Skip heat-haze pass that smears pixels and corrupts DLSS motion vectors.
         put("VICTORY_LEAVE_OUT", "731a39171b568298");
         put("VICTORY_DYNAMIC_SLOTS", "393216");
         if !self.reflections {
             put("VICTORY_REFLECT_SCREEN", "1");
             put("VICTORY_AMBIENT_REFLECT", "0.5");
+        }
+
+        // --- Optional Microsoft GDKX (`xg_xs.dll`) for exact Scarlett tiling ---
+        // Strictly gated on verified installation so disabling/uninstalling GDKX
+        // always falls back cleanly to built-in victory-formats.
+        if self.use_gdkx
+            && let Some(dll) = gdkx_dll
+        {
+            let dll_s = dll.display().to_string();
+            put("VICTORY_XG_DLL", &dll_s);
+            put("VICTORY_XG_MODE", "real");
         }
 
         // --- Native KB/M Controls & Scaleform Prompt Glyphs ---
@@ -908,6 +1174,13 @@ impl Profile {
             "VICTORY_DATA_DIR" => {
                 self.data_dir = if clear { String::new() } else { value.into() };
             }
+            "VICTORY_XG_DLL" => {
+                self.gdkx_path = if clear { String::new() } else { value.into() };
+                self.use_gdkx = !clear;
+            }
+            "VICTORY_XG_MODE" => {
+                self.use_gdkx = !clear && !value.eq_ignore_ascii_case("builtin");
+            }
             _ => {
                 if clear {
                     self.extra_env.remove(name);
@@ -1035,6 +1308,7 @@ impl Profile {
             cache_dir: keep.cache_dir,
             data_dir: keep.data_dir,
             dlss_sdk_dir: keep.dlss_sdk_dir,
+            gdkx_path: keep.gdkx_path,
             ingame_hotkey: keep.ingame_hotkey,
             music_volume: keep.music_volume,
             muted: keep.muted,
@@ -1061,21 +1335,22 @@ impl Profile {
         self.extra_env.clear();
         match preset {
             Preset::Performance => {
-                // Maximum FPS & lowest VRAM footprint:
-                // 1080p output, 1114x626 (DLSS Balanced) or 1280x720 (native upscaler),
-                // DRED disabled (-1..2 ms), shorter shader wait, tighter texture stage.
-                self.console = Console::SeriesX;
+                // Maximum FPS & lowest CPU/VRAM footprint:
+                // Series S console profile (genuinely fewer draw calls & lighter scene LODs),
+                // 1080p output, 58% DLSS Balanced (or 67% native), DRED off (-1..2 ms),
+                // aggressive staging/send buffer trims.
+                self.console = Console::SeriesS;
                 self.output_resolution = "1920x1080".into();
                 self.dlss = DlssMode::Balanced;
                 self.render_scale = Some(0.6667);
                 self.lod_bias = Some(-0.79);
-                self.texture_room_percent = 90;
-                self.texture_pool_spares = 6;
+                self.texture_room_percent = 88;
+                self.texture_pool_spares = 4;
                 self.texture_partial_frames = 12;
-                self.texture_stage_ms = 12;
+                self.texture_stage_ms = 10;
                 self.card_buffers_mb = 1024;
-                self.card_windows_mb = 768;
-                self.pipeline_wait_ms = Some(8);
+                self.card_windows_mb = 512;
+                self.pipeline_wait_ms = Some(6);
                 self.dred_light = false;
             }
             Preset::Balanced => {
@@ -1183,27 +1458,35 @@ mod tests {
         let mut p = Profile::default();
 
         p.apply_preset(Preset::Performance);
+        assert_eq!(p.console, Console::SeriesS);
         assert_eq!(val_with_dlss(&p, "VICTORY_OUTPUT", true).as_deref(), Some("1920x1080"));
-        assert_eq!(val_with_dlss(&p, "VICTORY_UPSCALER", true).as_deref(), Some("7"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_UPSCALER", true), None);
         assert_eq!(val_with_dlss(&p, "VICTORY_FFX_SCALE", true).as_deref(), Some("0.58"));
         assert_eq!(val_with_dlss(&p, "VICTORY_LOD_BIAS", true).as_deref(), Some("-0.79"));
         assert_eq!(val_with_dlss(&p, "VICTORY_D3D12_DRED", true).as_deref(), Some("0"));
         assert_eq!(val_with_dlss(&p, "VICTORY_JOIN_BARRIERS", true).as_deref(), Some("1"));
-        assert_eq!(val_with_dlss(&p, "VICTORY_TEXTURE_ROOM_PERCENT", true).as_deref(), Some("90"));
-        assert_eq!(val_with_dlss(&p, "VICTORY_TEXTURE_STAGE_MS", true).as_deref(), Some("12"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_TEXTURE_ROOM_PERCENT", true).as_deref(), Some("88"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_TEXTURE_STAGE_MS", true).as_deref(), Some("10"));
         assert_eq!(val_with_dlss(&p, "VICTORY_CARD_BUFFERS_MB", true).as_deref(), Some("1024"));
-        assert_eq!(val_with_dlss(&p, "VICTORY_PIPELINE_WAIT_MS", true).as_deref(), Some("8"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_PIPELINE_WAIT_MS", true).as_deref(), Some("6"));
         assert_eq!(val_with_dlss(&p, "VICTORY_SUBMIT_FRAMES", true).as_deref(), Some("2"));
         assert_eq!(val_with_dlss(&p, "VICTORY_TITLE_USED_MB", true).as_deref(), Some("title"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_SEND_SPARE_MB", true).as_deref(), Some("128"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_STAGING_REST_MS", true).as_deref(), Some("250"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_STAGING_PACK", true).as_deref(), Some("1"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_CARD_AWAKE", true).as_deref(), Some("0"));
 
         p.apply_preset(Preset::Balanced);
+        assert_eq!(p.console, Console::SeriesX);
         assert_eq!(val_with_dlss(&p, "VICTORY_OUTPUT", true).as_deref(), Some("2560x1440"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_UPSCALER", true).as_deref(), Some("7"));
         assert_eq!(val_with_dlss(&p, "VICTORY_FFX_SCALE", true).as_deref(), Some("0.6667"));
         assert_eq!(val_with_dlss(&p, "VICTORY_LOD_BIAS", true).as_deref(), Some("-0.58"));
         assert_eq!(val_with_dlss(&p, "VICTORY_D3D12_DRED", true).as_deref(), Some("light"));
         assert_eq!(val_with_dlss(&p, "VICTORY_TEXTURE_ROOM_PERCENT", true).as_deref(), Some("95"));
         assert_eq!(val_with_dlss(&p, "VICTORY_TEXTURE_STAGE_MS", true).as_deref(), Some("16"));
         assert_eq!(val_with_dlss(&p, "VICTORY_CARD_BUFFERS_MB", true).as_deref(), Some("1536"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_SEND_SPARE_MB", true).as_deref(), Some("256"));
 
         p.apply_preset(Preset::HighQuality);
         assert_eq!(val_with_dlss(&p, "VICTORY_OUTPUT", true).as_deref(), Some("2560x1440"));
@@ -1276,5 +1559,52 @@ mod tests {
             ["run", r"C:\Games\Title\master.exe", "--execute", "--console", "series-x"]
         );
         assert_eq!(p.prebuild_args(game), ["warm", "--used"]);
+    }
+
+    #[test]
+    fn gdkx_env_only_emitted_when_enabled_and_installed() {
+        let mut p = Profile::default();
+        let fake_dll = Path::new(r"C:\Microsoft GDK\261000\gxdk\bin\xg_xs.dll");
+
+        let find = |env: Vec<(String, String)>, key: &str| {
+            env.into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        };
+
+        // Disabled -> never emitted even when DLL is installed.
+        p.use_gdkx = false;
+        assert_eq!(find(p.env_for_with_plugins(None, None, 16, None, Some(fake_dll)), "VICTORY_XG_DLL"), None);
+        assert_eq!(find(p.env_for_with_plugins(None, None, 16, None, Some(fake_dll)), "VICTORY_XG_MODE"), None);
+
+        // Enabled but NOT installed -> must not emit broken paths.
+        p.use_gdkx = true;
+        assert_eq!(find(p.env_for_with_plugins(None, None, 16, None, None), "VICTORY_XG_DLL"), None);
+        assert_eq!(find(p.env_for_with_plugins(None, None, 16, None, None), "VICTORY_XG_MODE"), None);
+
+        // Enabled AND installed -> emits both VICTORY_XG_DLL and VICTORY_XG_MODE=real.
+        let env = p.env_for_with_plugins(None, None, 16, None, Some(fake_dll));
+        assert_eq!(find(env.clone(), "VICTORY_XG_DLL").as_deref(), Some(r"C:\Microsoft GDK\261000\gxdk\bin\xg_xs.dll"));
+        assert_eq!(find(env, "VICTORY_XG_MODE").as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn detect_gdkx_finds_versioned_xg_xs_dll() {
+        let dir = std::env::temp_dir().join(format!("vertex-gdkx-test-{}", std::process::id()));
+        let bin = dir.join("261000").join("gxdk").join("bin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&bin).unwrap();
+        let dll = bin.join("xg_xs.dll");
+        std::fs::write(&dll, b"stub").unwrap();
+
+        let status = detect_gdkx(dir.to_str().unwrap(), None);
+        assert!(status.installed);
+        assert_eq!(status.source, "configured");
+        assert_eq!(status.version.as_deref(), Some("261000"));
+        assert_eq!(status.xg_dll.as_deref(), dll.to_str());
+
+        let missing = detect_gdkx(dir.join("missing").to_str().unwrap(), None);
+        assert!(!missing.installed);
+        assert_eq!(missing.xg_dll, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -90,6 +90,7 @@ struct Start {
     profile: Profile,
     victory: runner::Found,
     dlss_available: bool,
+    gdkx: settings::GdkxStatus,
     paths: Paths,
     defaults: Defaults,
     key_names: Vec<String>,
@@ -191,17 +192,21 @@ fn get_start(app: State<App>) -> Start {
             .filter_map(|&n| settings::default_of(n, work).map(|v| (n, v)))
             .collect()
     };
-    let victory = runner::find_victory(&app.profile().victory_exe);
-    let dlss_available = settings::find_dlss_plugin(victory.path.as_deref().map(Path::new)).is_some();
+    let profile = app.profile();
+    let victory = runner::find_victory(&profile.victory_exe);
+    let vpath = victory.path.as_deref().map(Path::new);
+    let dlss_available = settings::find_dlss_plugin(vpath).is_some();
+    let gdkx = settings::detect_gdkx(&profile.gdkx_path, vpath);
     let mut native_key_names: Vec<String> = ('A'..='Z')
         .chain('0'..='9')
         .map(|c| c.to_string())
         .collect();
     native_key_names.extend(native_keys::NATIVE_KEY_NAMES.iter().map(|s| (*s).to_string()));
     Start {
-        profile: app.profile(),
+        profile,
         victory,
         dlss_available,
+        gdkx,
         paths: paths(&app),
         defaults: Defaults {
             cpu: table(settings::Work::Cpu),
@@ -307,15 +312,21 @@ async fn get_system(app: State<'_, App>) -> R<system::SystemInfo> {
 struct Saved {
     victory: runner::Found,
     dlss_available: bool,
+    gdkx: settings::GdkxStatus,
     paths: Paths,
     restart_needed: bool,
 }
 
 #[tauri::command]
-fn save_profile(app: State<App>, profile: Profile) -> R<Saved> {
-    settings::save(&profile)?;
+fn save_profile(app: State<App>, mut profile: Profile) -> R<Saved> {
     let victory = runner::find_victory(&profile.victory_exe);
-    let dlss_available = settings::find_dlss_plugin(victory.path.as_deref().map(Path::new)).is_some();
+    let vpath = victory.path.as_deref().map(Path::new);
+    let dlss_available = settings::find_dlss_plugin(vpath).is_some();
+    let gdkx = settings::detect_gdkx(&profile.gdkx_path, vpath);
+    if !gdkx.installed {
+        profile.use_gdkx = false;
+    }
+    settings::save(&profile)?;
     let restart_needed = {
         let run = app.run.lock().unwrap();
         run.running
@@ -329,9 +340,17 @@ fn save_profile(app: State<App>, profile: Profile) -> R<Saved> {
     Ok(Saved {
         victory,
         dlss_available,
+        gdkx,
         paths: paths(&app),
         restart_needed,
     })
+}
+
+#[tauri::command]
+fn check_gdkx(app: State<App>) -> settings::GdkxStatus {
+    let profile = app.profile();
+    let victory = runner::find_victory(&profile.victory_exe);
+    settings::detect_gdkx(&profile.gdkx_path, victory.path.as_deref().map(Path::new))
 }
 
 #[tauri::command]
@@ -381,6 +400,17 @@ async fn pick_exe(window: tauri::Window, label: String) -> Option<String> {
         .dialog()
         .file()
         .add_filter(label, &["exe"])
+        .blocking_pick_file()
+        .and_then(|f| f.into_path().ok())
+        .map(|p| p.display().to_string())
+}
+
+#[tauri::command]
+async fn pick_dll(window: tauri::Window, label: String) -> Option<String> {
+    window
+        .dialog()
+        .file()
+        .add_filter(label, &["dll"])
         .blocking_pick_file()
         .and_then(|f| f.into_path().ok())
         .map(|p| p.display().to_string())
@@ -824,7 +854,9 @@ fn main() {
             set_ingame_hotkey,
             resume_game,
             pick_exe,
+            pick_dll,
             pick_folder,
+            check_gdkx,
             cache_check,
             start_play,
             restart_game,

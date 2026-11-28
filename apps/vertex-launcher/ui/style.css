@@ -107,11 +107,11 @@ button { font: inherit; color: inherit; }
   padding: 92px 28px 24px 52px;
   max-width: 520px;
 }
-.field { margin-bottom: 18px; }
+.field { margin-bottom: 13px; }
 .label {
   display: flex; align-items: center; gap: 6px;
   font-size: 11.5px; font-weight: 650; letter-spacing: 0.12em; text-transform: uppercase;
-  color: var(--muted); margin-bottom: 7px;
+  color: var(--muted); margin-bottom: 6px;
 }
 .game-row {
   display: flex; align-items: center; gap: 12px;
@@ -138,12 +138,30 @@ button { font: inherit; color: inherit; }
   background: linear-gradient(135deg, rgba(124, 58, 237, 0.42), rgba(40, 16, 80, 0.5));
   box-shadow: inset 0 0 0 1px var(--accent);
 }
-.console-opt .t { font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 8px; }
-.console-opt .s { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.console-opt .t { font-weight: 700; font-size: 14.5px; display: flex; align-items: center; gap: 8px; }
+.console-opt .s { font-size: 11.8px; color: var(--muted); margin-top: 2px; }
+
+.gdkx-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 14px; border-radius: 14px;
+  background: var(--glass); border: 1px solid var(--line);
+  backdrop-filter: blur(8px);
+  transition: border-color 0.15s, background 0.15s;
+}
+.gdkx-row.on {
+  border-color: var(--accent);
+  background: linear-gradient(135deg, rgba(124, 58, 237, 0.28), rgba(40, 16, 80, 0.48));
+}
+.gdkx-row.missing { border-color: rgba(251, 191, 36, 0.22); }
+.gdkx-info { flex: 1; min-width: 0; }
+.gdkx-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.gdkx-title { font-weight: 680; font-size: 13.5px; }
+.gdkx-desc { font-size: 11.5px; color: var(--muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gdkx-actions { display: flex; align-items: center; gap: 6px; flex: none; }
 
 .start {
   position: relative; isolation: isolate;
-  width: 100%; height: 68px; margin-top: 8px;
+  width: 100%; height: 60px; margin-top: 6px;
   border: 0; border-radius: 18px; cursor: pointer;
   font-size: 22px; font-weight: 800; letter-spacing: 0.14em; text-transform: uppercase;
   color: #fff;
