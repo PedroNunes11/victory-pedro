@@ -51,7 +51,8 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing.
+    // run is left empty and costs nothing. Bit 2: one dispatch, written as
+    // SPLIT records of at most 65,535 groups in x each.
     uint has_count;
     uint count_offset;
 };
@@ -66,6 +67,7 @@ static const uint BUDGET = 1u << 27;
 static const uint MOST_DRAW = 1u << 23;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+static const uint SPLIT = 2;
 // Each group charges the budget once: the costs of its records go here,
 // one thread charges their sum, saturating as each record would in lane
 // order, and every thread then reads whether its own record fitted. A
@@ -82,6 +84,7 @@ groupshared uint all_asked;
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
+    bool split = (has_count & 4u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
@@ -116,9 +119,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
-        uint3 g = src_args.Load3(src_at);
+        uint3 wants = src_args.Load3(src_at);
         // Up to WIDEST groups in x run as asked (`widest`).
-        g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+        uint3 g = min(wants, uint3(wants.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+        // In parts (non-AMD): one dimension, and not the garbage of an argument
+        // nothing wrote.
+        if (split && g.y <= 1u && g.z <= 1u && wants.x <= SPLIT * 65535u) {
+            g.x = wants.x;
+        }
         // x * y fits 32 bits where it is looked at; the whole count may not.
         if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
@@ -222,6 +230,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
+        }
+        if (split) {
+            for (uint part = 0; part < SPLIT; part++) {
+                uint before = part * 65535u;
+                uint x = groups.x > before ? min(groups.x - before, 65535u) : 0u;
+                dst_args.Store3(dst_at + part * 12u, uint3(x, groups.yz));
+            }
+            return;
         }
         dst_args.Store3(dst_at, groups);
         for (uint off = 12; off < stride; off += 4) {
@@ -391,6 +407,22 @@ fn validate_layout(
 /// their own. Replaces the list's compute root signature and pipeline
 /// (callers bind theirs after). `None` if the clamp or alignment is not
 /// available.
+/// The parts [`bound_split`] makes of a dispatch, the most groups of each,
+/// and the bytes between them.
+pub(crate) const SPLIT: u32 = 2;
+pub(crate) const SPLIT_GROUPS: u32 = 65_535;
+pub(crate) const SPLIT_STRIDE: u64 = 12;
+
+const AHEAD_FLAG: u32 = 1 << 1;
+const SPLIT_FLAG: u32 = 1 << 2;
+
+/// Whether the host adapter runs wide 1D indirect dispatches (> 65,535 groups)
+/// natively without splitting (AMD with `VICTORY_INDIRECT_WIDE != 0`).
+pub(crate) fn wide_host() -> bool {
+    static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WIDE.get_or_init(|| host().is_some_and(|h| widest(amd(&h.device)) > SPLIT_GROUPS))
+}
+
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
@@ -399,7 +431,21 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, count, spec, 0).then_some(dst)
+}
+
+/// [`bound`] for one indirect dispatch whose groups in x may exceed 65,535 on
+/// a non-AMD host: writes [`SPLIT`] records of at most [`SPLIT_GROUPS`] groups
+/// each at offsets `0`, `12`, ... in the scratch buffer.
+pub(crate) fn bound_split(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+) -> Option<ID3D12Resource> {
+    let spec = (2, SPLIT_STRIDE as u32, 1);
+    validate_layout(spec, src.1, None)?;
+    let bytes = u64::from(SPLIT) * SPLIT_STRIDE;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    clamp_into(list, c, &dst, budget, src, None, spec, SPLIT_FLAG).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -419,7 +465,7 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, None, spec, AHEAD_FLAG).then_some(dst)
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -434,11 +480,11 @@ fn clamp_into(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
-    ahead: bool,
+    flags: u32,
 ) -> bool {
     let before = list.indirect_state(dst);
     let need_uav = !list.list.is_uav_synced();
-    let recorded = record_clamp_with_uav(c, &list.list, (dst, before), budget, src, count, spec, ahead, need_uav);
+    let recorded = record_clamp_with_uav(c, &list.list, (dst, before), budget, src, count, spec, flags, need_uav);
     if recorded {
         list.indirect_readable(dst);
     }
@@ -461,7 +507,17 @@ fn record_clamp_as(
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    record_clamp_with_uav(c, l, (dst, before), budget, (src, src_offset), count, (kind, stride, records), ahead, true)
+    record_clamp_with_uav(
+        c,
+        l,
+        (dst, before),
+        budget,
+        (src, src_offset),
+        count,
+        (kind, stride, records),
+        if ahead { AHEAD_FLAG } else { 0 },
+        true,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -473,7 +529,7 @@ fn record_clamp_with_uav(
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
-    ahead: bool,
+    flags: u32,
     need_pre_uav: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
@@ -519,7 +575,7 @@ fn record_clamp_with_uav(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let constants = [kind, stride, records, args_offset, has_count | flags, count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`

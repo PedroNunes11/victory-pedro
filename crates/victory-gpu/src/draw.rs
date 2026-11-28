@@ -1560,8 +1560,10 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
-        // All of every group, unless the dispatch says otherwise.
-        if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
+        // All of every group, and group base 0, unless the dispatch says otherwise.
+        if kind == victory_shader::emit::USER_DISPATCH_THREADS_X
+            || kind == victory_shader::emit::USER_GROUP_BASE
+        {
             return 0;
         }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
@@ -3604,8 +3606,29 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // Direct 1D dispatches over 65,535 groups run in parts on hosts capped
+        // at D3D12's 65,535-group limit, advancing USER_GROUP_BASE per part.
+        if x > crate::indirect::SPLIT_GROUPS
+            && y == 1
+            && z == 1
+            && let Some((param, word)) = compute_word(p, victory_shader::emit::USER_GROUP_BASE)
+        {
+            let mut base = 0u32;
+            while base < x {
+                let chunk = (x - base).min(crate::indirect::SPLIT_GROUPS);
+                // SAFETY: an open list with everything set; root signature has the word.
+                unsafe {
+                    list.list.SetComputeRoot32BitConstant(param, base, word);
+                    list.list.Dispatch(chunk, 1, 1);
+                }
+                base += chunk;
+            }
+            // SAFETY: restore group base to 0 for subsequent dispatches.
+            unsafe { list.list.SetComputeRoot32BitConstant(param, 0, word) };
+        } else {
+            // SAFETY: an open list with everything set.
+            unsafe { list.list.Dispatch(x, y, z) };
+        }
         self.after_compute_dispatch(pipeline_stores(p));
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -5064,8 +5087,18 @@ impl State {
             }
             self.window = None;
         }
+        // On non-AMD hosts, a 1D indirect dispatch whose shader accepts
+        // USER_GROUP_BASE splits into two 65,535-group records so dispatches
+        // like the 115,200-tile light gather are not truncated at 65,535.
+        let split_word = (kind == DISPATCH
+            && max == 1
+            && count.is_none()
+            && stride == crate::indirect::SPLIT_STRIDE as u32
+            && !crate::indirect::wide_host())
+        .then(|| compute_word(p, victory_shader::emit::USER_GROUP_BASE))
+        .flatten();
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if !alone && batches() > 0 && max == 1 && count.is_none() {
+        let batch = if split_word.is_none() && !alone && batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -5132,7 +5165,9 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
+                let bounded = if split_word.is_some() {
+                    crate::indirect::bound_split(list, (&args.buffer, offset))
+                } else if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
@@ -5185,16 +5220,35 @@ impl State {
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
-        };
+        if let Some((param, word)) = split_word {
+            for part in 0..crate::indirect::SPLIT {
+                unsafe {
+                    list.list
+                        .SetComputeRoot32BitConstant(param, part * crate::indirect::SPLIT_GROUPS, word);
+                    list.list.ExecuteIndirect(
+                        &signature,
+                        1,
+                        &bounded,
+                        at + u64::from(part) * crate::indirect::SPLIT_STRIDE,
+                        None,
+                        0,
+                    );
+                }
+            }
+            // SAFETY: restore group base to 0.
+            unsafe { list.list.SetComputeRoot32BitConstant(param, 0, word) };
+        } else {
+            unsafe {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                )
+            };
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

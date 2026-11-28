@@ -108,6 +108,12 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host sets: the number of
+/// the first thread group in x. The console dispatches any number of groups
+/// in one dimension; a non-AMD host at most 65,535, so a larger dispatch runs
+/// in parts, each with the groups before it here. Asked for by compute
+/// programs that read the x group number alone (the one-dimensional ones).
+pub const USER_GROUP_BASE: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

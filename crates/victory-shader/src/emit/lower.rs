@@ -2835,6 +2835,12 @@ impl<'a> Lower<'a> {
             let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
                 unreachable!()
             };
+            let group = if self.one_dimensional() {
+                let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
+                self.s.m.bin(original, Bin::Add, group, base)
+            } else {
+                group
+            };
             let Val::I32(thread) = self.thread_id(0) else {
                 unreachable!()
             };
@@ -3067,7 +3073,15 @@ impl<'a> Lower<'a> {
                 return Val::I32(v);
             }
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => {
+                let id = self.compute_id("groupId.i32", 94, c);
+                if c != 0 || !self.one_dimensional() {
+                    return id;
+                }
+                let Val::I32(id) = id else { unreachable!() };
+                let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
+                return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, id, base));
+            }
             // bits 0-5 the group's waves, 6-11 this wave's index (Mesa's `tg_size`)
             Input::GroupInfo => {
                 let StageIo::Cs(cs) = self.x.native.io else {
@@ -3145,6 +3159,28 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// Whether the program is a compute program that reads its group's
+    /// number in x alone, with room for a dword of the host's among its user
+    /// data (the host's root signature holds 64 dwords, views included).
+    fn one_dimensional(&self) -> bool {
+        const MOST: u32 = 20;
+        let reads = |c| self.x.io.inputs.iter().any(|i| i.1 == Input::GroupId(c));
+        let words = self
+            .x
+            .native
+            .layout
+            .iter()
+            .map(|e| u32::from(e.user_data) + e.sgprs)
+            .max()
+            .unwrap_or(0);
+        matches!(self.x.native.io, StageIo::Cs(_))
+            && reads(0)
+            && !reads(1)
+            && !reads(2)
+            && words <= MOST
+            && !crate::spill::is_spilled(self.x.native)
     }
 
     /// A component of a compute thread or group id, read in the entry block.
