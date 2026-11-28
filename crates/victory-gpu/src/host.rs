@@ -1655,8 +1655,16 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 /// lists put a few constants or a rectangle's corners there, and every
 /// list that did took 4 MiB of the PC's memory for it.
 const SCRATCH_FIRST: u64 = 256 << 10;
-/// The most bytes of chunks kept while no list holds them.
-const SPARE_MOST: u64 = 128 << 20;
+/// The most bytes of chunks kept while no list holds them. A constrained
+/// host can opt into a smaller cache without disabling chunk reuse.
+/// `VICTORY_SMALL_HOST=1` uses 64 MiB instead of 128 MiB.
+fn spare_most() -> u64 {
+    if std::env::var_os("VICTORY_SMALL_HOST").is_some_and(|v| v == "1") {
+        64 << 20
+    } else {
+        128 << 20
+    }
+}
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -1729,7 +1737,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
-/// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
+/// or dropped): kept for the next list, or freed past [`spare_most`] and
 /// without the pool.
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
@@ -1740,7 +1748,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, SPARE_MOST)
+                spare.give(chunk, size, spare_most())
             } else {
                 Some(chunk)
             };
