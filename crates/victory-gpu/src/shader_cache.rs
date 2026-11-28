@@ -125,6 +125,7 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_BOUNDS",
             "VICTORY_NAN_GUARD",
             "VICTORY_THREAD_TICKET",
+            "VICTORY_WATER_TILE_SLOTS",
             "VICTORY_WAVE_LDS_LOOSE",
             "VICTORY_SCC_LOCAL_ANY",
             "VICTORY_BVH_MISS",
@@ -136,6 +137,8 @@ fn build() -> [u8; 32] {
             }
             bytes.push(0);
         }
+        // Invalidate pre-fix cached Wave32 water/halves shaders cleanly.
+        bytes.extend_from_slice(b"water_halves_v1\0");
         // The list affects output with the explicit global opt-in, and on its
         // own while `VICTORY_WAVE_WIDE` is unset (the listed programs only).
         if std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v == "1")

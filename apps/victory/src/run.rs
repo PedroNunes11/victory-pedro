@@ -314,6 +314,9 @@ pub fn run(
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        // Disable GTA VI's 30 s hang watchdog so cold shader builds never abort at +0x2215c35.
+        // SAFETY: as above.
+        unsafe { victory_loader::watchdog::apply_asked(image.base(), size) };
         // Research: who asks the input devices for which sources (VICTORY_INPUT_SPY=1).
         // SAFETY: as above.
         unsafe { victory_loader::input_spy::apply(image.base(), size) };

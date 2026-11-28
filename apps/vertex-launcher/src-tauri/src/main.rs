@@ -327,6 +327,9 @@ fn save_profile(app: State<App>, mut profile: Profile) -> R<Saved> {
         profile.use_gdkx = false;
     }
     settings::save(&profile)?;
+    let wd = victory.path.as_deref().map(|p| runner::workdir(Path::new(p)));
+    let data_dir = PathBuf::from(profile.data_folder(wd.as_deref()).path);
+    let _ = settings::sync_title_settings_xml(&data_dir, &profile);
     let restart_needed = {
         let run = app.run.lock().unwrap();
         run.running
@@ -359,6 +362,8 @@ fn apply_preset(app: State<App>, preset: Preset) -> R<Profile> {
     p.apply_preset(preset);
     settings::save(&p)?;
     *app.profile.lock().unwrap() = p.clone();
+    let data_dir = resolved_data_dir(&app);
+    let _ = settings::sync_title_settings_xml(&data_dir, &p);
     Ok(p)
 }
 
@@ -435,6 +440,59 @@ async fn cache_check(app: State<'_, App>) -> R<runner::CacheCheck> {
     Ok(runner::check_cache(&cache, victory.as_deref()))
 }
 
+/// Non-blocking shader & pipeline cache clear (klbf-lab `0d20cb8` pattern):
+/// immediately renames cache subdirectories aside so the UI stays responsive,
+/// then deletes them on a background thread.
+#[tauri::command]
+async fn clear_shader_cache(app: State<'_, App>) -> R<usize> {
+    if app.run.lock().unwrap().running {
+        return Err("busy".into());
+    }
+    let profile = app.profile();
+    let victory = app.victory().ok();
+    let wd = victory.as_deref().map(runner::workdir);
+    let cache = PathBuf::from(profile.cache_folder(wd.as_deref()).path);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+
+    let mut moved: Vec<PathBuf> = Vec::new();
+    for name in ["shaders", "pipelines", "d3d12"] {
+        let src = cache.join(name);
+        if !src.exists() {
+            continue;
+        }
+        let aside = cache.join(format!("{name}.old-{stamp}"));
+        if std::fs::rename(&src, &aside).is_ok() {
+            moved.push(aside);
+        } else {
+            moved.push(src);
+        }
+    }
+    // Also sweep any leftover `.old-*` directories from an earlier interrupted delete.
+    if let Ok(entries) = std::fs::read_dir(&cache) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(".old-"))
+                && !moved.contains(&p)
+            {
+                moved.push(p);
+            }
+        }
+    }
+    let cleared = moved.len();
+    if !moved.is_empty() {
+        std::thread::spawn(move || {
+            for dir in moved {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        });
+    }
+    Ok(cleared)
+}
+
 fn game_of(profile: &Profile) -> R<PathBuf> {
     let game = PathBuf::from(profile.game_exe.trim());
     if profile.game_exe.trim().is_empty() || !game.is_file() {
@@ -454,6 +512,9 @@ fn launch_play_now(app: &App) -> R<Started> {
     let game = game_of(&profile)?;
     let victory = app.victory()?;
     let data_dir = resolved_data_dir(app);
+    // Sync the title's saved settings.xml (resolution, uiResolution, unlocked FPS/VSync,
+    // anisotropic filtering, and preset graphics toggles) before launching.
+    let _ = settings::sync_title_settings_xml(&data_dir, &profile);
     // Ensure native-keys.txt exists before launching in native controls mode.
     if profile.native_controls && !native_keys::native_keys_path(&data_dir).is_file() {
         let _ = native_keys::reset(&data_dir);
@@ -858,6 +919,7 @@ fn main() {
             pick_folder,
             check_gdkx,
             cache_check,
+            clear_shader_cache,
             start_play,
             restart_game,
             start_prebuild,

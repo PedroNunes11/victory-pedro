@@ -114,6 +114,7 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
+mod water_tile_slots;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -493,13 +494,23 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     }
 }
 
+/// Brings a console program into the form this host translates, where one differs
+/// from the program as the title has it: on 32-lane wave hosts the water light's
+/// tile lists take one slot per lane ([`water_tile_slots`]).
+pub fn host_form(c: &Container, native: &mut NativeProgram) -> bool {
+    lower::host_max_wave() == 32
+        && c.digest == water_tile_slots::CONTAINER
+        && water_tile_slots::on()
+        && water_tile_slots::rewrite(native)
+}
+
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let mut native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -511,6 +522,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    host_form(&c, &mut native);
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').

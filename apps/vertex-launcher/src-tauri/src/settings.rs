@@ -355,6 +355,14 @@ pub const MANAGED: &[&str] = &[
     "VICTORY_SEND_SPARE_MB",
     "VICTORY_STAGING_REST_MS",
     "VICTORY_STAGING_PACK",
+    "VICTORY_COPY_BESIDE",
+    "VICTORY_STORE_BESIDE",
+    "VICTORY_GPU_BACK_MAX_KB",
+    "VICTORY_DLSS_PRESET",
+    "VICTORY_WATER_TILE_SLOTS",
+    "VICTORY_THREAD_TICKET",
+    "VICTORY_AMBIENT_AIR",
+    "VICTORY_AMBIENT_MOST",
     "VICTORY_CONTROLS_MENU",
     "VICTORY_DPI_AWARE",
 ];
@@ -869,6 +877,9 @@ impl Profile {
         {
             let s = plugin.display().to_string();
             put("VICTORY_DLSS_PLUGIN", &s);
+            // DLSS 4 Transformer model (Preset K): dramatically sharper textures & cleaner motion
+            // than the legacy CNN preset 0, especially at 1080p/1440p Quality.
+            put("VICTORY_DLSS_PRESET", "K");
             if let Some(sdk) = find_dlss_sdk(&self.dlss_sdk_dir, victory_exe) {
                 let sdk_s = sdk.display().to_string();
                 put("VICTORY_DLSS_SDK", &sdk_s);
@@ -958,12 +969,25 @@ impl Profile {
         };
         put("VICTORY_SEND_SPARE_MB", send_spare_mb);
         put("VICTORY_STAGING_REST_MS", staging_rest_ms);
+        // Parallel copy/store beside guard locks (hotscarlett): cuts guard waits ~44 ms -> ~8 ms/frame.
+        put("VICTORY_COPY_BESIDE", "1");
+        put("VICTORY_STORE_BESIDE", "1");
+        // Skip shader write copy-back above size threshold (hotscarlett): cuts copy-back ~23 -> 1 MB/frame.
+        let back_max_kb = match self.preset {
+            Preset::Performance | Preset::Balanced => "256",
+            Preset::HighQuality | Preset::Native4k => "512",
+        };
+        put("VICTORY_GPU_BACK_MAX_KB", back_max_kb);
+        // Water black-tile / Wave32 group-ticket fixes (hotscarlett 088c2d3 + 9093067).
+        put("VICTORY_WATER_TILE_SLOTS", "1");
+        put("VICTORY_THREAD_TICKET", "1");
         // Skip heat-haze pass that smears pixels and corrupts DLSS motion vectors.
         put("VICTORY_LEAVE_OUT", "731a39171b568298");
         put("VICTORY_DYNAMIC_SLOTS", "393216");
+        // Balanced ambient lighting without clamping screen-space water reflections down to 0.5x.
         if !self.reflections {
-            put("VICTORY_REFLECT_SCREEN", "1");
-            put("VICTORY_AMBIENT_REFLECT", "0.5");
+            put("VICTORY_AMBIENT_AIR", "1.5");
+            put("VICTORY_AMBIENT_MOST", "2");
         }
 
         // --- Optional Microsoft GDKX (`xg_xs.dll`) for exact Scarlett tiling ---
@@ -1344,21 +1368,23 @@ impl Profile {
         self.extra_env.clear();
         match preset {
             Preset::Performance => {
-                // Maximum FPS & lowest CPU/VRAM footprint:
-                // Series S console profile (genuinely fewer draw calls & lighter scene LODs),
-                // 1080p output, 58% DLSS Balanced (or 67% native), DRED off (-1..2 ms),
-                // aggressive staging/send buffer trims.
+                // 30+ FPS with sharp textures on Series S:
+                // Series S console profile (fewer draw calls & lighter scene LODs) + unlocked
+                // settings.xml (low shadows/LOD, AF 8x, VSync off), 1080p output, 67% DLSS Quality
+                // (1280x720 internal with DLSS Preset K Transformer instead of mushy 1113x626 CNN),
+                // fast 4-frame mip sharpening & generous texture staging so textures stay crisp,
+                // DRED off (-1..2 ms), aggressive send/staging trims + beside copies + 256 KB back cap.
                 self.console = Console::SeriesS;
                 self.output_resolution = "1920x1080".into();
-                self.dlss = DlssMode::Balanced;
+                self.dlss = DlssMode::Quality;
                 self.render_scale = Some(0.6667);
                 self.lod_bias = Some(-0.79);
-                self.texture_room_percent = 88;
-                self.texture_pool_spares = 4;
-                self.texture_partial_frames = 12;
-                self.texture_stage_ms = 10;
-                self.card_buffers_mb = 1024;
-                self.card_windows_mb = 512;
+                self.texture_room_percent = 94;
+                self.texture_pool_spares = 8;
+                self.texture_partial_frames = 4;
+                self.texture_stage_ms = 18;
+                self.card_buffers_mb = 1536;
+                self.card_windows_mb = 1024;
                 self.pipeline_wait_ms = Some(6);
                 self.dred_light = false;
             }
@@ -1450,6 +1476,174 @@ pub fn save(profile: &Profile) -> Result<(), String> {
     std::fs::rename(&temp, &path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+fn replace_xml_value(xml: &mut String, tag: &str, value: &str) -> bool {
+    let needle = format!("<{tag} value=\"");
+    let Some(start) = xml.find(&needle) else {
+        return false;
+    };
+    let val_start = start + needle.len();
+    let Some(rel_end) = xml[val_start..].find('"') else {
+        return false;
+    };
+    let val_end = val_start + rel_end;
+    if &xml[val_start..val_end] == value {
+        return false;
+    }
+    xml.replace_range(val_start..val_end, value);
+    true
+}
+
+fn replace_xml_block_wh(xml: &mut String, block: &str, w: &str, h: &str) -> bool {
+    let open = format!("<{block}>");
+    let close = format!("</{block}>");
+    let Some(start) = xml.find(&open) else {
+        return false;
+    };
+    let inner_start = start + open.len();
+    let Some(rel_close) = xml[inner_start..].find(&close) else {
+        return false;
+    };
+    let inner_end = inner_start + rel_close;
+    let mut inner = xml[inner_start..inner_end].to_string();
+    let changed_w = replace_xml_value(&mut inner, "width", w);
+    let changed_h = replace_xml_value(&mut inner, "height", h);
+    if !changed_w && !changed_h {
+        return false;
+    }
+    xml.replace_range(inner_start..inner_end, &inner);
+    true
+}
+
+fn replace_xml_inner_text(xml: &mut String, tag: &str, text: &str) -> bool {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let Some(start) = xml.find(&open) else {
+        return false;
+    };
+    let inner_start = start + open.len();
+    let Some(rel_close) = xml[inner_start..].find(&close) else {
+        return false;
+    };
+    let inner_end = inner_start + rel_close;
+    if &xml[inner_start..inner_end] == text {
+        return false;
+    }
+    xml.replace_range(inner_start..inner_end, text);
+    true
+}
+
+/// Syncs every title `settings.xml` under `<data_dir>\<title_id>\storage\settings\settings.xml`
+/// to match the active Vertex profile:
+/// - Matches `<resolutionFullscreen>` and `<uiResolution>` to `profile.output_resolution`
+///   (fixes oversized 1.33x-2x menus per hotscarlett 0f6d106 + 2e58075).
+/// - Unlocks console 30 FPS half-VSync (`vSync=0`, `frameRateLimit=0`, `desiredFPS=60`).
+/// - Applies genuine per-preset graphics quality settings (anisotropic filtering, texture
+///   mip upgrade rate, LOD/grass scale, RT dynamic shadows, shadow detail, SSRO, water
+///   reflection resolution, decoration shift, motion blur, and video card description).
+/// Creates a one-time `settings.xml.bak` backup before the first modification.
+pub fn sync_title_settings_xml(data_dir: &Path, profile: &Profile) -> Vec<String> {
+    let mut updated = Vec::new();
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return updated;
+    };
+    let (w_num, h_num) = parse_size(&profile.output_resolution).unwrap_or((2560, 1440));
+    let w = w_num.to_string();
+    let h = h_num.to_string();
+    let card_desc = match profile.console {
+        Console::SeriesS => "Xbox Series S",
+        Console::SeriesX => "Xbox Series X",
+    };
+
+    // Per-preset real in-game graphics tuning (written to settings.xml).
+    let (
+        af,
+        max_tex_up,
+        lod_scale,
+        grass_lod,
+        rt_dyn_shadows,
+        particle_shadows,
+        alpha_shadows,
+        ssro_samples,
+        water_rx,
+        water_ry,
+        deco_shift,
+        fsr_quality,
+        quality_preset,
+    ) = match profile.preset {
+        Preset::Performance => (
+            "8", "12", "0.750000", "0.500000", "false", "false", "false", "1", "256", "128", "1",
+            "2", "0.000000",
+        ),
+        Preset::Balanced => (
+            "16", "12", "1.000000", "0.850000", "false", "true", "true", "2", "512", "256", "0",
+            "2", "1.000000",
+        ),
+        Preset::HighQuality => (
+            "16", "16", "1.000000", "1.000000", "true", "true", "true", "2", "512", "256", "0",
+            "3", "2.000000",
+        ),
+        Preset::Native4k => (
+            "16", "16", "1.000000", "1.000000", "true", "true", "true", "2", "1024", "512", "0",
+            "3", "2.000000",
+        ),
+    };
+
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let xml_path = dir.join("storage").join("settings").join("settings.xml");
+        if !xml_path.is_file() {
+            continue;
+        }
+        let Ok(mut text) = std::fs::read_to_string(&xml_path) else {
+            continue;
+        };
+        let mut changed = false;
+        changed |= replace_xml_block_wh(&mut text, "resolutionFullscreen", &w, &h);
+        changed |= replace_xml_block_wh(&mut text, "uiResolution", &w, &h);
+        changed |= replace_xml_value(&mut text, "vSync", "0");
+        changed |= replace_xml_value(&mut text, "frameRateLimit", "0");
+        changed |= replace_xml_value(&mut text, "desiredFPS", "60");
+        changed |= replace_xml_value(&mut text, "anisotropicFiltering", af);
+        changed |= replace_xml_value(&mut text, "maxTexUpgradesPerFrame", max_tex_up);
+        changed |= replace_xml_value(&mut text, "lodScale", lod_scale);
+        changed |= replace_xml_value(&mut text, "grassLod", grass_lod);
+        changed |= replace_xml_value(&mut text, "rtDynamicShadows", rt_dyn_shadows);
+        changed |= replace_xml_value(&mut text, "shadowParticleShadows", particle_shadows);
+        changed |= replace_xml_value(&mut text, "shadowAlphaTintedShadows", alpha_shadows);
+        changed |= replace_xml_value(&mut text, "ssroSampleCount", ssro_samples);
+        changed |= replace_xml_value(&mut text, "waterReflectionResX", water_rx);
+        changed |= replace_xml_value(&mut text, "waterReflectionResY", water_ry);
+        changed |= replace_xml_value(&mut text, "motionBlur", "false");
+        changed |= replace_xml_value(&mut text, "decorationResolutionShift", deco_shift);
+        changed |= replace_xml_value(&mut text, "fsrQuality", fsr_quality);
+        changed |= replace_xml_value(&mut text, "graphicsQualityPreset", quality_preset);
+        changed |= replace_xml_inner_text(&mut text, "videoCardDescription", card_desc);
+
+        if !changed {
+            continue;
+        }
+        let bak_path = xml_path.with_extension("xml.bak");
+        if !bak_path.exists() {
+            let _ = std::fs::copy(&xml_path, &bak_path);
+        }
+        let tmp_path = xml_path.with_extension("xml.vertex-new");
+        let write_ok = if std::fs::write(&tmp_path, text.as_bytes()).is_ok() {
+            std::fs::rename(&tmp_path, &xml_path)
+                .or_else(|_| std::fs::write(&xml_path, text.as_bytes()))
+                .is_ok()
+        } else {
+            std::fs::write(&xml_path, text.as_bytes()).is_ok()
+        };
+        if write_ok {
+            updated.push(xml_path.display().to_string());
+        }
+    }
+    updated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1470,19 +1664,29 @@ mod tests {
         assert_eq!(p.console, Console::SeriesS);
         assert_eq!(val_with_dlss(&p, "VICTORY_OUTPUT", true).as_deref(), Some("1920x1080"));
         assert_eq!(val_with_dlss(&p, "VICTORY_UPSCALER", true), None);
-        assert_eq!(val_with_dlss(&p, "VICTORY_FFX_SCALE", true).as_deref(), Some("0.58"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_FFX_SCALE", true).as_deref(), Some("0.6667"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_DLSS_PRESET", true).as_deref(), Some("K"));
         assert_eq!(val_with_dlss(&p, "VICTORY_LOD_BIAS", true).as_deref(), Some("-0.79"));
         assert_eq!(val_with_dlss(&p, "VICTORY_D3D12_DRED", true).as_deref(), Some("0"));
         assert_eq!(val_with_dlss(&p, "VICTORY_JOIN_BARRIERS", true).as_deref(), Some("1"));
-        assert_eq!(val_with_dlss(&p, "VICTORY_TEXTURE_ROOM_PERCENT", true).as_deref(), Some("88"));
-        assert_eq!(val_with_dlss(&p, "VICTORY_TEXTURE_STAGE_MS", true).as_deref(), Some("10"));
-        assert_eq!(val_with_dlss(&p, "VICTORY_CARD_BUFFERS_MB", true).as_deref(), Some("1024"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_TEXTURE_ROOM_PERCENT", true).as_deref(), Some("94"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_TEXTURE_PARTIAL_FRAMES", true).as_deref(), Some("4"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_TEXTURE_STAGE_MS", true).as_deref(), Some("18"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_CARD_BUFFERS_MB", true).as_deref(), Some("1536"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_CARD_WINDOWS_MB", true).as_deref(), Some("1024"));
         assert_eq!(val_with_dlss(&p, "VICTORY_PIPELINE_WAIT_MS", true).as_deref(), Some("6"));
         assert_eq!(val_with_dlss(&p, "VICTORY_SUBMIT_FRAMES", true).as_deref(), Some("2"));
         assert_eq!(val_with_dlss(&p, "VICTORY_TITLE_USED_MB", true).as_deref(), Some("title"));
         assert_eq!(val_with_dlss(&p, "VICTORY_SEND_SPARE_MB", true).as_deref(), Some("128"));
         assert_eq!(val_with_dlss(&p, "VICTORY_STAGING_REST_MS", true).as_deref(), Some("250"));
         assert_eq!(val_with_dlss(&p, "VICTORY_STAGING_PACK", true).as_deref(), Some("1"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_COPY_BESIDE", true).as_deref(), Some("1"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_STORE_BESIDE", true).as_deref(), Some("1"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_GPU_BACK_MAX_KB", true).as_deref(), Some("256"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_WATER_TILE_SLOTS", true).as_deref(), Some("1"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_THREAD_TICKET", true).as_deref(), Some("1"));
+        assert_eq!(val_with_dlss(&p, "VICTORY_REFLECT_SCREEN", true), None);
+        assert_eq!(val_with_dlss(&p, "VICTORY_AMBIENT_AIR", true).as_deref(), Some("1.5"));
         assert_eq!(val_with_dlss(&p, "VICTORY_CARD_AWAKE", true).as_deref(), Some("0"));
 
         p.apply_preset(Preset::Balanced);
@@ -1613,6 +1817,87 @@ mod tests {
         let missing = detect_gdkx(dir.join("missing").to_str().unwrap(), None);
         assert!(!missing.installed);
         assert_eq!(missing.xg_dll, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_title_settings_xml_applies_preset_and_unlocks_fps() {
+        let dir = std::env::temp_dir().join(format!("vertex-xml-test-{}", std::process::id()));
+        let settings_dir = dir.join("7952987A").join("storage").join("settings");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        let xml_path = settings_dir.join("settings.xml");
+        let sample = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rage__fwSystemSettingsCollection>
+  <graphics>
+    <anisotropicFiltering value="0" />
+    <desiredFPS value="30" />
+    <fsrQuality value="2" />
+    <graphicsQualityPreset value="0.000000" />
+  </graphics>
+  <advancedGraphics>
+    <decorationResolutionShift value="0" />
+    <grassLod value="1.000000" />
+    <lodScale value="1.000000" />
+    <maxTexUpgradesPerFrame value="5" />
+    <motionBlur value="true" />
+    <rtDynamicShadows value="true" />
+    <shadowAlphaTintedShadows value="true" />
+    <shadowParticleShadows value="true" />
+    <ssroSampleCount value="2" />
+    <waterReflectionResX value="512" />
+    <waterReflectionResY value="256" />
+  </advancedGraphics>
+  <video>
+    <uiResolution>
+      <width value="0" />
+      <height value="0" />
+    </uiResolution>
+    <resolutionFullscreen>
+      <width value="2560" />
+      <height value="1440" />
+    </resolutionFullscreen>
+    <frameRateLimit value="30" />
+    <vSync value="2" />
+  </video>
+  <videoCardDescription>Xbox Series X</videoCardDescription>
+</rage__fwSystemSettingsCollection>"#;
+        std::fs::write(&xml_path, sample).unwrap();
+
+        let mut p = Profile::default();
+        p.apply_preset(Preset::Performance);
+        let updated = sync_title_settings_xml(&dir, &p);
+        assert_eq!(updated.len(), 1);
+        assert!(xml_path.with_extension("xml.bak").is_file());
+
+        let perf_xml = std::fs::read_to_string(&xml_path).unwrap();
+        assert!(perf_xml.contains("<vSync value=\"0\" />"));
+        assert!(perf_xml.contains("<frameRateLimit value=\"0\" />"));
+        assert!(perf_xml.contains("<desiredFPS value=\"60\" />"));
+        assert!(perf_xml.contains("<anisotropicFiltering value=\"8\" />"));
+        assert!(perf_xml.contains("<maxTexUpgradesPerFrame value=\"12\" />"));
+        assert!(perf_xml.contains("<lodScale value=\"0.750000\" />"));
+        assert!(perf_xml.contains("<grassLod value=\"0.500000\" />"));
+        assert!(perf_xml.contains("<rtDynamicShadows value=\"false\" />"));
+        assert!(perf_xml.contains("<ssroSampleCount value=\"1\" />"));
+        assert!(perf_xml.contains("<waterReflectionResX value=\"256\" />"));
+        assert!(perf_xml.contains("<motionBlur value=\"false\" />"));
+        assert!(perf_xml.contains("<width value=\"1920\" />"));
+        assert!(perf_xml.contains("<height value=\"1080\" />"));
+        assert!(perf_xml.contains("<videoCardDescription>Xbox Series S</videoCardDescription>"));
+
+        p.apply_preset(Preset::HighQuality);
+        let updated2 = sync_title_settings_xml(&dir, &p);
+        assert_eq!(updated2.len(), 1);
+        let hq_xml = std::fs::read_to_string(&xml_path).unwrap();
+        assert!(hq_xml.contains("<anisotropicFiltering value=\"16\" />"));
+        assert!(hq_xml.contains("<maxTexUpgradesPerFrame value=\"16\" />"));
+        assert!(hq_xml.contains("<rtDynamicShadows value=\"true\" />"));
+        assert!(hq_xml.contains("<lodScale value=\"1.000000\" />"));
+        assert!(hq_xml.contains("<width value=\"2560\" />"));
+        assert!(hq_xml.contains("<height value=\"1440\" />"));
+        assert!(hq_xml.contains("<videoCardDescription>Xbox Series X</videoCardDescription>"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

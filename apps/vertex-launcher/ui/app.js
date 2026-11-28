@@ -1710,6 +1710,28 @@
           tip(K.warmTip),
           h("button", { class: "btn", disabled: running || !v.path, onclick: () => startRun("shaders") }, icon("spark"), K.shadersBtn),
           tip(K.shadersTip),
+          h("button", {
+            class: "btn ghost",
+            disabled: running,
+            onclick: () => {
+              choose({
+                iconName: "warn",
+                title: K.clearConfirmTitle,
+                lines: [K.clearConfirmBody],
+                choices: [
+                  [K.clearBtn, true, async () => {
+                    try {
+                      const n = await invoke("clear_shader_cache");
+                      toast(n > 0 ? K.clearDone : K.clearEmpty);
+                      await refreshCache();
+                    } catch (e) { toast(errText(e), true); }
+                  }],
+                  [S.controls.cancel, false, () => {}],
+                ],
+              });
+            },
+          }, K.clearBtn),
+          tip(K.clearTip),
         ),
         boolSetting(K.warmAll, p.prebuild_all, (x) => { p.prebuild_all = x; changed(true, false); }),
       ),

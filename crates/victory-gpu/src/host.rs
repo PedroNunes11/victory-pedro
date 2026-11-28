@@ -7500,6 +7500,25 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        // `VICTORY_GPU_BACK_MAX_KB=<n>` (ported from HotScarlett / scarlet-fps 24e9826):
+        // shader writes to ranges larger than `n` KiB stay on the card without copying back
+        // into title memory (0 copies none; unset copies all as before).
+        static MOST: OnceLock<Option<usize>> = OnceLock::new();
+        let most = *MOST.get_or_init(|| {
+            let most = std::env::var("VICTORY_GPU_BACK_MAX_KB")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok());
+            if let Some(kb) = most {
+                tracing::info!(
+                    kb,
+                    "shader writes of ranges over {kb} KiB are not copied back into title memory (VICTORY_GPU_BACK_MAX_KB)"
+                );
+            }
+            most.map(|kb| kb << 10)
+        });
+        if most.is_some_and(|most| len > most || most == 0) {
+            return;
+        }
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
