@@ -9190,7 +9190,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     #[cfg(feature = "diagnostics")]
     let sparse = std::time::Instant::now();
-    if !title_dst && len >= 64 << 10 {
+    if title_dst {
+        title_pieces(src, dst, len);
+    } else if len >= 64 << 10 {
         read_sparse(src, dst, len);
     } else {
         read_pieces(src, dst, len);
@@ -9261,6 +9263,58 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
                     zero(to, n);
                 }
             });
+        }
+    });
+}
+
+/// [`read_pieces`] into title memory that is mapped: zeros only for what
+/// cannot be READ. A copy into title memory also fails when the destination
+/// cannot be written, as when another thread's asking guards its block again
+/// between [`crate::watch::writing`] and the copy; `read_pieces` took that
+/// for an unreadable source and put zeros over the title's bytes. Such a
+/// piece is written again with its guard opened, and left as it is if that
+/// fails too.
+fn title_pieces(src: *const u8, dst: *mut u8, len: usize) {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const PIECE: usize = 4 << 10;
+    for_pieces(src as usize, len, 64 << 10, |at, n| {
+        let to = dst.wrapping_add(at - src as usize);
+        if read(at as *const u8, to, n) {
+            return;
+        }
+        // Cut at the pages of both sides: a piece in one page of each.
+        let mut cut = at;
+        while cut < at + n {
+            let to = dst.wrapping_add(cut - src as usize);
+            let step = (PIECE - cut % PIECE)
+                .min(PIECE - to as usize % PIECE)
+                .min(at + n - cut);
+            let (at, n) = (cut, step);
+            cut += step;
+            let mut bytes = [0u8; PIECE];
+            if !read(at as *const u8, bytes.as_mut_ptr(), n) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                bytes = [0u8; PIECE];
+            }
+            for _ in 0..4 {
+                crate::watch::writing(to as usize, n);
+                let mut done = 0;
+                // SAFETY: the source is ours; the kernel checks the
+                // destination and writes nothing it cannot.
+                if unsafe {
+                    NtWriteVirtualMemory(
+                        GetCurrentProcess(),
+                        to.cast(),
+                        bytes.as_ptr().cast(),
+                        n,
+                        &mut done,
+                    )
+                } >= 0
+                {
+                    break;
+                }
+            }
         }
     });
 }
