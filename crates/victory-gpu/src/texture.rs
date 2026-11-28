@@ -93,8 +93,17 @@ unsafe impl Send for Spare {}
 /// Spare staging buffers by size (a power of two), and their bytes in all.
 static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
     Mutex::new((std::collections::BTreeMap::new(), 0));
-/// The most bytes kept spare, and the largest buffer that is pooled.
-const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
+/// The largest staging buffer that is pooled.
+const SPARE_LARGEST: u64 = 8 << 20;
+/// The most bytes of staging buffers kept spare. `VICTORY_SMALL_HOST=1`
+/// retains 64 MiB after a streaming burst instead of 256 MiB.
+fn spare_most() -> u64 {
+    if std::env::var_os("VICTORY_SMALL_HOST").is_some_and(|v| v == "1") {
+        64 << 20
+    } else {
+        256 << 20
+    }
+}
 /// Staging buffers taken from the spare ones, and made, since the start.
 pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
@@ -113,7 +122,7 @@ pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std:
 fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let size = total.max(64 << 10).next_power_of_two();
-    if size > SPARE_MOST.1 || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
+    if size > SPARE_LARGEST || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
         return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
     }
     let spare = {
@@ -568,7 +577,7 @@ impl Drop for Staging {
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
             let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-            if all.1 + self.pooled <= SPARE_MOST.0 {
+            if all.1 + self.pooled <= spare_most() {
                 all.1 += self.pooled;
                 all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
             }

@@ -1262,10 +1262,21 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
+/// The most snapshot bytes kept for reuse. The reduced-host policy retains
+/// a small scratch reserve but returns completed large snapshots to Windows.
+/// `VICTORY_SMALL_HOST=1` uses 64 MiB instead of 512 MiB.
+fn pooled_most() -> usize {
+    if std::env::var_os("VICTORY_SMALL_HOST").is_some_and(|v| v == "1") {
+        64 << 20
+    } else {
+        512 << 20
+    }
+}
+
 /// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// of those the largest one and the next ones up to [`pooled_most`] bytes in
+/// all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
@@ -1274,7 +1285,7 @@ fn give_back(v: Vec<u8>) {
     pool.retain(|v| {
         seen += 1;
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+        seen == 1 || total <= pooled_most()
     });
 }
 
