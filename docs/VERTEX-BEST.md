@@ -1,12 +1,26 @@
-# Vertex best-of build (`vertex/axx-best`)
+# Vertex unified build (`vertex/unified`, built on `vertex/axx-best` + `vertex/glyphs`)
 
-The branch that gathers the best of AnyXboxX, VIctory-NVIDIA (trustno1-coder), Vertex's own work and
-community fixes on top of the AnyXboxX / Vice-Tay engine base, for one machine: RTX 5070 12 GB,
-Ryzen 9 9950X3D, 32 GB RAM, Grand Theft Auto VI 1.0.2.1 as Series X, 2560x1440 with DLSS.
+The unified branch that gathers the best of AnyXboxX, VIctory-NVIDIA (trustno1-coder), Vertex's own
+work (`unify/all-forks`, `vertex/glyphs`, side branches), and community / PR fixes on top of the
+AnyXboxX / Vice-Tay engine base.
 
-Status (2026-11-28): everything below builds and its unit tests pass (engine 1,155+, launcher 28; `audio::tests::apu_alloc_map_unmap_and_free_round_trip` can fail when run in parallel with the other APU heap test: shared global heap, passes alone, not touched here).
-**Nothing on this branch has been measured in game yet**: the A/B against the user's previous build
-(`56f395e1`) is the next step. No game files and no NVIDIA binaries are in the tree.
+Status (2026-11-28): everything below builds (`victory.exe` diag+diagnostics, `vertex-launcher.exe`
+release, `victory_glyphs.dll`) and all unit test suites pass.
+**Next step:** in-game A/B against the previous build (`56f395e1`), then branch/worktree cleanup.
+No game files and no NVIDIA binaries are in the tree.
+
+### Unified merges added on top of `vertex/glyphs` (`373689f7`)
+| Area | Change | Source / Switch |
+|---|---|---|
+| Shaders (P0) | Restore AscilCH fixes (`v_div_fixup_f32` `0/x` & `x/Inf`, `wavePrefixOp.f32` signed flag, `v_cvt_{u16,i16}_f16` integer NaN check, MIMG 3D Z/a16 offsets), keep empty-EXEC branches that reactivate lanes, bump `TRANSLATOR_VERSION` to 4 | `76f874c7`, `97b1300e`, `b74b669e`, `194c7364` |
+| Shaders (PRs) | `ds_sub_u32` LDS atomic fix, `v_mad_i64_i32`, `s_brev_b64`, pixel `SV_Coverage`, constant 64-bit compares, DXBC signature bounds, spill hybrid-root guard, validator null-blob / `ds_wrap` / `global_addtid` fixes | PRs `#628`, `#629`, `#630`, `#635`, `#638`, `#639`, `#657`, `#658` |
+| GPU / Formats (P1) | Pipe/bank XOR swizzle addressing (PastiiJay, MIT) so ocean heightmap / `texback` copy-back tiles properly | `4ee6d153` |
+| GPU / Shaders (P1) | Split >65,535-group 1D direct & indirect dispatches on non-AMD hosts (`USER_GROUP_BASE = 0x107`) while preserving AMD's wide path | `0abcd8b4` |
+| GPU safety (P0/P1) | Fix AMD `VICTORY_DYNAMIC_SLOTS` regression on uncapped heaps; default `VICTORY_WC_NO_BACK_MIN_KB` to 1024; `held_elsewhere` shared-copy coherence under `WC_NO_BACK` (`VICTORY_WC_NO_BACK_SHARED`); atomic concurrent frame waits; retry failed title copies instead of zero-fill; `inplace.rs` aligned-span overflow, atomic budget, and late-wait mutual exclusion | `1104466a`, `36f033e0` (MIT fix), `59d53a22`, `dd202bc5`, `66f41e05` |
+| GPU perf & ordering | `RECORD_LEAN` read-back buffer pool in `texback` (16/size, 128 MB cap; `VICTORY_TEXBACK_POOL=0` disables) + async read-back writer settle flush | `04b90185` |
+| AnyXboxX PRs | Diagnostic switches excluded from shader cache key (`#301`), data-dir-inside-cache-dir guard (`#322`), per-core CPU & worker-pool overlay (`#455`) | AnyXboxX `#301`, `#322`, `#455` |
+| Audio / HLE | Mono DSP convolutions so TVs, phone calls, and reverb are heard (`VICTORY_DSP_CONVOLVE=0` disables, `VICTORY_DSP_GAIN`); optional Bink movie skipper (`VICTORY_SKIP_BINK=1/all`, off) | VNV `eca45ac2`, `e31f4740` |
+| Diagnostics / Launcher | `VICTORY_DLSS_CHECK=n`; poison-safe locks inside launcher `WH_KEYBOARD_LL` callback (`hotkey.rs`) | `5f8ff886` |
 
 ## Build
 
