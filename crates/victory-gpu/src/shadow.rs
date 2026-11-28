@@ -2564,14 +2564,15 @@ fn wc_no_back() -> bool {
 }
 
 /// The smallest copy whose shader writes [`wc_no_back`] leaves on the card,
-/// in bytes (`VICTORY_WC_NO_BACK_MIN_KB`, 0 unset: all). With every copy
-/// left, the 4070 SUPER's cutscenes went near black (run xd-wcnoback,
-/// 2026-11-26: small results the title reads back, such as exposure, came
-/// back stale) while most of the saving is in a few ranges of hundreds of MB.
+/// in bytes (`VICTORY_WC_NO_BACK_MIN_KB`, 1024 unset: 1 MiB; `0` leaves all).
+/// With every copy left, the 4070 SUPER's cutscenes went near black (run
+/// xd-wcnoback, 2026-11-26: small results the title reads back, such as
+/// exposure, came back stale) while most of the saving is in a few ranges of
+/// hundreds of MB.
 fn wc_no_back_min() -> u64 {
     static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MIN.get_or_init(|| {
-        std::env::var("VICTORY_WC_NO_BACK_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) * 1024
+        std::env::var("VICTORY_WC_NO_BACK_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) * 1024
     })
 }
 

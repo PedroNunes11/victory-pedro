@@ -165,7 +165,7 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
         if !injected {
             let msg = wparam.0 as u32;
             let vk = info.vkCode;
-            let target = state.desired.lock().unwrap().0;
+            let target = state.desired.lock().unwrap_or_else(|e| e.into_inner()).0;
 
             if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
                 let win = is_down(i32::from(VK_LWIN.0)) || is_down(i32::from(VK_RWIN.0));
@@ -175,7 +175,8 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
 
                 if target.matches(vk, win, alt, ctrl, shift) {
                     if !state.key_down.swap(true, Ordering::SeqCst) {
-                        *state.last_trigger.lock().unwrap() = Some(Instant::now());
+                        *state.last_trigger.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(Instant::now());
                         let tid = state.thread_id.load(Ordering::Acquire);
                         if tid != 0 {
                             // SAFETY: lightweight async wake to our dedicated hotkey thread.
@@ -195,11 +196,11 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
                     && state
                         .last_trigger
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .is_some_and(|t| t.elapsed() < Duration::from_secs(2))
                 {
                     // Prevent Windows Start Menu from opening when releasing Win after our hotkey.
-                    *state.last_trigger.lock().unwrap() = None;
+                    *state.last_trigger.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     // SAFETY: harmless unassigned virtual-key mask pulse to cancel Start Menu.
                     unsafe {
                         keybd_event(0xFF, 0, Default::default(), 0);

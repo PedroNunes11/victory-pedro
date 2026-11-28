@@ -1787,16 +1787,19 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
 /// refused, with 2,639 indirect draws and dispatches).
 fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_DYNAMIC_SLOTS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
-    });
     if null < PORTABLE_VIEWS {
         return dynamic_capped(null);
     }
+    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    // On uncapped heaps (AMD), never shrink below the 2^20 default when
+    // `VICTORY_DYNAMIC_SLOTS` is set for NVIDIA's capped heap (e.g. 393216).
+    let most = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_DYNAMIC_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|n| n.max(DYNAMIC << 2))
+            .unwrap_or(DYNAMIC << 2)
+    });
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
 

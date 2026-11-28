@@ -2531,7 +2531,7 @@ impl<'a> Lower<'a> {
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
             (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
                 let r = self.s.op(
                     c,
                     &format!("wavePrefixOp.{sfx}"),
@@ -9299,16 +9299,19 @@ impl<'a> Lower<'a> {
                 let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
                 let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
                 let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
-                let make_inf = {
-                    let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
-                    self.s.m.bin(c, Bin::Or, t, q_nan)
-                };
+                let make_inf = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
                 let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
                 let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
                 let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
                 let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
                 let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
-                let r = self.s.m.select(c, make_zero, sign, signed_q);
+                // Priority (highest to lowest): n_nan, d_nan, invalid (0/0 or
+                // Inf/Inf), make_inf (n_inf or d_zero), make_zero (d_inf or
+                // n_zero), q_nan (overflowed quotient -> signed Inf), signed_q.
+                // `q_nan` must stay below `make_zero` because `v_div_scale_f32`
+                // and `v_fma_f32(-Inf, 0, 1)` produce qNaN on `0 / x` and `x / Inf`.
+                let r = self.s.m.select(c, q_nan, signed_inf, signed_q);
+                let r = self.s.m.select(c, make_zero, sign, r);
                 let r = self.s.m.select(c, make_inf, signed_inf, r);
                 let r = self.s.m.select(c, invalid, kneg_qnan, r);
                 let r = self.s.m.select(c, d_nan, d_qnan, r);
@@ -10519,7 +10522,7 @@ impl<'a> Lower<'a> {
             let t = self.binary(35, a, lo);
             let t = self.binary(36, t, hi);
             let r = self.s.m.cast(c, Cast::FpToSi, t, i32t);
-            let nan = self.s.m.cmp(c, pred::UNO, a, a);
+            let nan = self.is_nan_f32(a);
             let z = self.s.m.i32(0);
             let r = self.s.m.select(c, nan, z, r);
             return self.write_half(inst, r, guard);
@@ -12220,13 +12223,34 @@ impl<'a> Lower<'a> {
                 *o = zero;
             }
             if offset_word && offsets > 0 {
-                let w = addr_val(self, 0)?;
-                for (k, at) in [(0, 26), (1, 18)].into_iter().take(offsets.min(2)) {
-                    // Bits at..at+5 sign-extended: shift up, then down.
-                    let left = self.s.m.i32(at);
-                    let t = self.s.m.bin(c, Bin::Shl, w, left);
-                    let k26 = self.s.m.i32(26);
-                    os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
+                // The offset word is always 32-bit (6-bit signed X/Y/Z in bits
+                // 0..5, 8..13, 16..21), even under `a16`. DXIL `sample*` ops
+                // require immediate constant offsets in -8..=7; fold constant
+                // words in range directly, and keep dynamic extraction for
+                // programmable gathers / out-of-range offsets.
+                let w = addr_u32(self, 0)?;
+                let folded = self.s.m.int_value(w).and_then(|w| {
+                    let w = w as u32;
+                    let fields: Vec<i32> = (0..offsets)
+                        .map(|k| {
+                            let x = (w >> (8 * k) & 0x3F) as i32;
+                            if x >= 32 { x - 64 } else { x }
+                        })
+                        .collect();
+                    fields.iter().all(|&f| (-8..=7).contains(&f)).then_some(fields)
+                });
+                if let Some(fields) = folded {
+                    for (o, f) in os.iter_mut().zip(fields) {
+                        *o = self.s.m.i32(f as u32);
+                    }
+                } else {
+                    for (k, at) in [(0, 26), (1, 18), (2, 10)].into_iter().take(offsets) {
+                        // Bits at..at+5 sign-extended: shift up, then down.
+                        let left = self.s.m.i32(at);
+                        let t = self.s.m.bin(c, Bin::Shl, w, left);
+                        let k26 = self.s.m.i32(26);
+                        os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
+                    }
                 }
             }
             let mut args = vec![h, sh];
@@ -12307,27 +12331,6 @@ impl<'a> Lower<'a> {
                     call_sample(self, "sampleLevel.f32", 62, &args, &mut gathered)
                 }
                 60 => {
-                    if offset_word {
-                        // DXIL wants immediate offsets in -8..=7 here; the
-                        // console's are 6-bit and may be computed. A
-                        // constant word in range becomes immediates
-                        // (upstream PR #634); anything else keeps the
-                        // offsets computed above (upstream refuses those).
-                        let w = addr_val(self, 0)?;
-                        if let Some(w) = self.s.m.int_value(w) {
-                            let w = w as u32;
-                            let field = |k: usize| {
-                                let x = (w >> (8 * k) & 0x3F) as i32;
-                                if x >= 32 { x - 64 } else { x }
-                            };
-                            let n = offsets.min(2);
-                            if (0..n).all(|k| (-8..=7).contains(&field(k))) {
-                                for (k, o) in os.iter_mut().enumerate().take(n) {
-                                    *o = self.s.m.i32(field(k) as u32);
-                                }
-                            }
-                        }
-                    }
                     args.extend(&os);
                     args.push(clamp);
                     call_sample(self, "sample.f32", 60, &args, &mut gathered)
