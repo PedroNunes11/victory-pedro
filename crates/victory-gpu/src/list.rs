@@ -1911,6 +1911,21 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     let _ = this;
 }
 
+/// Whether console pipeline-sync flags synchronize GPU memory writes or shader
+/// stages that require a host UAV barrier.
+///
+/// Pure no-op (`0`), instruction-cache (`0x1..=0x3`), command-processor
+/// prefetch (`0x40`), and scalar constant-cache (`0x80`) invalidates alone do
+/// not order UAV writes on Windows D3D12. Any data-cache (`MCACHE`, `GL0`/`GL1`,
+/// `GL2`), `CPDMA`, color/depth flush, shader partial flush, coherency, or
+/// `IDLE` bit conservatively requires synchronization.
+pub(crate) const fn sync_flags_need_uav(flags: u32) -> bool {
+    const NON_DATA_ONLY: u32 = 0x0000_0003 // ICACHE_INVALIDATE | ICACHE_RANGE | ICACHE_MARGIN
+        | 0x0000_0040 // PFP_SYNC_ME
+        | 0x0000_0080; // KCACHE_INVALIDATE
+    (flags & !NON_DATA_ONLY) != 0
+}
+
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
 /// bottom of the pipe `(flags, control, address, size)`. The host orders
 /// nothing between dispatches by itself: what shaders wrote is waited for
@@ -1921,6 +1936,9 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
     #[cfg(windows)]
     {
+        if !sync_flags_need_uav(flags) {
+            return;
+        }
         with_state(this, |_, state| state.synced());
         if let Some(list) = host_list(this) {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
@@ -1940,8 +1958,14 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                         "a pipeline sync"
                     );
                 }
-                crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
             }
+            // Paired BOP flush + TOP cache invalidate with no intervening GPU
+            // work is already covered by the preceding global UAV barrier.
+            if list.list.is_uav_synced() {
+                return;
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
@@ -3206,5 +3230,24 @@ mod tests {
             },
         };
         assert!(barrier_groups_need_uav(1, (&raw const w2r_group).cast()));
+    }
+
+    #[test]
+    fn pipeline_sync_flags_filter_non_data_syncs() {
+        // No-op, instruction cache, PFP-sync-ME, and scalar K-cache only.
+        assert!(!sync_flags_need_uav(0x0));
+        assert!(!sync_flags_need_uav(0x1));
+        assert!(!sync_flags_need_uav(0x3));
+        assert!(!sync_flags_need_uav(0x40));
+        assert!(!sync_flags_need_uav(0x80));
+        assert!(!sync_flags_need_uav(0xc3));
+
+        // Real title sync shapes observed in Vertex-AXX logs MUST sync:
+        assert!(sync_flags_need_uav(0x10_0000)); // CS_PARTIAL_FLUSH
+        assert!(sync_flags_need_uav(0x70_0000)); // CS|VS|PS_PARTIAL_FLUSH
+        assert!(sync_flags_need_uav(0xc280));    // GL2_WB|GL2_INV|GL1_INV|KCACHE_INV
+        assert!(sync_flags_need_uav(0xc380));    // GL2_WB|GL2_INV|GL1_INV|VCACHE_INV|KCACHE_INV
+        assert!(sync_flags_need_uav(0xc3c0));    // 0xc380 | PFP_SYNC_ME
+        assert!(sync_flags_need_uav(0x8000_0000)); // IDLE
     }
 }
